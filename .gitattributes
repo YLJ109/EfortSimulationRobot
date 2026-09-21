@@ -1,0 +1,25 @@
+# 统一行尾，避免 Windows/Linux 混用导致 diff 噪声。
+# 文本文件统一 LF（仓库内存储）；Windows 批处理必须 CRLF 才能被 cmd 正确解析。
+* text=auto
+
+# 源码 / 配置 / 文档 → LF
+*.py    text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.vue   text eol=lf
+*.json  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.env   text eol=lf
+*.example text eol=lf
+
+# Windows 批处理必须 CRLF（cmd 按 CRLF 解析，LF 会导致标签/命令错乱）
+*.bat   text eol=crlf
+
+# 二进制
+*.glb   binary
+*.png   binary
+*.jpg   binary
+*.pdf   binary

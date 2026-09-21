@@ -1,0 +1,23 @@
+{
+  "name": "efort-web-monitoring",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "EFORT ER8-700H 3D web monitoring frontend (Three.js)",
+  "scripts": {
+    "dev": "vite",
+    "check": "node tools/check_imports.mjs",
+    "build": "node tools/check_imports.mjs && vite build",
+    "preview": "vite preview",
+    "verify": "node tools/check_imports.mjs && node tools/verify_lab.mjs && node tools/verify_cell.mjs && node tools/verify_ground.mjs && node tools/verify_safety.mjs && node tools/verify_official_model.mjs && node tools/verify_kinematics.mjs"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.9",
+    "vite": "^5.4.0"
+  },
+  "dependencies": {
+    "pinia": "^4.0.3",
+    "three": "^0.169.0",
+    "vue": "^3.5.43"
+  }
+}

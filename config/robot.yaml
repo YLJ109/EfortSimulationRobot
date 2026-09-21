@@ -1,0 +1,111 @@
+# =====================================================================
+# EFORT ER8-700H 机器人配置（纯数据，换机型只改此文件）
+# 单位: 长度 mm, 角度 deg, 寄存器为 Modbus 保持寄存器地址(0-based)
+# DH 约定(标准): T_i = Rz(theta_i) * Tz(d_i) * Tx(a_i) * Rx(alpha_i)
+#               其中 theta_i = q_i(关节角,度) + theta_offset_i
+# =====================================================================
+
+robot:
+  model: "ER8-700H"
+  serial: "OSN201BE16081"
+  payload_kg: 8
+  reach_mm: 712
+  notes: "EFORT 6 轴垂直多关节, 控制器 Robox 系; H=桌面安装构型"
+
+# ---- Modbus TCP 连接 ----
+connection:
+  host: "192.168.1.12"
+  port: 502
+  unit_id: 1
+  timeout_s: 2.0
+  # 机器人离线/未接网线时自动回退到模拟器(平滑合成轨迹), 也可强制开启:
+  simulate: "auto"        # auto | always | never
+
+# ---- 寄存器映射(实测反推, 控制器 192.168.1.12) ----
+# 每个关节占用 2 个保持寄存器(float32, 大端, 字序交换: 高字在后)
+modbus:
+  func: 3
+  base_addr: 10
+  count: 12
+  unit: "deg"
+  word_order: "swap"      # float = struct.unpack('>f', pack('>HH', high, low))
+
+# ---- 轴符号校准 ----
+# 若某轴在界面上的旋转方向与真机相反, 把对应位改成 -1
+# (同步作用于 TCP 计算 / 历史入库 / WebSocket 推送, 全链路一致)
+axis_sign: [1, 1, 1, 1, 1, 1]
+
+# ---- 关节行程限位(官方规格, 单位 deg) ----
+# 供模拟界面的键盘控制做 clamp, 以及界面显示量程。
+joint_limits:
+  - { name: "J1", min: -170, max: 170 }
+  - { name: "J2", min: -170, max: 90 }
+  - { name: "J3", min: -85,  max: 150 }
+  - { name: "J4", min: -180, max: 180 }
+  - { name: "J5", min: -115, max: 115 }
+  - { name: "J6", min: -360, max: 360 }
+
+# ---- DH 参数(正运动学) ----
+# status: measured = 来自装箱标定表/手册(可信); estimate = 待手册校准
+# 零位约定(与真机示教器一致): J1=0 朝正前, J2=0 大臂垂直向上, J3=0 小臂水平向前,
+#                             J4/J5/J6=0 法兰沿小臂方向水平向前。
+dh:
+  calibration_pending: true
+  joints:
+    - name: "J1"
+      d: 376.0        # 基座到 J2 轴高(官方运动范围图)
+      a: 49.5932      # 肩部偏距(实测, 可信)
+      alpha: 90.0     # (标准构型)
+      theta_offset: 0.0
+      status: "measured"
+    - name: "J2"
+      d: 0.2852       # (实测, 近似 0)
+      a: 330.1834     # 大臂长(实测, 可信)
+      alpha: 0.0      # (标准构型)
+      theta_offset: 90.0   # 机械零位: q2=0 时大臂垂直向上(由 J2 行程 +90/-170 唯一确定)
+      status: "measured"
+    - name: "J3"
+      d: 0.0
+      a: 40.2714      # 肘部偏距(实测, 可信)
+      alpha: 90.0     # (标准构型)
+      theta_offset: 0.0    # q3=0 时小臂水平向前(由 J3 行程 +150/-85 唯一确定)
+      status: "measured_a"
+    - name: "J4"
+      d: 329.2414     # 小臂长(实测, 可信)
+      a: 0.0
+      alpha: -90.0    # (估算, 待校准)
+      theta_offset: 0.0
+      status: "measured_d"
+    - name: "J5"
+      d: 0.0
+      a: 0.0
+      alpha: 90.0     # (估算, 待校准)
+      theta_offset: 0.0
+      status: "estimate"
+    - name: "J6"
+      d: 80.0         # 腕长(估算, 待手册)
+      a: 0.0
+      alpha: 0.0
+      theta_offset: 0.0
+      status: "estimate"
+
+# ---- 安装方式(影响底座变换) ----
+mounting:
+  type: "floor"      # floor | wall | ceiling  (H = 桌面/地装)
+
+# ---- 采样与推送 ----
+sampling:
+  read_hz: 10.0          # Modbus 读取频率
+  db_write_hz: 2.0       # 入库频率(防止库膨胀)
+  ws_push_hz: 20.0       # WebSocket 推送频率
+  history_retention_days: 30   # 历史自动清理保留天数
+
+# ---- 数据库 ----
+database:
+  url: "sqlite:///data/robot.db"
+
+# ---- 服务 ----
+server:
+  host: "0.0.0.0"
+  port: 8000
+  ws_path: "/ws/pose"

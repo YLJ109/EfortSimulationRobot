@@ -1,0 +1,20 @@
+# =====================================================================
+#  视觉检测服务依赖 (camera/camera_service.py)
+#
+#  注意: 本服务与后端使用**不同的解释器**。原因:
+#    - 海康 MVS SDK 的 Python 封装 (MvCameraControl_class.py) 不打在 PyPI 上,
+#      随 MVS 客户端安装或从厂商样例包获得;
+#    - ultralytics 会拉入 PyTorch, 体积可达数 GB, 不该塞进后端 venv。
+#
+#  因此视觉服务的解释器由 EFORT_CAMERA_PYTHON 指定 (见 .env.example),
+#  默认复用参考项目 EFORT_Camera_Python_OpenCv 的 venv。
+#  若要新建独立环境, 安装本文件后, 再把 MVS 的 MvImport 目录加到 sys.path
+#  (由 EFORT_MVS_SDK_DIR 指定, 见 camera_service.py 顶部)。
+# =====================================================================
+
+# 抓帧管线: 相机原始 buffer -> numpy 数组 -> PIL 图像 -> JPEG
+numpy>=1.26,<3.0
+pillow>=10.0
+
+# 目标检测 (会连带安装 torch / torchvision, 首次安装下载量较大)
+ultralytics>=8.3

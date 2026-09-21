@@ -1,0 +1,42 @@
+# Python
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+
+# 环境变量(本地私有配置, 模板见 .env.example)
+.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+
+# 运行时数据
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+logs/
+*.log
+
+# 原始数模备份(体积大, 不属于源码; 官方 STEP/DWG 原件保留在本地 data/ 即可)
+data/*.STEP
+data/*.DWG
+
+# 视觉采集产物
+camera/captures/
+camera/__pycache__/
+# YOLO 权重: 可由 ultralytics 重新下载(见 camera/requirements.txt), 不入库
+camera/models/*.pt
+
+# 打包/临时产物
+*.zip
+*.tar.gz
+.release/
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
