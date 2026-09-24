@@ -6,12 +6,14 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.api.auth import require_admin, require_control, token_role
 from app.core.deps import get_db
 from app.core.exceptions import AppError
 from app.core.safety_config import (
@@ -22,7 +24,18 @@ from app.core.safety_config import (
     save_safety,
     validate_safety,
 )
-from app.db.crud import clear_safety_events, insert_safety_event, list_safety_events
+from app.db.crud import (
+    clear_safety_events,
+    get_safety_version,
+    insert_safety_event,
+    insert_safety_version,
+    list_safety_events,
+    list_safety_versions,
+    prune_safety_versions,
+)
+from app.services.events import emit as emit_event
+from app.services.safety_guard import snapshot as guard_snapshot
+from app.services.safety_guard import update as guard_update
 
 router = APIRouter(prefix="/api", tags=["safety"])
 
@@ -64,20 +77,46 @@ def api_get_safety():
     return load_safety()
 
 
+def _archive(db: Session, prev_cfg: dict, actor: str, source: str, note: str) -> None:
+    """把改动前的配置归档为历史版本（失败不影响主流程 —— 版本历史是锦上添花）。"""
+    try:
+        if json.dumps(prev_cfg, sort_keys=True) == json.dumps(load_safety(), sort_keys=True):
+            return                       # 与原配置完全相同，没必要往历史里塞垃圾
+        insert_safety_version(db, json.dumps(prev_cfg, ensure_ascii=False),
+                              actor=actor, source=source, note=note)
+        prune_safety_versions(db, keep=30)
+    except Exception:
+        pass
+
+
 @router.put("/safety")
-def api_put_safety(body: SafetyIn):
-    """保存配置（后端强校验，非法返回 400 并带具体字段）。"""
+def api_put_safety(body: SafetyIn, tok: str = Depends(require_admin),
+                   db: Session = Depends(get_db)):
+    """保存配置（★ 管理员权限；后端强校验，非法返回 400 并带具体字段）。"""
+    actor = token_role(tok) or "unknown"
+    prev = load_safety()
     try:
         cfg = save_safety(body.config)
     except SafetyConfigError as e:
+        emit_event("config", "error", "safety.save_failed",
+                   f"围栏配置保存被拒绝：{str(e)[:120]}", {"reason": str(e)}, actor=actor)
         raise AppError(f"配置校验失败: {e}", 400, "SAFETY_CONFIG_INVALID", str(e))
+    _archive(db, prev, actor, "save", "保存前自动归档")
+    emit_event("config", "info", "safety.save", "安全围栏配置已保存",
+               {"zones": len(cfg.get("zones", [])), "enabled": cfg.get("enabled", True)},
+               actor=actor)
     return {"ok": True, "config": cfg}
 
 
 @router.post("/safety/reset")
-def api_reset_safety():
-    """恢复出厂默认配置。"""
-    return {"ok": True, "config": reset_safety()}
+def api_reset_safety(tok: str = Depends(require_admin), db: Session = Depends(get_db)):
+    """恢复出厂默认配置（★ 管理员权限，重置前自动归档当前配置）。"""
+    actor = token_role(tok) or "unknown"
+    prev = load_safety()
+    cfg = reset_safety()
+    _archive(db, prev, actor, "reset", "恢复默认前自动归档")
+    emit_event("config", "warn", "safety.reset", "围栏配置已恢复出厂默认", actor=actor)
+    return {"ok": True, "config": cfg}
 
 
 @router.get("/safety/default")
@@ -116,16 +155,136 @@ def api_list_events(limit: int = Query(100, ge=1, le=1000),
 
 @router.post("/safety/events")
 def api_add_event(body: EventIn, db: Session = Depends(get_db)):
-    """记录一条报警事件。只在状态变严重/恢复时调用，避免每帧刷库。"""
+    """记录一条报警事件。只在状态变严重/恢复时调用，避免每帧刷库。
+
+    ★ 同时镜像一份到统一事件总线，让「运维时间线」里能看到报警，不必两个数据源来回翻。
+    """
     if body.state not in ("danger", "hit", "clear"):
         raise AppError("state 必须是 danger / hit / clear", 400, "BAD_SAFETY_STATE")
-    row = insert_safety_event(
-        db, body.zone_id, body.zone_name, body.state, body.clearance, body.ratio
-    )
+    row = insert_safety_event(db, body.zone_id, body.zone_name, body.state,
+                             body.clearance, body.ratio)
+    level = {"danger": "warn", "hit": "critical", "clear": "info"}.get(body.state, "info")
+    zone = body.zone_name or body.zone_id or "未命名区域"
+    msg = {
+        "danger": f"接近/危险：{zone}",
+        "hit": f"碰撞报警：{zone}",
+        "clear": f"已恢复安全：{zone}",
+    }.get(body.state, zone)
+    emit_event("safety", level, f"safety.{body.state}", msg, {
+        "zone_id": body.zone_id, "zone_name": body.zone_name,
+        "clearance": body.clearance, "ratio": body.ratio,
+    })
     return {"ok": True, "id": row.id}
 
 
 @router.delete("/safety/events")
-def api_clear_events(db: Session = Depends(get_db)):
+def api_clear_events(tok: str = Depends(require_admin), db: Session = Depends(get_db)):
+    """清空报警事件（★ 管理员权限）。"""
     n = clear_safety_events(db)
+    emit_event("config", "info", "safety.events_clear",
+               f"报警事件已清空（{n} 条）", {"deleted": n},
+               actor=token_role(tok) or "unknown")
     return {"ok": True, "deleted": n}
+
+
+# =====================================================================
+# 围栏实时状态上报（阶段 4：把"前端算出来的余量"喂给后端做下发互锁）
+# =====================================================================
+class LiveIn(BaseModel):
+    state: str = "safe"                  # safe | warn | danger | hit
+    zone_id: str = ""
+    zone_name: str = ""
+    clearance: float = 0.0
+    ratio: float = 1.0
+
+
+@router.post("/safety/live")
+def api_report_live(body: LiveIn):
+    """前端每帧评估围栏后节流上报（1s 一次），后端据此拦截危险状态下的下发。"""
+    return guard_update(body.state, body.zone_id, body.zone_name,
+                        body.clearance, body.ratio)
+
+
+@router.get("/safety/live")
+def api_get_live():
+    """查看互锁状态是否有效（排障用：reported/fresh 为 false 说明前端没在上报）。"""
+    return guard_snapshot()
+
+
+# =====================================================================
+# 配置版本化（阶段 4）：历史版本列表 / 查看 / 回滚
+# =====================================================================
+class VersionOut(BaseModel):
+    id: int
+    created_at: str
+    actor: str = ""
+    source: str = ""
+    note: str = ""
+    zones: int = 0
+    enabled: bool = True
+
+
+def _iso(dt) -> str:
+    try:
+        return dt.isoformat() + "Z" if dt and dt.tzinfo is None else (dt.isoformat() if dt else "")
+    except Exception:
+        return ""
+
+
+@router.get("/safety/versions", response_model=List[VersionOut])
+def api_list_versions(db: Session = Depends(get_db),
+                      tok: str = Depends(require_control)):
+    """历史版本列表（摘要，不含完整配置）。"""
+    out = []
+    for v in list_safety_versions(db, limit=50):
+        try:
+            cfg = json.loads(v.config or "{}")
+        except Exception:
+            cfg = {}
+        out.append(VersionOut(
+            id=v.id, created_at=_iso(v.created_at), actor=v.actor,
+            source=v.source, note=v.note,
+            zones=len(cfg.get("zones", []) or []),
+            enabled=bool(cfg.get("enabled", True)),
+        ))
+    return out
+
+
+@router.get("/safety/versions/{vid}")
+def api_get_version(vid: int, db: Session = Depends(get_db),
+                    tok: str = Depends(require_control)):
+    """查看某个历史版本的完整配置（回滚前先看看内容）。"""
+    v = get_safety_version(db, vid)
+    if not v:
+        raise AppError("版本不存在", 404, "VERSION_NOT_FOUND")
+    try:
+        cfg = json.loads(v.config or "{}")
+    except Exception:
+        cfg = {}
+    return {"id": v.id, "created_at": _iso(v.created_at), "actor": v.actor,
+            "source": v.source, "note": v.note, "config": cfg}
+
+
+@router.post("/safety/versions/{vid}/rollback")
+def api_rollback_version(vid: int, db: Session = Depends(get_db),
+                         tok: str = Depends(require_admin)):
+    """回滚到某个历史版本（★ 管理员权限；回滚前会把当前配置再归档一次）。"""
+    actor = token_role(tok) or "unknown"
+    v = get_safety_version(db, vid)
+    if not v:
+        raise AppError("版本不存在", 404, "VERSION_NOT_FOUND")
+    try:
+        target = json.loads(v.config or "{}")
+    except Exception as e:
+        raise AppError(f"历史版本数据损坏: {e}", 400, "VERSION_CORRUPTED")
+
+    prev = load_safety()
+    try:
+        cfg = save_safety(target)      # 走完整校验，坏数据不会污染线上
+    except SafetyConfigError as e:
+        raise AppError(f"历史版本校验失败: {e}", 400, "SAFETY_CONFIG_INVALID", str(e))
+
+    _archive(db, prev, actor, "rollback", f"回滚至版本 #{vid} 前自动归档")
+    emit_event("config", "warn", "safety.rollback",
+               f"围栏配置已回滚到历史版本 #{vid}", {"version": vid}, actor=actor)
+    return {"ok": True, "config": cfg, "from_version": vid}

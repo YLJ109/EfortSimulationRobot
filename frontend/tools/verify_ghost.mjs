@@ -1,0 +1,172 @@
+// =====================================================================
+// 残影（Ghost）回归（headless，真实 THREE，无需 WebGL）
+//
+// 覆盖后续最容易回归的几点：
+//  A. 残影必须是**独立的程序化模型**，尺寸与实体机同量级
+//     —— 本项目踩过坑：clone 官方 GLB 单 mesh 会整体放大 1000 倍。
+//     这里直接量包围盒，把"1000 倍"钉死成失败。
+//  B. 造型：半透明、depthWrite=false（不遮挡实体机）、不可拾取、首帧不可见。
+//  C. 运动：首次 setPose 立即落位；之后 setPose 只改目标，由 step() 逐帧收敛。
+//
+// 运行： node tools/verify_ghost.mjs
+// =====================================================================
+import * as THREE from "three";
+import { createGhost, GHOST_OPACITY, GHOST_ALARM_COLOR } from "../src/three/ghost.js";
+import { buildRobot } from "../src/robot/robotModel.js";
+import { FALLBACK_DH } from "../src/config.js";
+
+let pass = 0, fail = 0;
+function ok(name, cond, extra = "") {
+  if (cond) { pass++; console.log("  PASS  " + name); }
+  else { fail++; console.log("  FAIL  " + name + (extra ? "   → " + extra : "")); }
+}
+
+const boxOf = (root) => {
+  root.updateMatrixWorld(true);
+  return new THREE.Box3().setFromObject(root);
+};
+const sizeOf = (root) => {
+  const b = boxOf(root);
+  const s = new THREE.Vector3();
+  b.getSize(s);
+  return s;
+};
+const maxDiff = (a, b) => Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y), Math.abs(a.z - b.z));
+
+console.log("== 残影 Ghost 回归 ==");
+
+// ---------- A. 独立程序化模型 + 尺寸量级 ----------
+const ghost = createGhost(FALLBACK_DH, "floor", 0);
+const ref = buildRobot(FALLBACK_DH, "floor");
+
+ok("root 名为 ghost-root（独立节点，不混进实体机）", ghost.root.name === "ghost-root");
+ok("mesh 数量 > 0", ghost.meshCount > 0, "meshCount=" + ghost.meshCount);
+
+const gs = sizeOf(ghost.root);
+const rs = sizeOf(ref.root);
+// 逐轴比值：0.5~2 视为同量级；1000 倍会直接掉出去
+const ratios = [gs.x / rs.x, gs.y / rs.y, gs.z / rs.z];
+ok("尺寸与实体机同量级（非 1000× 放大）",
+  ratios.every((r) => r > 0.5 && r < 2),
+  "ghost=" + gs.toArray().map((v) => v.toFixed(3)) + " ref=" + rs.toArray().map((v) => v.toFixed(3)));
+
+// ---------- B. 造型：半透明 / 不写深度 / 不可拾取 / 初始不可见 ----------
+let meshes = 0, badMat = 0, badDepth = 0, pickable = 0;
+ghost.root.traverse((o) => {
+  if (!o.isMesh) return;
+  meshes++;
+  const mats = Array.isArray(o.material) ? o.material : [o.material];
+  for (const m of mats) {
+    if (!m.transparent || Math.abs(m.opacity - GHOST_OPACITY) > 1e-6) badMat++;
+    if (m.depthWrite !== false) badDepth++;
+  }
+  // 不可拾取：raycast 必须是空实现
+  if (typeof o.raycast === "function" && o.raycast.toString().indexOf("three") !== -1) pickable++;
+});
+ok("所有材质均为半透明且 opacity = " + GHOST_OPACITY, badMat === 0, "badMat=" + badMat);
+ok("所有材质 depthWrite=false（不遮挡实体机）", badDepth === 0, "badDepth=" + badDepth);
+ok("残影不可拾取（raycast 已禁用）", pickable === 0, "pickable=" + pickable);
+ok("初始不可见（未预演时不显示）", ghost.visible === false);
+
+// ---------- C. 运动：首次落位 + 之后平滑收敛 ----------
+const POSE_A = [0, 0, 0, 0, 0, 0];
+const POSE_B = [40, 30, -20, 15, 25, 60];
+
+ghost.setPose(POSE_A);
+ok("setPose 后残影可见", ghost.visible === true);
+const boxA = boxOf(ghost.root);
+
+ghost.setPose(POSE_B);              // 只改目标：应**不**立即跳变
+const boxB0 = boxOf(ghost.root);
+ok("第二次 setPose 不立即跳变（仍停在旧位姿）", maxDiff(
+  boxA.getSize(new THREE.Vector3()), boxB0.getSize(new THREE.Vector3())) < 1e-6);
+
+// 逐步推进 → 应该明显移动
+for (let i = 0; i < 4; i++) ghost.step(1 / 60);
+const boxMid = boxOf(ghost.root);
+ok("step() 推进后确实在移动", maxDiff(
+  boxB0.getSize(new THREE.Vector3()), boxMid.getSize(new THREE.Vector3())) > 1e-4);
+
+// 持续推进 → 收敛到目标（与"直接落位到 B"的几何一致）
+for (let i = 0; i < 240; i++) ghost.step(1 / 60);
+const boxB = boxOf(ghost.root);
+const probe = createGhost(FALLBACK_DH, "floor", 0);
+probe.setPose(POSE_B);
+const boxBRef = boxOf(probe.root);
+ok("收敛到目标位姿（与直接落位几何一致，误差 < 1e-3 m）",
+  maxDiff(boxB.getSize(new THREE.Vector3()), boxBRef.getSize(new THREE.Vector3())) < 1e-3,
+  "diff=" + maxDiff(boxB.getSize(new THREE.Vector3()), boxBRef.getSize(new THREE.Vector3())).toExponential(2));
+
+// 隐藏 / 显示
+ghost.setVisible(false);
+ok("setVisible(false) 生效", ghost.visible === false);
+ghost.setVisible(true);
+ok("setVisible(true) 生效", ghost.visible === true);
+
+// ---------- D. ★ 下发判据：withTarget 必须量"目标位姿"，且量完不跳变 ----------
+// 这是"点位执行按残影目标位姿判定"的地基：manager.evalSafety() 把围栏/地面测量
+// 塞进 withTarget 里执行，量到的必须是**终点**（要去的地方），不是"飘到一半"的位置。
+// 一旦这里量错，拦截判据就会系统性偏松或偏严，而且画面看不出任何异常。
+console.log("\n[D] withTarget 量目标位姿 + 量完还原动画姿态");
+{
+  const g = createGhost(FALLBACK_DH, "floor", 0);
+  g.setPose(POSE_A);                       // 首次落位：当前 = A
+  g.setPose(POSE_B);                       // 只改目标：当前仍停在 A，动画未推进
+  const boxAnimated = boxOf(g.root);
+
+  const measured = g.withTarget((root) => boxOf(root));
+  const refB = createGhost(FALLBACK_DH, "floor", 0);
+  refB.setPose(POSE_B);
+  const boxB = boxOf(refB.root);
+
+  ok("withTarget 量到的是**目标位姿**(B)，不是动画中的当前位姿(A)",
+    maxDiff(measured.getSize(new THREE.Vector3()), boxB.getSize(new THREE.Vector3())) < 1e-6,
+    "measured=" + measured.getSize(new THREE.Vector3()).toArray().map((v) => v.toFixed(3)));
+  ok("withTarget 量到的**不是**当前动画位姿(A)（否则判据形同虚设）",
+    maxDiff(measured.getSize(new THREE.Vector3()), boxAnimated.getSize(new THREE.Vector3())) > 1e-3);
+
+  const boxAfter = boxOf(g.root);
+  ok("withTarget 返回后立刻还原动画姿态（视觉零跳变）",
+    maxDiff(boxAfter.getSize(new THREE.Vector3()), boxAnimated.getSize(new THREE.Vector3())) < 1e-9,
+    "diff=" + maxDiff(boxAfter.getSize(new THREE.Vector3()), boxAnimated.getSize(new THREE.Vector3())).toExponential(2));
+  g.dispose();
+}
+
+// ---------- E. ★ 报警着色：泛红只改颜色，不许破坏"半透明/不遮挡" ----------
+console.log("\n[E] setAlarm 泛红（且不动透明与深度写入）");
+{
+  const g = createGhost(FALLBACK_DH, "floor", 0);
+  g.setPose(POSE_A);
+  const matsOf = () => {
+    const out = [];
+    g.root.traverse((o) => {
+      if (!o.isMesh) return;
+      (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => out.push(m));
+    });
+    return out;
+  };
+  const hexOf = (m) => (m.color ? m.color.getHex() : null);
+  const before = matsOf().map(hexOf);
+
+  ok("初始 alarmed = false", g.alarmed === false);
+  g.setAlarm(true);
+  ok("setAlarm(true) 后 alarmed = true", g.alarmed === true);
+  const during = matsOf().map(hexOf);
+  ok("泛红：所有材质基色都变成报警色 " + GHOST_ALARM_COLOR.toString(16),
+    during.length > 0 && during.every((h) => h === GHOST_ALARM_COLOR),
+    "得到 " + [...new Set(during)].map((h) => h && h.toString(16)).join(","));
+  ok("泛红后仍全部半透明且 opacity 不变（硬约束）",
+    matsOf().every((m) => m.transparent && Math.abs(m.opacity - GHOST_OPACITY) < 1e-6));
+  ok("泛红后仍 depthWrite=false（不遮挡实体机）", matsOf().every((m) => m.depthWrite === false));
+
+  g.setAlarm(false);
+  ok("setAlarm(false) 还原淡蓝", matsOf().map(hexOf).join(",") === before.join(","));
+  ok("还原后 alarmed = false", g.alarmed === false);
+  g.setAlarm(false);
+  ok("重复 setAlarm(false) 幂等（不产生副作用）", g.alarmed === false);
+  g.dispose();
+}
+
+console.log("");
+console.log("结果: " + pass + " 通过 / " + fail + " 失败");
+process.exit(fail ? 1 : 0);

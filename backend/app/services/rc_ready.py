@@ -1,0 +1,223 @@
+# -*- coding: utf-8 -*-
+"""
+一键就绪（Stage D）：把控制器从"任意状态"推到"可接受点动"的就绪态。
+
+参考私有参考实现 tools/ready_up.py 的实机验证流程：
+  清报警 → （伺服掉了就重新吸合）→ 加载点动服务程序 → 运行（挂起在 WAIT）。
+
+★ 铁律（全部来自实测教训）：
+  - 触发位（40135.Bit0）为 1 时**绝不执行** —— 上一发点动还没收尾，任何写入
+    都可能被正在 WAIT 的程序读到半截数据；
+  - 必须在【自动/远程】档 —— T1/T2 下控制器忽略一切上位机指令（寄存器写得进
+    去但机器人不动），先检查模式位再动手，省得用户对着"写成功但没动"排查；
+  - 清报警后伺服可能掉电：掉电就重新吸合（0x0000 → 等 0.6s → 0x1001，
+    吸合延迟实测 ≈0.55s，等待必须 ≥0.6s）；
+  - 先加载成功才准运行（否则 5005 加载的程序不存在）；
+  - 全程**不写**目标角区（40139~44）与触发位 —— 本流程只让程序挂起到 WAIT，
+    不产生任何运动。
+"""
+from __future__ import annotations
+
+import time
+from typing import Any, Callable, Dict, List, Optional
+
+from app.core.config import get_config
+from app.core.logger import get_logger
+from app.services.modbus import (
+    CMD_CLEAR,
+    CMD_LOAD,
+    CMD_RUN,
+    CMD_ZERO,
+    SERVO_REENGAGE_DELAY,
+    ModbusRobot,
+)
+from app.services.motion import real_write_enabled
+
+log = get_logger("rc_ready")
+
+
+def jog_service_program() -> int:
+    """点动服务程序号（config motion.jog.service_program；0 = 未指定，不瞎猜）。"""
+    try:
+        return int(get_config().get("motion", "jog", "service_program", default=0) or 0)
+    except Exception:
+        return 0
+
+
+class ReadinessService:
+    """一键就绪执行器。无状态（每次完整跑一遍），线程安全由"单次串行"保证。"""
+
+    def __init__(self, modbus: Optional[ModbusRobot] = None) -> None:
+        self._mb = modbus  # None = 用 motion 的连接（共享 socket + IO 锁）
+        self._busy_lock = __import__("threading").Lock()
+
+    def _client(self) -> ModbusRobot:
+        if self._mb is not None:
+            return self._mb
+        from app.services.motion import motion   # 延迟导入避免环
+        return motion.modbus
+
+    def ready(self, prog: Optional[int] = None,
+              on_step: Optional[Callable[[str, str], None]] = None) -> Dict[str, Any]:
+        """执行就绪流程，返回 {ok, steps:[{step,ok,msg}], error, summary}。"""
+        if not self._busy_lock.acquire(blocking=False):
+            return {"ok": False, "error": "就绪流程正在执行中，请稍候", "steps": []}
+        try:
+            return self._ready(prog, on_step)
+        finally:
+            self._busy_lock.release()
+
+    # ------------------------------------------------------------------
+    def _step(self, steps: List[dict], name: str, on_step, ok: bool, msg: str) -> None:
+        rec = {"step": name, "ok": ok, "msg": msg}
+        steps.append(rec)
+        log.info("[就绪] %s: %s", name, msg)
+        if on_step:
+            try:
+                on_step(name, msg)
+            except Exception:
+                pass
+
+    def _ready(self, prog: Optional[int], on_step) -> Dict[str, Any]:
+        steps: List[dict] = []
+        mb = self._client()
+
+        # 0) 总闸：一键就绪本身就是要写真机寄存器 —— 双确认必须已开
+        if not real_write_enabled():
+            self._step(steps, "gate", on_step, False,
+                       "真实下发未开启（需要 EFORT_REAL_MOTION=1 且 motion.real_write=true）")
+            return {"ok": False, "error": "真实下发未开启：总闸未打开，拒绝写控制器",
+                    "steps": steps}
+
+        # 1) 快照：先看清楚控制器现在什么状态
+        snap, err = mb.rc_snapshot()
+        if snap is None:
+            self._step(steps, "snapshot", on_step, False, "读快照失败: %s" % err)
+            return {"ok": False, "error": "无法读取控制器状态: %s" % err, "steps": steps}
+        b = snap["bits"]
+        self._step(steps, "snapshot", on_step, True,
+                   "模式=%s 伺服=%d 报警=%d 程序=%d 加载=%d 运行=%d"
+                   % (snap["mode"], b["servo"], b["alarm"], snap["prog"],
+                      b["prog_loaded"], b["run"]))
+
+        # 2) 前置守卫：触发位
+        if snap.get("jog_trig"):
+            self._step(steps, "guard", on_step, False, "点动触发位仍为 1")
+            return {"ok": False, "error": "点动触发位仍为 1（上一发未收尾），请先撤销触发再就绪",
+                    "steps": steps}
+
+        # 3) 档位守卫：T1/T2 下控制器忽略上位机指令（实机确认）
+        if b["manual"] and not (b["auto"] or b["remote"]):
+            self._step(steps, "mode", on_step, False, "控制器在手动档（T1/T2）")
+            return {"ok": False,
+                    "error": "控制器在手动档（T1/T2）：上位机指令无效，请把模式开关拨到 AUTO 或 远程",
+                    "steps": steps}
+
+        # 4) 报警
+        if b["alarm"]:
+            _, cerr = mb.rc_command(CMD_CLEAR)
+            time.sleep(0.4)
+            snap2, err2 = mb.rc_snapshot()
+            alarm_now = bool(snap2 and snap2["bits"]["alarm"])
+            self._step(steps, "alarm", on_step, not alarm_now,
+                       ("清报警失败（码 %s/%s 仍在）" % (snap["alarm1"], snap["alarm2"]))
+                       if alarm_now else "报警已清（原码 %s/%s）" % (snap["alarm1"], snap["alarm2"]))
+            if alarm_now:
+                return {"ok": False, "error": "清报警后仍处于报警状态（如 1812=安全门，请检查安全回路）",
+                        "steps": steps}
+            b = snap2["bits"] if snap2 else b
+
+        # 5) 伺服：掉了就重新吸合（0x0000 → 0.6s → 0x1001）
+        if not b["servo"]:
+            try:
+                mb.rc_command(CMD_ZERO)          # 全清（控制器可能不回正常应答，容忍）
+            except Exception:
+                pass
+            time.sleep(SERVO_REENGAGE_DELAY)
+            _, serr = mb.rc_command(0x1001)
+            if serr:
+                self._step(steps, "servo", on_step, False, "上电命令失败: %s" % serr)
+                return {"ok": False, "error": "伺服上电失败: %s" % serr, "steps": steps}
+            # 吸合延迟 ≈0.55s，以 0.1s 步进等待伺服位（采样太快会误判"没上电"）
+            t0 = time.time()
+            servo_on = False
+            while time.time() - t0 < 1.5:
+                s2, _ = mb.rc_snapshot()
+                if s2 and s2["bits"]["servo"]:
+                    servo_on = True
+                    break
+                time.sleep(0.1)
+            self._step(steps, "servo", on_step, servo_on,
+                       "伺服已吸合（%.2fs）" % (time.time() - t0) if servo_on
+                       else "伺服位 1.5s 内未吸合")
+            if not servo_on:
+                return {"ok": False, "error": "伺服上电后 1.5s 内未吸合，请检查使能回路/急停", "steps": steps}
+        else:
+            self._step(steps, "servo", on_step, True, "伺服已在上电状态")
+
+        # 6) 加载点动服务程序
+        prog_no = int(prog if prog is not None else jog_service_program())
+        if prog_no <= 0:
+            self._step(steps, "prog", on_step, False, "未配置点动服务程序号")
+            return {"ok": False,
+                    "error": "未配置点动服务程序号（config motion.jog.service_program，现场=200/JOGSVC）",
+                    "steps": steps}
+        if b["prog_loaded"] and snap["prog"] == prog_no:
+            self._step(steps, "prog", on_step, True, "程序 %d 已在加载态（跳过）" % prog_no)
+        else:
+            _, e1 = mb.write_reg(103, prog_no)    # 目标程序号
+            if e1:
+                return {"ok": False, "error": "写目标程序号失败: %s" % e1, "steps": steps}
+            _, e2 = mb.rc_command(CMD_LOAD)       # 0x1011 加载
+            if e2:
+                return {"ok": False, "error": "加载命令失败: %s" % e2, "steps": steps}
+            t0 = time.time()
+            loaded = False
+            while time.time() - t0 < 2.5:
+                s2, _ = mb.rc_snapshot()
+                if s2 and s2["bits"]["prog_loaded"]:
+                    loaded = True
+                    break
+                time.sleep(0.1)
+            self._step(steps, "prog", on_step, loaded,
+                       "程序 %d 已加载（%.2fs）" % (prog_no, time.time() - t0) if loaded
+                       else "程序加载位 2.5s 内未置位（5005=程序不存在？）")
+            if not loaded:
+                return {"ok": False,
+                        "error": ("程序 %d 加载失败（5005=加载的程序不存在；确认控制器上有 "
+                                  "JOGSVC/点动程序且示教器没停在文件管理器）" % prog_no),
+                        "steps": steps}
+
+        # 7) 运行（程序会执行到 WAIT 挂起等触发 —— 不产生任何运动）
+        _, rerr = mb.rc_command(CMD_RUN)          # 0x1013
+        if rerr:
+            return {"ok": False, "error": "运行命令失败: %s" % rerr, "steps": steps}
+        t0 = time.time()
+        running = False
+        while time.time() - t0 < 2.5:
+            s2, _ = mb.rc_snapshot()
+            if s2 and s2["bits"]["run"]:
+                running = True
+                break
+            time.sleep(0.1)
+        self._step(steps, "run", on_step, running,
+                   "程序 %d 运行中（挂起于 WAIT 等触发）" % prog_no if running
+                   else "运行位 2.5s 内未置位")
+        if not running:
+            return {"ok": False, "error": "程序运行位未置位，请检查程序状态", "steps": steps}
+
+        # 8) 终态汇总
+        fin, _ = mb.rc_snapshot()
+        summary = {
+            "prog": prog_no,
+            "mode": fin["mode"] if fin else "",
+            "servo": bool(fin and fin["bits"]["servo"]),
+            "loaded": bool(fin and fin["bits"]["prog_loaded"]),
+            "running": bool(fin and fin["bits"]["run"]),
+            "jog_done": fin.get("jog_done") if fin else None,
+        }
+        from app.services.events import emit as emit_event
+        emit_event("control", "info", "control.ready",
+                   "一键就绪完成：程序 %d 已挂起于 WAIT" % prog_no,
+                   {"steps": steps, "summary": summary})
+        return {"ok": True, "steps": steps, "summary": summary}

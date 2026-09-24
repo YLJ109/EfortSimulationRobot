@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "base": {
+    "name": "机器人坐标系",
+    "x_axis_yaw_deg": 0.0,
+    "z_sign": 1,
+    "verified": false
+  },
+  "tool": {
+    "name": "工具坐标系",
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.0,
+    "rx": 0.0,
+    "ry": 0.0,
+    "rz": 0.0,
+    "verified": false,
+    "note": "姿态 rpy 暂未参与求解（工具系姿态 = 法兰姿态）"
+  },
+  "wobj": [
+    {
+      "id": "wobj0",
+      "name": "机器人坐标系（默认）",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0,
+      "rx": 0.0,
+      "ry": 0.0,
+      "rz": 0.0,
+      "verified": true,
+      "builtin": true
+    }
+  ]
+}

@@ -7,18 +7,24 @@ import io
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from typing import Optional
 
+from app.api.auth import require_control
 from app.core.config import get_config
 from app.core.deps import get_db
 from app.db.crud import get_recent_poses
 from app.schemas.pose import HealthOut, HistoryOut, MetaOut
-from app.services.collector import collector
+from app.services.collector import collector, feed_run_mode
 from app.services.hub import hub
+from app.services.motion import motion, real_write_enabled
+from app.services.rc_ready import ReadinessService
 
 router = APIRouter(prefix="/api", tags=["robot"])
+_ready = ReadinessService()
 
 
 @router.get("/health", response_model=HealthOut)
@@ -35,6 +41,59 @@ def health():
 def reconnect():
     """手动重连机器人（网线在摄像头/机器人间切换后触发，无需重启服务）。"""
     return collector.reconnect()
+
+
+@router.get("/rc-status")
+def rc_status():
+    """控制器寄存器快照（只读，不写任何寄存器）。
+
+    返回状态位解码（模式/伺服/报警/急停/程序）、报警码、当前程序号、
+    点动触发/完成位、以及"真实下发是否已开启"与点动服务程序号。
+    供前端「真机链路就绪」卡展示与排障。
+    """
+    snap, err = motion.modbus.rc_snapshot()
+    cfg = get_config()
+    prog_no = 0
+    try:
+        prog_no = int(cfg.get("motion", "jog", "service_program", default=0) or 0)
+    except Exception:
+        prog_no = 0
+    if snap is None:
+        return {"ok": False, "error": err or "读不到控制器",
+                "real_enabled": real_write_enabled(), "service_program": prog_no}
+    snap["ok"] = True
+    snap["real_enabled"] = real_write_enabled()
+    snap["service_program"] = prog_no
+    # 就绪态一句话判定（前端直接显示）
+    b = snap["bits"]
+    snap["ready"] = bool(b["servo"] and b["prog_loaded"] and b["run"]
+                         and (b["auto"] or b["remote"]) and not b["alarm"] and not b["estop"])
+    # ★ 实测档位喂给 runmode（与采集循环同一条路）：用户手动刷新真机链路时，
+    #   底栏「示教器」灯也能立刻反映旋钮实际位置，不必等下一个 4s 采集周期。
+    feed_run_mode(snap.get("mode"), snap.get("status_word"))
+    return snap
+
+
+class ReadyIn(BaseModel):
+    prog: Optional[int] = None   # 缺省用 config motion.jog.service_program
+
+
+@router.post("/ready")
+def ready(body: Optional[ReadyIn] = None, request: Request = None,
+          tok: str = Depends(require_control)):
+    """一键就绪：清报警 → 伺服上电 → 加载点动服务程序 → 运行挂起于 WAIT。
+
+    ★ 本身就是真机寄存器写操作：需控制令牌 + 双确认总闸（EFORT_REAL_MOTION=1
+      且 motion.real_write=true）。总闸没开时明确拒绝并解释怎么开。
+    """
+    ip = request.client.host if (request and request.client) else ""
+    from app.services.events import emit as emit_event
+    r = _ready.ready(prog=(body.prog if body else None),
+                     on_step=lambda s, m: None)
+    emit_event("control", "info" if r.get("ok") else "warn", "control.ready_request",
+               "一键就绪：%s" % ("成功" if r.get("ok") else (r.get("error") or "失败")),
+               {"steps": r.get("steps", [])}, actor="web", ip=ip)
+    return r
 
 
 @router.get("/pose")

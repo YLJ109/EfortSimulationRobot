@@ -8,6 +8,8 @@
 // =====================================================================
 import { defineStore } from "pinia";
 import { apiUrl } from "../config.js";
+import { apiControl } from "../net/control.js";
+import { useAuthStore } from "./auth.js";
 import { setSafetyConfig, getCameraPose, applyCameraPose } from "../three/manager.js";
 import { updateAlarm } from "../utils/alarm.js";
 import { defaultSafety, normalizeSafetyConfig } from "../utils/safetyConfig.js";
@@ -32,6 +34,13 @@ export const useSafetyStore = defineStore("safety", {
     error: "",
     events: [],
     lastState: "safe",
+    /**
+     * 这份 lastState 量的是谁：
+     *   "ghost" = 残影预演的**目标位姿**（"要去的地方会不会撞"）
+     *   "robot" = 实体机的**当前位姿**（实时监控）
+     * ★ 执行域据此区分：只有 "ghost" 才构成点位/示教/程序的拦截依据。
+     */
+    lastSource: "robot",
     last: { state: "safe", ratio: 1, clearance: 0, zoneId: "", zoneName: "" },
     appliedJson: "",
   }),
@@ -85,6 +94,22 @@ export const useSafetyStore = defineStore("safety", {
       this.apply();
     },
 
+    /**
+     * 统一处理写请求的响应。
+     * ★ 阶段 4：改围栏配置需要管理员令牌 —— 401/403 时直接把登录弹窗顶起来，
+     *   而不是只在面板里留一句看不懂的报错。@return 原始 Response（调用方自行判定）
+     */
+    _afterWrite(r) {
+      if (r.status === 401 || r.status === 403) {
+        const auth = useAuthStore();
+        this.error = r.status === 403
+          ? "该操作需要管理员权限（当前为操作员）"
+          : "需要管理员权限：请先获取控制令牌";
+        auth.requestLogin();
+      }
+      return r;
+    },
+
     async save() {
       if (!this.config || this.busy) return;
       this.busy = true;
@@ -93,13 +118,16 @@ export const useSafetyStore = defineStore("safety", {
       //   下次打开就被切回老角度（用户反馈的"改参数视角被切换"根源）。
       this._captureCamera(false);
       try {
-        const r = await fetch(apiUrl("/safety"), {
+        const r = await this._afterWrite(await apiControl("/safety", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ config: this.config }),
-        });
+        }));
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          throw new Error((d && d.detail) || "保存失败");
+        }
         const d = await r.json();
-        if (!r.ok) throw new Error((d && d.detail) || "保存失败");
         this.config = d.config;
         this.saved = clone(this.config);
         this.dirty = false;
@@ -117,7 +145,9 @@ export const useSafetyStore = defineStore("safety", {
       if (this.busy) return;
       this.busy = true;
       try {
-        const r = await fetch(apiUrl("/safety/reset"), { method: "POST" });
+        const r = await this._afterWrite(
+          await apiControl("/safety/reset", { method: "POST" }));
+        if (!r.ok) throw new Error("恢复默认失败");
         const d = await r.json();
         this.config = normalizeSafetyConfig(d.config);
         this.saved = clone(this.config);
@@ -197,8 +227,10 @@ export const useSafetyStore = defineStore("safety", {
       const st = s && s.state ? s.state : "safe";
       const prev = this.lastState;
       this.lastState = st;
+      this.lastSource = (s && s.source) || "robot";
       this.last = {
         state: st,
+        source: this.lastSource,
         ratio: s ? s.ratio : 1,
         clearance: s ? s.clearance : 0,
         zoneId: s ? s.zoneId : "",
@@ -234,8 +266,9 @@ export const useSafetyStore = defineStore("safety", {
     },
 
     async clearEvents() {
-      await fetch(apiUrl("/safety/events"), { method: "DELETE" });
-      this.events = [];
+      const r = await this._afterWrite(
+        await apiControl("/safety/events", { method: "DELETE" }));
+      if (r.ok) this.events = [];
     },
   },
 });

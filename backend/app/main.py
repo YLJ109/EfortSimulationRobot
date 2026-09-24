@@ -13,14 +13,36 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import control, recordings, robot, safety, ws
+from app.api import (
+    auth,
+    control,
+    events,
+    frames,
+    points,
+    programs,
+    recordings,
+    robot,
+    safety,
+    settings,
+    system,
+    vision,
+    ws,
+)
 from app.core.config import get_config, public_dir, db_path, dotenv_loaded
+from app.core.brand import (
+    DEVICE_MODEL,
+    SERVICE_NAME,
+    SERVICE_NAME_EN,
+    SERVICE_VERSION,
+)
 from app.core.exceptions import register_exception_handlers
 from app.core.logger import get_logger
 from app.core.middleware import RequestLogMiddleware
 from app.db.crud import prune_old_poses
 from app.db.database import SessionLocal, init_db
 from app.services.collector import collector
+from app.services.events import emit as emit_event
+from app.services.vision_ingest import ingest
 
 log = get_logger("main")
 if dotenv_loaded:
@@ -55,21 +77,41 @@ def _prune_history() -> None:
         log.warning("历史清理失败: %s", e)
 
 
+def _prune_vision() -> None:
+    """按配置清理超期的视觉分拣记录（启动时执行一次）。"""
+    try:
+        days = int(get_config().vision.get("retention_days", 0) or 0)
+        if days <= 0:
+            return
+        n = ingest.prune(days)
+        if n:
+            log.info("视觉记录清理: 删除 %d 条超过 %d 天的记录", n, days)
+    except Exception as e:
+        log.warning("视觉记录清理失败: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
     log.info("数据库就绪: %s", db_path())
     _prune_history()
+    _prune_vision()
     collector.start()
+    ingest.start()          # 视觉事件摄入（相机服务没起时会自动重试, 不影响后端启动）
+    emit_event("system", "info", "system.start",
+               f"服务已启动（{'模拟' if collector.simulated else '真实'}链路）",
+               {"simulated": collector.simulated, "connected": collector.connected})
     yield
+    emit_event("system", "info", "system.stop", "服务正在关闭")
+    ingest.stop()
     collector.stop()
     log.info("采集器已停止")
 
 
 app = FastAPI(
-    title="EFORT Web Monitoring",
-    version="0.2.0",
-    description="EFORT ER8-700H 工业机器人全栈 Web 监控与仿真系统",
+    title=SERVICE_NAME,
+    version=SERVICE_VERSION,
+    description=f"{SERVICE_NAME_EN} — {DEVICE_MODEL} 工业机器人全栈 Web 监控/仿真/控制系统",
     lifespan=lifespan,
 )
 
@@ -91,7 +133,17 @@ app.include_router(robot.router)
 app.include_router(ws.router)
 app.include_router(recordings.router)
 app.include_router(control.router)
+# 只读预演（/control/preview、/control/ik）：不挂 require_control —— 只算不发，见 control.py
+app.include_router(control.router_ro)
 app.include_router(safety.router)
+app.include_router(auth.router)
+app.include_router(points.router)
+app.include_router(programs.router)
+app.include_router(events.router)
+app.include_router(system.router)
+app.include_router(vision.router)
+app.include_router(frames.router)
+app.include_router(settings.router)
 
 
 # 存活探针/根信息：必须在静态挂载之前注册，否则被 mount("/") 拦截。
@@ -104,7 +156,14 @@ def healthz():
 @app.get("/api/version")
 def api_version():
     """服务版本信息（运维/诊断用）。"""
-    return {"service": "EFORT Web Monitoring", "version": "0.2.0", "docs": "/docs", "ws": "/ws/pose"}
+    return {
+        "service": SERVICE_NAME,
+        "service_en": SERVICE_NAME_EN,
+        "device": DEVICE_MODEL,
+        "version": SERVICE_VERSION,
+        "docs": "/docs",
+        "ws": "/ws/pose",
+    }
 
 
 # 生产: 托管前端构建产物 (SPA)。必须在 API 路由之后挂载。

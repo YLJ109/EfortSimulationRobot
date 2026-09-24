@@ -9,6 +9,7 @@
 import { ref, computed, watch } from "vue";
 import { useSafetyStore } from "../stores/safety.js";
 import { setAlarmEnabled } from "../utils/alarm.js";
+import Icon from "./Icon.vue";
 
 const safety = useSafetyStore();
 
@@ -283,7 +284,7 @@ watch(open, (v) => { if (v) safety.refreshEvents(); });
 
       <!-- 形状 -->
       <div class="sp-sec">
-        <div class="sp-sec-h" @click="sec.shape = !sec.shape">形状与尺寸 <i>{{ sec.shape ? "▾" : "▸" }}</i></div>
+        <div class="sp-sec-h" @click="sec.shape = !sec.shape">形状与尺寸 <Icon :name="sec.shape ? 'chevronDown' : 'chevronRight'" :size="14" /></div>
         <div v-show="sec.shape">
           <div class="btns" style="margin-bottom:8px">
             <button :class="{ primary: cur.shape === 'rect' }" @click="setShape(cur, 'rect')">矩形</button>
@@ -321,7 +322,7 @@ watch(open, (v) => { if (v) safety.refreshEvents(); });
 
       <!-- 阈值 -->
       <div class="sp-sec">
-        <div class="sp-sec-h" @click="sec.thr = !sec.thr">接近 / 远离 阈值 <i>{{ sec.thr ? "▾" : "▸" }}</i></div>
+        <div class="sp-sec-h" @click="sec.thr = !sec.thr">接近 / 远离 阈值 <Icon :name="sec.thr ? 'chevronDown' : 'chevronRight'" :size="14" /></div>
         <div v-show="sec.thr">
           <div class="fld">
             <label>接近告警 {{ warnPct }}%</label>
@@ -352,7 +353,7 @@ watch(open, (v) => { if (v) safety.refreshEvents(); });
 
       <!-- 颜色与闪烁 -->
       <div class="sp-sec">
-        <div class="sp-sec-h" @click="sec.color = !sec.color">颜色 / 闪烁 / 叠加 <i>{{ sec.color ? "▾" : "▸" }}</i></div>
+        <div class="sp-sec-h" @click="sec.color = !sec.color">颜色 / 闪烁 / 叠加 <Icon :name="sec.color ? 'chevronDown' : 'chevronRight'" :size="14" /></div>
         <div v-show="sec.color">
           <div class="sp-colors">
             <span v-for="k in ['safe', 'warn', 'danger', 'hit']" :key="k" class="sp-c">
@@ -384,7 +385,7 @@ watch(open, (v) => { if (v) safety.refreshEvents(); });
 
       <!-- 全局围栏与碰撞 -->
       <div class="sp-sec">
-        <div class="sp-sec-h" @click="sec.global = !sec.global">全局围栏与碰撞 <i>{{ sec.global ? "▾" : "▸" }}</i></div>
+        <div class="sp-sec-h" @click="sec.global = !sec.global">全局围栏与碰撞 <Icon :name="sec.global ? 'chevronDown' : 'chevronRight'" :size="14" /></div>
         <div v-show="sec.global">
           <div class="sp-line">
             <label>四面透明玻璃</label>
@@ -447,7 +448,7 @@ watch(open, (v) => { if (v) safety.refreshEvents(); });
 
       <!-- 报警 -->
       <div class="sp-sec">
-        <div class="sp-sec-h" @click="sec.alarm = !sec.alarm">报警与视角 <i>{{ sec.alarm ? "▾" : "▸" }}</i></div>
+        <div class="sp-sec-h" @click="sec.alarm = !sec.alarm">报警与视角 <Icon :name="sec.alarm ? 'chevronDown' : 'chevronRight'" :size="14" /></div>
         <div v-show="sec.alarm">
           <div class="sp-line">
             <label>顶部报警条</label>
@@ -471,19 +472,19 @@ watch(open, (v) => { if (v) safety.refreshEvents(); });
             <input type="checkbox" :checked="cfg.alarm.sound" @change="setAlarm('sound', $event)" />
           </div>
           <div class="btns" style="margin-top:8px">
-            <button @click="safety.saveCamera()">📷 保存视角</button>
-            <button @click="safety.resetCamera()">↺ 复位视角</button>
+            <button @click="safety.saveCamera()"><Icon name="snapshot" :size="15" /> 保存视角</button>
+            <button @click="safety.resetCamera()"><Icon name="refresh" :size="15" /> 复位视角</button>
           </div>
         </div>
       </div>
 
       <!-- 报警记录 -->
       <div class="sp-sec">
-        <div class="sp-sec-h" @click="sec.events = !sec.events">报警记录 ({{ safety.events.length }}) <i>{{ sec.events ? "▾" : "▸" }}</i></div>
+        <div class="sp-sec-h" @click="sec.events = !sec.events">报警记录 ({{ safety.events.length }}) <Icon :name="sec.events ? 'chevronDown' : 'chevronRight'" :size="14" /></div>
         <div v-show="sec.events">
           <div class="btns" style="margin-bottom:8px">
-            <button @click="safety.refreshEvents()">↻ 刷新</button>
-            <button @click="safety.clearEvents()">🗑 清空</button>
+            <button @click="safety.refreshEvents()"><Icon name="refresh" :size="15" /> 刷新</button>
+            <button @click="safety.clearEvents()"><Icon name="trash" :size="15" /> 清空</button>
           </div>
           <div class="ev-list">
             <div v-if="!safety.events.length" class="rec-empty">暂无报警记录</div>
@@ -500,7 +501,7 @@ watch(open, (v) => { if (v) safety.refreshEvents(); });
       <!-- 保存 / 重置 / 撤销 -->
       <div class="btns" style="margin-top:10px">
         <button class="primary" :disabled="safety.busy" @click="safety.save()">
-          {{ safety.dirty ? "● 保存" : "保存" }}
+          <Icon v-if="safety.dirty" name="alert" :size="14" /> 保存
         </button>
         <button :disabled="!safety.dirty" @click="safety.revert()">撤销</button>
         <button :disabled="safety.busy" @click="safety.reset()">重置</button>

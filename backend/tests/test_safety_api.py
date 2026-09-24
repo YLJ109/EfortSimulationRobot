@@ -18,6 +18,20 @@ def tmp_safety_path(tmp_path, monkeypatch):
     yield p
 
 
+def _admin(client) -> dict:
+    """管理员令牌头（阶段 4：改围栏配置必须是 admin）。"""
+    r = client.post("/api/auth/login", json={"password": "test1234"})
+    assert r.status_code == 200, r.text
+    return {"X-Control-Token": r.json()["token"]}
+
+
+def test_put_requires_token(client):
+    """★ 阶段 4：改安全围栏配置必须持有令牌，否则 401。"""
+    cfg = sc.default_safety()
+    assert client.put("/api/safety", json={"config": cfg}).status_code == 401
+    assert client.post("/api/safety/reset").status_code == 401
+
+
 def test_get_default(client):
     r = client.get("/api/safety")
     assert r.status_code == 200
@@ -32,7 +46,7 @@ def test_put_and_persist(client):
     cfg = sc.default_safety()
     cfg["zones"][0]["half"] = {"x": 1.10, "z": 0.95}
     cfg["zones"][0]["thresholds"]["warn"] = 0.45
-    r = client.put("/api/safety", json={"config": cfg})
+    r = client.put("/api/safety", json={"config": cfg}, headers=_admin(client))
     assert r.status_code == 200
     assert r.json()["ok"] is True
     got = client.get("/api/safety").json()
@@ -44,7 +58,7 @@ def test_put_rejects_bad_thresholds(client):
     cfg = sc.default_safety()
     cfg["zones"][0]["thresholds"]["warn"] = 0.10
     cfg["zones"][0]["thresholds"]["danger"] = 0.50   # danger 必须 < warn
-    r = client.put("/api/safety", json={"config": cfg})
+    r = client.put("/api/safety", json={"config": cfg}, headers=_admin(client))
     assert r.status_code == 400
     assert r.json()["code"] == "SAFETY_CONFIG_INVALID"
     assert "危险阈值" in r.json()["message"]
@@ -53,14 +67,14 @@ def test_put_rejects_bad_thresholds(client):
 def test_put_rejects_bad_color(client):
     cfg = sc.default_safety()
     cfg["zones"][0]["colors"]["safe"] = "green"      # 必须 #RRGGBB
-    r = client.put("/api/safety", json={"config": cfg})
+    r = client.put("/api/safety", json={"config": cfg}, headers=_admin(client))
     assert r.status_code == 400
 
 
 def test_put_rejects_bad_shape(client):
     cfg = sc.default_safety()
     cfg["zones"][0]["shape"] = "triangle"
-    r = client.put("/api/safety", json={"config": cfg})
+    r = client.put("/api/safety", json={"config": cfg}, headers=_admin(client))
     assert r.status_code == 400
 
 
@@ -68,7 +82,7 @@ def test_circle_zone_roundtrip(client):
     cfg = sc.default_safety()
     cfg["zones"][0]["shape"] = "circle"
     cfg["zones"][0]["radius"] = 1.25
-    r = client.put("/api/safety", json={"config": cfg})
+    r = client.put("/api/safety", json={"config": cfg}, headers=_admin(client))
     assert r.status_code == 200
     got = client.get("/api/safety").json()
     assert got["zones"][0]["shape"] == "circle"
@@ -79,7 +93,7 @@ def test_quad_zone_roundtrip(client):
     cfg = sc.default_safety()
     cfg["zones"][0]["shape"] = "quad"
     cfg["zones"][0]["corners"] = [[0, 1], [1, 0], [0, -1], [-1, 0]]
-    r = client.put("/api/safety", json={"config": cfg})
+    r = client.put("/api/safety", json={"config": cfg}, headers=_admin(client))
     assert r.status_code == 200
     assert client.get("/api/safety").json()["zones"][0]["shape"] == "quad"
 
@@ -87,8 +101,8 @@ def test_quad_zone_roundtrip(client):
 def test_reset(client):
     cfg = sc.default_safety()
     cfg["zones"][0]["half"]["x"] = 2.5
-    client.put("/api/safety", json={"config": cfg})
-    r = client.post("/api/safety/reset")
+    client.put("/api/safety", json={"config": cfg}, headers=_admin(client))
+    r = client.post("/api/safety/reset", headers=_admin(client))
     assert r.status_code == 200
     assert r.json()["config"]["zones"][0]["half"]["x"] == 0.82
 
@@ -104,7 +118,7 @@ def test_events_crud(client):
     assert lst[0]["state"] == "hit"
     assert lst[0]["zone_name"] == "主工作区"
 
-    d = client.delete("/api/safety/events")
+    d = client.delete("/api/safety/events", headers=_admin(client))
     assert d.json()["ok"] is True
     assert client.get("/api/safety/events").json() == []
 

@@ -5,7 +5,7 @@
 import * as THREE from "three";
 import {
   zonePolygon, polygonHalfspaces, clearanceToPolygon, clearanceToCircle,
-  basisOf, classify, evaluateZone, classifyGround,
+  basisOf, classify, evaluateZone, classifyGround, STATE_RANK,
 } from "../src/three/safety.js";
 
 let pass = 0, fail = 0;
@@ -165,6 +165,30 @@ console.log("== 7. 地面碰撞分级（绿/黄/红/红闪，报警垫配色依�
   ok("同上 0.02m → danger", classifyGround(0.02, tight) === "danger");
   // 缺省阈值兜底（不传阈值也不报错）
   ok("缺省阈值兜底可用", ["safe", "warn", "danger", "hit"].includes(classifyGround(0.5, {})));
+}
+
+console.log("== 8. ★ 下发门控判据（点位/示教/程序按残影目标位姿拦截） ==");
+{
+  // 全站三处严重度比较（围栏取最差 / 残影泛红 / 执行域拦截）都建立在这张表上。
+  // 顺序一旦被改动，"危险"就可能比"接近"还轻 —— 拦截会静默失效，界面却完全正常。
+  ok("STATE_RANK 顺序严格递增 safe<warn<danger<hit",
+    STATE_RANK.safe < STATE_RANK.warn && STATE_RANK.warn < STATE_RANK.danger
+      && STATE_RANK.danger < STATE_RANK.hit,
+    JSON.stringify(STATE_RANK));
+  ok("STATE_RANK 只含四档、无多余键", Object.keys(STATE_RANK).length === 4);
+
+  // 门控规则（与 stores/exec.js 的 gateAt / ghostUnsafe 同一表达式）：
+  //   拦截 ⇔ rank(state) >= rank(danger)
+  const blocks = (state) => STATE_RANK[state] >= STATE_RANK.danger;
+  ok("safe → 放行", blocks("safe") === false);
+  ok("warn（接近）→ 放行（接近不等于撞上，仍允许运动）", blocks("warn") === false);
+  ok("danger → 拦截", blocks("danger") === true);
+  ok("hit → 拦截", blocks("hit") === true);
+
+  // 反证：判据不是恒真/恒假
+  ok("反证：四个状态里既有放行也有拦截",
+    ["safe", "warn", "danger", "hit"].map(blocks).includes(true)
+      && ["safe", "warn", "danger", "hit"].map(blocks).includes(false));
 }
 
 console.log(`\n结果: ${pass} PASS / ${fail} FAIL`);

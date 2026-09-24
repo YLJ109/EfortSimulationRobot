@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 
+def _ctrl_headers(client):
+    """获取控制类接口所需的鉴权头(阶段1 鉴权门)。"""
+    r = client.post("/api/auth/login", json={"password": "test1234"})
+    assert r.status_code == 200, r.text
+    return {"X-Control-Token": r.json()["token"]}
+
+
 def test_healthz(client):
     r = client.get("/healthz")
     assert r.status_code == 200
@@ -48,7 +55,7 @@ def test_export_csv(client):
 
 
 def test_control_limits(client):
-    r = client.get("/api/control/limits")
+    r = client.get("/api/control/limits", headers=_ctrl_headers(client))
     assert r.status_code == 200
     data = r.json()
     assert data["readonly"] is True
@@ -97,7 +104,7 @@ def test_recordings_crud(client):
 def test_control_preview_joint_ok(client):
     r = client.post("/api/control/preview", json={
         "mode": "joint", "joints": [10, 0, 0, 0, 0, 0], "current": [0, 0, 0, 0, 0, 0],
-    })
+    }, headers=_ctrl_headers(client))
     assert r.status_code == 200
     data = r.json()
     assert data["ok"] is True
@@ -107,7 +114,7 @@ def test_control_preview_joint_ok(client):
 def test_control_preview_joint_violation(client):
     r = client.post("/api/control/preview", json={
         "mode": "joint", "joints": [999, 0, 0, 0, 0, 0], "current": [0, 0, 0, 0, 0, 0],
-    })
+    }, headers=_ctrl_headers(client))
     data = r.json()
     assert len(data["violations"]) >= 1
     assert data["ok"] is False
@@ -118,12 +125,47 @@ def test_control_ik(client):
         "tcp": {"x": 300, "y": 0, "z": 700},
         "current": [0, 0, 0, 0, 0, 0],
         "keep_orientation": False,
-    })
+    }, headers=_ctrl_headers(client))
     assert r.status_code == 200
     data = r.json()
     assert "joints" in data
     assert len(data["joints"]) == 6
     assert data["readonly"] is True
+
+
+def test_control_preview_public_no_token(client):
+    """★ 回归（历史缺陷 P1-9）：/preview 只算不发，**无控制令牌也必须可用**。
+
+    它挂在 router_ro（不挂 require_control）上；「模拟仿真」页是公开页，未登录
+    访客点预演不该吃 401 —— 那会让控制台刷满 401 且按钮永远点不动。
+    """
+    r = client.post("/api/control/preview", json={
+        "mode": "joint", "joints": [10, 0, 0, 0, 0, 0], "current": [0, 0, 0, 0, 0, 0],
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+
+
+def test_control_ik_public_no_token(client):
+    """★ 同 /preview：/ik 只做逆解，不写寄存器 → 公开只读。"""
+    r = client.post("/api/control/ik", json={
+        "tcp": {"x": 300, "y": 0, "z": 700},
+        "current": [0, 0, 0, 0, 0, 0],
+        "keep_orientation": False,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["readonly"] is True
+
+
+def test_write_endpoints_still_require_token(client):
+    """★ 放开的是"计算"，不是"下发"：写操作必须仍然要令牌。
+
+    这是上一组用例的反向守卫 —— 万一哪天有人图省事把 require_control 从
+    router 级依赖挪成模块级全局豁免，这里会立刻红。
+    """
+    assert client.post("/api/control/move", json={"joints": [0] * 6}).status_code == 401
+    assert client.post("/api/control/estop").status_code == 401
+    assert client.post("/api/control/jog/step", json={"joint": 1, "dir": 1}).status_code == 401
 
 
 def test_reconnect(client):

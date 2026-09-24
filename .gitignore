@@ -36,6 +36,16 @@ camera/models/*.pt
 *.tar.gz
 .release/
 
+# 测试/构建临时产物(不入库)
+.pytest_out.txt
+.pytest_tmp*/
+backend/.pytest_tmp*/
+frontend/build_err.txt
+frontend/vite.config.js.timestamp-*.mjs
+
+# 独立仓库(自带 git 版本管理, 避免内嵌 gitlink)
+efort_panel_pyqt6/
+
 # 系统
 .DS_Store
 Thumbs.db

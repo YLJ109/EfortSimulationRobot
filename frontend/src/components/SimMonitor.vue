@@ -1,19 +1,45 @@
 <script setup>
-// 模拟仿真视图：键盘控制 + 关节/直角指令预演（只算不发）+ 外观切换 + 录制。
+// 模拟仿真视图：键盘控制 + 关节/直角指令预演（只算不发）。
+// ★ 外观固定使用官方数模（ER8-700H GLB 可动版），本页不再提供模型切换。
 import { ref, reactive, computed, watch, onMounted, onBeforeUnmount } from "vue";
 import { useRobotStore } from "../stores/robot.js";
-import { useRecordingStore } from "../stores/recording.js";
-import {
-  applyRobotPose, getTcp, setShowGlb, getShowGlb, setGripperOpen,
-} from "../three/manager.js";
+import { getTcp } from "../three/manager.js";
 import { apiUrl } from "../config.js";
 import { dancePose } from "../utils/dance.js";
 import MonitorLayout from "./MonitorLayout.vue";
+import Icon from "./Icon.vue";
 
 const robot = useRobotStore();
-const rec = useRecordingStore();
 
-const showGlb = ref(getShowGlb());   // 与 manager 的当前状态对齐(默认官方真机数模)
+// =====================================================================
+// 只读接口的响应处理（/control/preview 与 /control/ik）
+//
+// ★ 这两个接口是**公开只读**的（后端 control.py 的 router_ro，不挂 require_control）：
+//   模拟仿真页在 tabs.js 里是公开页，让"只算不发"的预演去要控制令牌，只会让未登录
+//   访客的控制台刷满 401，按钮本身也永远点不动。
+// ★ 但仍必须处理失败：FastAPI 的校验错误（422）把 detail 放成数组、
+//   HTTPException 把 detail 放成字符串或对象。不解析就只能显示"undefined"，
+//   现场拿着这句话没法排查（这正是之前踩过的坑）。
+// =====================================================================
+async function readJson(r) {
+  try { return await r.json(); } catch (e) { return {}; }
+}
+
+function errText(d, status) {
+  const detail = d && d.detail;
+  if (typeof detail === "string" && detail) return detail;
+  if (Array.isArray(detail) && detail.length) {
+    // pydantic 校验错误：[{loc:[...], msg:"..."}] —— 只取第一条，够定位了
+    const m = detail[0] && detail[0].msg;
+    if (m) return String(m);
+  }
+  if (detail && typeof detail === "object") {
+    const m = detail.message || detail.error;
+    if (m) return String(m);
+  }
+  return (d && (d.message || d.error)) || ("后端返回 " + status);
+}
+
 const simTcp = ref({ x: 0, y: 0, z: 0 });
 const cmdMode = ref("joint");
 const cmdJoints = reactive([0, 0, 0, 0, 0, 0]);
@@ -45,6 +71,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
   if (cmdTimer) clearInterval(cmdTimer);
   stopDance();
+  robot.clearOverride("sim");
 });
 
 function clampQ(i, v) {
@@ -52,17 +79,20 @@ function clampQ(i, v) {
   return Math.min(lim.max, Math.max(lim.min, v));
 }
 
+// ★ 姿态权威模型：本页不再直接驱动 3D —— 把沙盘姿态登记为 override(owner="sim")，
+//   只有本页在前台时生效；App.vue 的渲染循环统一读取 displayQ 下发到 3D。
 function applySimPose() {
-  if (robot.activeView !== "sim") return;   // 单模型：只有本视图在前台才驱动姿态
-  applyRobotPose(robot.simQ);
+  if (robot.activeView !== "sim") return;   // 单模型：只有本视图在前台才登记
+  robot.setOverride("sim", robot.simQ, getTcp());
   simTcp.value = getTcp();
 }
 
 watch(() => robot.simQ, applySimPose, { deep: true, immediate: true });
-// 切回模拟仿真时补一次姿态 + TCP；切走时停止跳舞
+// 切回模拟仿真时补一次姿态 + TCP；切走时停止跳舞并交还姿态（override 只认前台 owner，
+// 但主动清掉更干净：回来时会由 immediate watch 重新登记）
 watch(() => robot.activeView, (v) => {
   if (v === "sim") applySimPose();
-  else stopDance();
+  else { stopDance(); robot.clearOverride("sim"); }
 });
 
 function onKey(e) {
@@ -120,7 +150,10 @@ async function moveCart(axis, delta) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ current: robot.simQ, tcp: dh, keep_orientation: false }),
     });
-    const d = await r.json();
+    const d = await readJson(r);
+    // ★ 先判 HTTP 状态再判业务字段：/ik 是**公开只读**接口（无需控制令牌），
+    //   出问题时后端会给出结构化 detail，不能当成"没有 joints 字段"糊过去。
+    if (!r.ok) { ikMsg.value = "IK 请求失败：" + errText(d, r.status); return; }
     if (d.joints && d.in_limits) {
       robot.setSimQ(d.joints);
       ikMsg.value = `末端 → (${th.x.toFixed(0)}, ${th.y.toFixed(0)}, ${th.z.toFixed(0)}) mm`;
@@ -140,19 +173,6 @@ function onSlider(i, e) {
   robot.setSimQ(q);
 }
 
-function toggleGlb(v) {
-  showGlb.value = v;
-  setShowGlb(v);
-  setGripperOpen(gripperOpen.value);   // 切到官方数模时同步夹爪开度
-}
-
-// J6 末端夹爪开度(mm)，仅官方数模带末端装置
-const gripperOpen = ref(46);
-function onGripper(e) {
-  gripperOpen.value = parseFloat(e.target.value) || 0;
-  setGripperOpen(gripperOpen.value);
-}
-
 // ---------- 指令预演 ----------
 function fillCmd() {
   if (cmdMode.value === "joint") {
@@ -165,20 +185,40 @@ function fillCmd() {
   }
 }
 
+/** 轨迹按时间线性插值（后端返回的 keyframe 序列，t 单位 ms）。 */
+function lerpPose(frames, tMs) {
+  if (tMs <= frames[0].t) return frames[0];
+  const last = frames[frames.length - 1];
+  if (tMs >= last.t) return last;
+  let lo = 0, hi = frames.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].t <= tMs) lo = mid; else hi = mid;
+  }
+  const a = frames[lo], b = frames[hi];
+  const span = b.t - a.t || 1;
+  const r = (tMs - a.t) / span;
+  return {
+    j1: a.j1 + (b.j1 - a.j1) * r, j2: a.j2 + (b.j2 - a.j2) * r,
+    j3: a.j3 + (b.j3 - a.j3) * r, j4: a.j4 + (b.j4 - a.j4) * r,
+    j5: a.j5 + (b.j5 - a.j5) * r, j6: a.j6 + (b.j6 - a.j6) * r,
+  };
+}
+
 function playTrajectory(traj) {
   if (cmdTimer) clearInterval(cmdTimer);
   const total = traj[traj.length - 1].t || 1;
   const t0 = performance.now();
   cmdTimer = setInterval(() => {
     const el = performance.now() - t0;
-    const p = rec.lerpPose(traj, Math.min(el, total));
+    const p = lerpPose(traj, Math.min(el, total));
     robot.setSimQ([p.j1, p.j2, p.j3, p.j4, p.j5, p.j6]);
     if (el >= total) { clearInterval(cmdTimer); cmdTimer = null; }
   }, 40);
 }
 
 // ---------- 跳舞演示 ----------
-// 轨迹定义在 utils/dance.js —— 与「真实监控离线演示」共用同一段动作（单一来源）。
+// 轨迹定义在 utils/dance.js（单一来源）。
 // J1 摆头 / J2·J3 舒展起伏 / J4 翻腕 / J5 点头 / J6 腕部摆动，平滑无跳变。
 const dancing = ref(false);
 let danceTimer = null;
@@ -202,17 +242,17 @@ function renderResult(d) {
   const parts = [];
   if (d.violations && d.violations.length) {
     cmdResultCls.value = "err";
-    parts.push("✗ 超限: " + d.violations.map((v) => `${v.joint}=${v.value}°(限 ${v.min}~${v.max})`).join(", "));
+    parts.push("超限: " + d.violations.map((v) => `${v.joint}=${v.value}°(限 ${v.min}~${v.max})`).join(", "));
   } else {
     cmdResultCls.value = "ok";
-    parts.push("✓ 限位通过");
+    parts.push("限位通过");
   }
   if (d.solver && d.solver.type === "ik") {
     parts.push(`IK: 位置误差 ${d.solver.pos_err_mm}mm / 姿态 ${d.solver.rot_err_deg}° (${d.solver.iters} 次迭代)`);
   }
   parts.push(`目标关节: [${(d.target || []).map((v) => v.toFixed(1)).join(", ")}]`);
   if (d.tcp_end) parts.push(`末端: (${d.tcp_end.join(", ")}) mm · 位移 ${d.distance_mm}mm`);
-  if (d.warnings && d.warnings.length) parts.push("⚠ " + d.warnings.join("；"));
+  if (d.warnings && d.warnings.length) parts.push(d.warnings.join("；"));
   cmdResult.value = parts.join("<br>");
 }
 
@@ -237,8 +277,9 @@ async function onPreview() {
     const r = await fetch(apiUrl("/control/preview"), {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    const d = await r.json();
-    if (d.error) { cmdResultCls.value = "err"; cmdResult.value = "✗ " + d.error; return; }
+    const d = await readJson(r);
+    if (!r.ok) { cmdResultCls.value = "err"; cmdResult.value = "预演失败：" + errText(d, r.status); return; }
+    if (d.error) { cmdResultCls.value = "err"; cmdResult.value = d.error; return; }
     renderResult(d);
     if (d.trajectory && d.trajectory.length) playTrajectory(d.trajectory);
   } catch (e) {
@@ -249,13 +290,14 @@ async function onPreview() {
 </script>
 
 <template>
-  <MonitorLayout view="sim">
-    <template #hud>
-      <div class="sim-hud">{{ selHud }}</div>
-    </template>
-    <div class="side-cards">
-      <div class="card">
-        <h3>操控模式</h3>
+  <div class="sim-root">
+    <MonitorLayout view="sim">
+      <template #hud>
+        <div class="sim-hud">{{ selHud }}</div>
+      </template>
+      <div class="side-cards">
+        <div class="card">
+          <h3>操控模式</h3>
         <div class="btns" style="margin-bottom:8px">
           <button :class="{ primary: controlMode === 'joint' }" @click="controlMode = 'joint'">关节模式</button>
           <button :class="{ primary: controlMode === 'cart' }" @click="controlMode = 'cart'">机器人模式</button>
@@ -278,27 +320,16 @@ async function onPreview() {
           <div class="small" style="margin-top:4px">{{ ikMsg }}</div>
         </template>
         <div class="status"><span class="dot warn"></span><span>就绪（只算不发）</span></div>
-      </div>
-      <div class="card">
-        <h3>录制控制</h3>
-        <div class="btns">
-          <button :disabled="rec.recOn" @click="rec.startRecording('sim')">⏺ 录制</button>
-          <button :disabled="!rec.recOn || rec.recorder.source !== 'sim'" @click="rec.stopRecording()">⏹ 停止</button>
         </div>
-        <div class="rec-state">
-          状态: <b>{{ rec.recOn && rec.recorder.source === 'sim' ? `录制中 · 已录 ${rec.recorder.frames.length} 帧` : '空闲' }}</b>
-        </div>
-        <div class="small" style="margin-top:6px">录制期间用键盘/滑块摆动作，停止后自动保存到「录制回放」库。</div>
-      </div>
       <div class="card">
         <h3>演示动作</h3>
         <div class="btns">
-          <button class="primary" :disabled="dancing" @click="startDance">🕺 跳舞演示</button>
-          <button :disabled="!dancing" @click="stopDance">⏹ 停止</button>
+          <button class="primary" :disabled="dancing" @click="startDance"><Icon name="play" :size="15" /> 跳舞演示</button>
+          <button :disabled="!dancing" @click="stopDance"><Icon name="stop" :size="15" /> 停止</button>
         </div>
         <div class="small" style="margin-top:8px">
           一段预设的关节轨迹（J1 摆头 / J2·J3 舒展起伏 / J4 翻腕 / J5 点头 / J6 腕部摆动），
-          经姿态平滑丝滑循环。真实监控离线时也播放同一段动作。
+          经姿态平滑丝滑循环。
         </div>
       </div>
       <div class="card">
@@ -308,22 +339,6 @@ async function onPreview() {
           <input type="range" :min="robot.limits[i]?.min ?? -180" :max="robot.limits[i]?.max ?? 180"
                  step="0.1" :value="robot.simQ[i]" @input="onSlider(i, $event)" />
           <span class="deg">{{ robot.simQ[i].toFixed(1) }}</span>
-        </div>
-      </div>
-      <div class="card">
-        <h3>外观</h3>
-        <div class="btns">
-          <button :class="{ primary: !showGlb }" @click="toggleGlb(false)">程序化(可动)</button>
-          <button :class="{ primary: showGlb }" @click="toggleGlb(true)">官方数模(可动)</button>
-        </div>
-        <div class="small" style="margin-top:8px">
-          「官方数模」= ER8-700H 官方 STEP 实物外观，已按 DH 关节轴重挂，六轴跟随关节角运动，
-          并按真机配色重新上色（白漆机身 / 深灰五金 / 铝银法兰）。<b>真实监控与本页共用这一套。</b>
-        </div>
-        <div v-if="showGlb" style="margin-top:10px">
-          <div class="row"><span class="k">J6 末端夹爪</span><span class="v">{{ gripperOpen.toFixed(0) }} mm 开度</span></div>
-          <input type="range" min="30" max="160" step="1" :value="gripperOpen" @input="onGripper" />
-          <div class="small">官方数模带 J6 气动平行夹爪（含法兰适配盘/气管/警示条），随 J6 一起运动。</div>
         </div>
       </div>
       <div class="card">
@@ -353,7 +368,11 @@ async function onPreview() {
           <button @click="fillCmd">取当前姿态</button>
           <button class="primary" @click="onPreview">预演</button>
         </div>
-        <div class="cmd-result small" :class="cmdResultCls" style="margin-top:8px" v-html="cmdResult"></div>
+        <div class="cmd-result small" :class="cmdResultCls" style="margin-top:8px">
+          <Icon v-if="cmdResultCls === 'ok'" name="check" :size="14" class="cr-ico" />
+          <Icon v-else-if="cmdResultCls === 'err'" name="alert" :size="14" class="cr-ico" />
+          <span v-html="cmdResult"></span>
+        </div>
       </div>
       <div class="card">
         <h3>末端 TCP (mm)</h3>
@@ -362,5 +381,13 @@ async function onPreview() {
         <div class="row"><span class="k">Z</span><span class="v">{{ simTcp.z.toFixed(1) }}</span></div>
       </div>
     </div>
-  </MonitorLayout>
+    </MonitorLayout>
+  </div>
 </template>
+
+<style scoped>
+.sim-root { position: relative; flex: 1; min-height: 0; display: flex; }
+/* 左侧浮动物体管理面板：可折叠，靠在 3D 视口左上、避开顶部 HUD 一行 */
+.sim-floating { position: absolute; left: 12px; top: 44px; width: 286px; z-index: 30;
+  max-height: calc(100% - 60px); overflow-y: auto; }
+</style>
