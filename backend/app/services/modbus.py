@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Robox 控制器 Modbus TCP 只读客户端。
+Robox 控制器 Modbus TCP 客户端。
 协议与已验证的 robot_pose.py 完全一致:
   FC3, 起始地址 10, 读 12 个保持寄存器;
   每关节 2 寄存器组成 float32(大端, 字序交换: 高字在后)。
   关节角单位: 度。
+
+★ 审计修复 P1-E4 —— 模块 docstring 原写"**只读客户端**"，与实现不符：
+  本模块明确会写控制器（FC6 写指令字 40101 / 速度 40103 / 程序号 40104 /
+  点动触发位 40135 与目标角 40139~44），是**真机会动**的写通道。
+  "只读"的错觉会让人放松对写路径的审查，也会误导部署时的防火墙/白名单决策。
+  写操作的双闸在 motion 层（EFORT_REAL_MOTION + robot.yaml real_write），
+  与本模块是否"只读"无关 —— 详见 docs/审计-项目代码审计与优化改进方案.md P1-E4。
 """
 from __future__ import annotations
 
@@ -101,6 +108,37 @@ class ModbusRobot:
         except Exception:
             return False
 
+    def reload_config(self) -> Dict[str, Any]:
+        """★ 审计修复 P1-C2：按当前配置刷新连接参数（不新建实例）。
+
+        原实现 host/port/timeout 在 ``__init__`` 里读死，而设置页把
+        ``connection.*`` 标成 apply="reconnect" —— 用户改完 IP 点「立即生效」，
+        探测和采集仍在用旧地址，只能重启进程，属于"声明与实现不符"。
+
+        就地改字段而不是 ``ModbusRobot()`` 新建实例：本对象被采集线程与
+        执行线程**共享**，换实例会让一帧进行到一半的 IO 落在被丢弃的旧 socket 上。
+        参数变化时在 IO 锁内关掉旧连接，确保下一发走新地址。
+        """
+        cfg = get_config()
+        conn = cfg.connection
+        mb = cfg.modbus
+        new = {
+            "host": conn.get("host", "192.168.1.12"),
+            "port": int(conn.get("port", 502)),
+            "uid": int(conn.get("unit_id", 1)),
+            "timeout": float(conn.get("timeout_s", 2.0)),
+            "func": int(mb.get("func", 3)),
+            "base_addr": int(mb.get("base_addr", 10)),
+            "count": int(mb.get("count", 12)),
+        }
+        with self._io_lock:
+            changed = any(getattr(self, k) != v for k, v in new.items())
+            if changed:
+                for k, v in new.items():
+                    setattr(self, k, v)
+                self._close()      # 旧连接仍指向旧地址/旧超时，必须断开
+        return {"changed": changed, "host": new["host"], "port": new["port"]}
+
     def _close(self) -> None:
         if self._sock is not None:
             try:
@@ -154,11 +192,22 @@ class ModbusRobot:
         if fc not in (3, 4):
             return None, "非预期功能码 0x%02x" % fc
 
-        bc = data[8]
-        regs = struct.unpack(">%dH" % (bc // 2), data[9:9 + bc])
-        if len(regs) < 12:
-            return None, "寄存器不足 %d" % len(regs)
-        pose = [_words_to_float(regs[i * 2], regs[i * 2 + 1]) for i in range(6)]
+        # ★ 审计修复 P1-A4：帧解析必须纳入保护。
+        #   原实现在 try 之外裸用 struct.unpack / 下标访问，坏帧（byte count
+        #   与实际长度不符、截断帧）会抛 struct.error 直接穿透到采集线程，
+        #   若上层无兜底 → 采集线程死亡（"假活"）。
+        try:
+            bc = data[8]
+            if bc < 24 or len(data) < 9 + bc:
+                return None, "byte count %d 与帧长 %d 不符" % (bc, len(data))
+            if bc > 300:
+                return None, "byte count %d 异常（疑似帧失步）" % bc
+            regs = struct.unpack(">%dH" % (bc // 2), data[9:9 + bc])
+            if len(regs) < 12:
+                return None, "寄存器不足 %d" % len(regs)
+            pose = [_words_to_float(regs[i * 2], regs[i * 2 + 1]) for i in range(6)]
+        except Exception as e:
+            return None, "帧解析失败: %s" % e
         return pose, None
 
     # ==================================================================
@@ -173,13 +222,41 @@ class ModbusRobot:
     # ==================================================================
     @staticmethod
     def encode_angle(deg: float) -> int:
-        """角度 → 有符号 16 位（×100 补码）。量化 0.01°。"""
-        return int(round(float(deg) * ANG_SCALE)) & 0xFFFF
+        """角度 → 有符号 16 位（×100 补码）。量化 0.01°。
+
+        ★ 审计修复 P0-1：原实现 `int(round(deg*100)) & 0xFFFF` 对超出
+          ±327.67° 的角度会**静默回绕**（350° → 35000 → 35000-65536 = -30536
+          → 下发 -305.36°，方向完全相反），且回读比对拿到的也是回绕后的值，
+          于是"回读一致"校验形同虚设。超出量程一律拒绝，绝不静默反号。
+        """
+        v = int(round(float(deg) * ANG_SCALE))
+        if v < -0x8000 or v > 0x7FFF:
+            raise ValueError(
+                "角度 %s° 超出 int16×100 表示范围(±327.67°)，拒绝下发" % deg)
+        return v & 0xFFFF
 
     @staticmethod
     def decode_angle(word: int) -> float:
         v = word - 0x10000 if word > 0x7FFF else word
         return v / ANG_SCALE
+
+    @staticmethod
+    def _to_signed(word: Optional[int]) -> Optional[int]:
+        """无符号寄存器字 → 有符号值。用于回读比对（P0-1 配套）。"""
+        if word is None:
+            return None
+        w = int(word) & 0xFFFF
+        return w - 0x10000 if w > 0x7FFF else w
+
+    def _echo_matches(self, got: Optional[int], want: int) -> bool:
+        """回读比对必须按**有符号值**解码后再比，不能比原始无符号字。
+
+        P0-1 配套：`want` 是 encode_angle 返回的 0..65535 补码，
+        `got` 是控制器回读的字，二者都转成有符号后才等价。
+        """
+        if got is None:
+            return False
+        return self._to_signed(got) == self._to_signed(want)
 
     def read_regs(self, addr: int, qty: int) -> Tuple[Optional[List[int]], Optional[str]]:
         """FC3 读任意寄存器区。返回 (寄存器列表, None) 或 (None, 错误)。"""
@@ -198,12 +275,26 @@ class ModbusRobot:
             return None, "Modbus 异常 0x%02x" % (data[8] if len(data) > 8 else 0)
         if fc != 3:
             return None, "非预期功能码 0x%02x" % fc
-        bc = data[8]
-        regs = struct.unpack(">%dH" % (bc // 2), data[9:9 + bc])
+        # ★ 审计修复 P1-A4：解析纳入保护，坏帧返回 (None, err) 而非抛异常穿透
+        try:
+            bc = data[8]
+            if len(data) < 9 + bc:
+                return None, "byte count %d 与帧长 %d 不符" % (bc, len(data))
+            regs = struct.unpack(">%dH" % (bc // 2), data[9:9 + bc])
+        except Exception as e:
+            return None, "帧解析失败: %s" % e
         return list(regs), None
 
     def write_reg(self, addr: int, value: int) -> Tuple[Optional[int], Optional[str]]:
-        """FC6 写单寄存器。返回 (回显值, None) 或 (None, 错误)。★ 回显在 body[3:5]。"""
+        """FC6 写单寄存器。返回 (回显值, None) 或 (None, 错误)。
+
+        ★★ 帧布局（务必按这个取，别再挪偏）：MBAP 7 字节
+           [0:2]事务 [2:4]协议 [4:6]长度 [6]单元号，随后 PDU：
+           [7]功能码 [8:10]**寄存器地址** [10:12]**寄存器值**。
+        ★ 真实事故（速度设定回读不一致）：原实现取 `data[9:11]` —— 那是"地址低字节+值高字节"，
+          写 40103=17% 时地址 102=0x0066、值 17=0x0011，于是回显被解成 0x6600 = **26112**，
+          触发 B-03「速度设定回读不一致：写 17% 读回 26112%」，把正确的下发误判为失败。
+        """
         try:
             with self._io_lock:
                 s = self._ensure_sock()
@@ -213,14 +304,15 @@ class ModbusRobot:
         except Exception as e:
             self._close()
             return None, "写异常: %s" % e
-        if len(data) < 9:
+        if len(data) < 12:
             return None, "写响应过短 %d 字节" % len(data)
         fc = data[7]
         if fc & 0x80:
             return None, "Modbus 异常 0x%02x" % (data[8] if len(data) > 8 else 0)
         if fc != 6:
             return None, "非预期功能码 0x%02x" % fc
-        return struct.unpack(">H", data[9:11])[0] if len(data) >= 11 else None, None
+        # ★ 值在 [10:12]：地址占 [8:10]，不要取到地址字节（见上方真实事故注释）
+        return struct.unpack(">H", data[10:12])[0], None
 
     def rc_command(self, word: int) -> Tuple[Optional[int], Optional[str]]:
         """写 40101 指令字。★ 必须同沿单条写入（保留 Bit0+Bit12）。"""
@@ -235,6 +327,11 @@ class ModbusRobot:
         regs, err = self.read_regs(0, READ_BLOCK)
         if regs is None:
             return None, err
+        # ★ 全维度审查 B-15：控制器返回短帧时，下面的 regs[ADDR_JOINT1+i*2] 会
+        #   IndexError → 采集循环被整条打崩、/api/rc-status 直接 500。
+        #   这里显式校验寄存器数量并回可读错误。
+        if len(regs) < READ_BLOCK:
+            return None, "寄存器数不足 %d（期望 %d）" % (len(regs), READ_BLOCK)
         ro, err2 = self.read_regs(ADDR_RO_TRIG, RO_WINDOW)
         wo, err3 = self.read_regs(ADDR_WO_STAT, 1)
         st = regs[ADDR_STATUS]
@@ -259,23 +356,34 @@ class ModbusRobot:
 
     def rc_write_jog_target(self, joints: List[float]) -> Tuple[bool, Optional[str]]:
         """写 6 个目标绝对角到 40139~44（6 发 FC6）+ 回读校验。不置触发位。"""
-        for i, a in enumerate(joints[:6]):
-            _, err = self.write_reg(ADDR_JOG_ANG + i, self.encode_angle(a))
+        # ★ 审计修复 P0-1：encode_angle 现在会对超量程抛 ValueError，
+        #   必须在**写任何一个寄存器之前**先整体校验，避免写了一半才失败。
+        try:
+            encoded = [self.encode_angle(a) for a in joints[:6]]
+        except ValueError as e:
+            return False, str(e)
+        if len(encoded) < 6:
+            return False, "目标角不足 6 个（收到 %d）" % len(encoded)
+        for i, word in enumerate(encoded):
+            _, err = self.write_reg(ADDR_JOG_ANG + i, word)
             if err:
                 return False, "写目标角 J%d 失败: %s" % (i + 1, err)
         ro, err = self.read_regs(ADDR_RO_TRIG, RO_WINDOW)
         if ro is None:
             return False, "目标角回读失败: %s" % err
         for i in range(6):
-            want = self.encode_angle(joints[i])
+            want = encoded[i]
             got = ro[4 + i] if 4 + i < len(ro) else None
-            if got != want:
-                return False, ("目标角回读不一致 J%d：写 %d 读 %s"
-                               % (i + 1, want, got))
+            # ★ P0-1：有符号比对（原实现比无符号字，回绕值会被误判一致）
+            if not self._echo_matches(got, want):
+                return False, ("目标角回读不一致 J%d：写 %s 读 %s"
+                               % (i + 1, self.decode_angle(want),
+                                  self.decode_angle(got) if got is not None else None))
         return True, None
 
     def rc_jog_execute(self, joints: List[float], speed_pct: int = 100,
-                       on_event=None, should_abort=None) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+                       on_event=None, should_abort=None,
+                       cur_joints: Optional[List[float]] = None) -> Tuple[bool, Optional[str], Dict[str, Any]]:
         """完整点动链路（同步）：校验触发位 → 写目标+回读 → settle → 触发 → 等完成 → 撤触发。
 
         调用方需已通过 real_write + EFORT_REAL_MOTION 双确认（见 motion.py）。
@@ -283,10 +391,18 @@ class ModbusRobot:
         should_abort() 可选，急停回调：在触发前与等待完成轮询中检查，
         为 True 时立即撤触发并中止（不等待本次点动走完）—— 急停必须能
         打断飞行中的点动，而不是排队等它自然结束（最长可达 30s）。
+        cur_joints: ★ 审计修复 P1-A2 —— 下发时的当前位姿，用于按**真实位移**
+        估算完成位超时；不传则退回"绝对角"保守口径（只会更宽松）。
         """
         detail: Dict[str, Any] = {"steps": []}
-        ev = (lambda step, msg: (detail["steps"].append({"step": step, "msg": msg}),
-                                 on_event(step, msg) if on_event else None)[1])
+
+        # ★ 审计修复 P1-E13：原为一行嵌套 lambda（ruff E731）。展开成 def 之后，
+        #   副作用顺序一眼可见：先落一步明细，再把同一拍透传给调用方的上报回调。
+        #   三个调用点都不用返回值，故显式标注 -> None。
+        def ev(step: str, msg: str) -> None:
+            detail["steps"].append({"step": step, "msg": msg})
+            if on_event:
+                on_event(step, msg)
 
         # 0) 前置守卫：触发位必须空闲（上一发还没收尾就再写 = 竞态，绝不允许）
         if should_abort and should_abort():
@@ -316,24 +432,33 @@ class ModbusRobot:
             return False, "置触发位失败: %s" % err, detail
         ev("trigger", "触发位已置 1")
 
-        # 4) 等完成位（40035.Bit0）。超时按速度与位移估算：40103=5% ≈1.3°/s，
-        #    100% ≈60~90°/s —— 用保守的 45°/s@100% 线性折算再放宽 2s。
-        max_deg = max(abs(float(j)) for j in joints[:6])
-        timeout = max(4.0, max_deg / max(1.0, 45.0 * min(100, speed_pct) / 100.0) * 2.0 + 2.0)
+        # ★ 审计修复 P1-A1：触发位清理必须走 finally。
+        #   原实现在第 4 步等待期间若抛异常（read_regs 内部虽吞异常，但
+        #   结构变化/编码错误/KeyboardInterrupt 都会穿透），触发位恒为 1，
+        #   下一发被"触发位仍为 1"守卫永久拒绝 → 点动链路整条瘫痪。
         t0 = time.time()
         done = False
         aborted = False
-        while time.time() - t0 < timeout:
-            if should_abort and should_abort():
-                aborted = True
-                break
-            wo, err = self.read_regs(ADDR_WO_STAT, 1)
-            if wo is not None and (wo[0] & 0x0001):
-                done = True
-                break
-            time.sleep(0.05)
-        # 5) 无论成败都撤触发（finally 语义：程序回到 WAIT 挂起）
-        _, cerr = self.write_reg(ADDR_RO_TRIG, 0x0000)
+        cerr = None
+        try:
+            # 4) 等完成位（40035.Bit0）。超时按**位移**与速度估算：
+            #    40103=5% ≈1.3°/s，100% ≈60~90°/s —— 保守 45°/s@100% 线性折算 + 2s。
+            #    ★ 审计修复 P1-A2：原式用"绝对角"当位移（J2 在 -90° 静止也要等 6s），
+            #      改为用真实位移 max|目标 - 当前|；无当前位姿时退回旧口径。
+            disp = self._max_displacement(joints, cur_joints)
+            timeout = max(4.0, disp / max(1.0, 45.0 * min(100, speed_pct) / 100.0) * 2.0 + 2.0)
+            while time.time() - t0 < timeout:
+                if should_abort and should_abort():
+                    aborted = True
+                    break
+                wo, err = self.read_regs(ADDR_WO_STAT, 1)
+                if wo is not None and (wo[0] & 0x0001):
+                    done = True
+                    break
+                time.sleep(0.05)
+        finally:
+            # 5) 无论成败（含异常）都撤触发（程序回到 WAIT 挂起）
+            _, cerr = self.write_reg(ADDR_RO_TRIG, 0x0000)
         detail["elapsed_s"] = round(time.time() - t0, 3)
         detail["timeout_s"] = round(timeout, 2)
         if aborted:
@@ -345,6 +470,23 @@ class ModbusRobot:
             return False, "完成但撤触发失败: %s" % cerr, detail
         ev("done", "完成位已置 1，用时 %0.2fs" % detail["elapsed_s"])
         return True, None, detail
+
+    @staticmethod
+    def _max_displacement(joints: List[float],
+                          cur_joints: Optional[List[float]]) -> float:
+        """下发目标相对当前位姿的最大关节位移（deg）。
+
+        无当前位姿（调用方未传）时退回"绝对角最大值"这一保守口径，
+        保证超时只会更长、不会更短 —— 宁可多等，不可早判失败。
+        """
+        try:
+            tgt = [float(j) for j in joints[:6]]
+            if cur_joints is None or len(cur_joints) < 6:
+                return max(abs(v) for v in tgt)
+            cur = [float(c) for c in cur_joints[:6]]
+            return max(abs(t - c) for t, c in zip(tgt, cur)) or 0.0
+        except Exception:
+            return 0.0
 
     def rc_estop(self, on: bool) -> Tuple[bool, Optional[str]]:
         """软件急停/停止：0x1005 停止命令字（旧 estop_addr 方案已证伪废弃）。"""

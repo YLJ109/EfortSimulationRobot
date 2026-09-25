@@ -114,11 +114,16 @@ def main():
         img = render(hex_bgr(hx))
         r = eng.detect(img)
         got = r["results"][0]["color"]["name"] if r["results"] else "<无目标>"
+        # ★ 2026-09-25：实时链路改为"只用颜色阈值"（对齐参考实现）后，白/黑/灰/银灰这类
+        #   **低饱和**物体在前景掩膜里根本不存在 → "<无目标>" 是**预期结果**，不是泄漏。
+        #   本断言真正要守的是"绝不给非三色输入**新造**出 橙/黄/青 等三色之外的类别名"。
+        if got == "<无目标>":
+            continue
         if got not in vc.RGB_NAMES and got != "未知":
-            # 非三色输入绝不能"新造"出 橙/黄/青/草绿 等非三色类别名（三色化铁律）
             leak_bad.append("%s->%s" % (name, got))
     ok("红/绿/蓝可判回自己", not reach_bad, "错判: " + ", ".join(reach_bad))
-    ok("非目标不新造三色外类别", not leak_bad, "泄漏: " + ", ".join(leak_bad[:8]))
+    ok("非目标不新造三色外类别（无目标/未知均视为正常）", not leak_bad,
+       "泄漏: " + ", ".join(leak_bad[:8]))
 
     print("== D. 只认长方形（圆必须剔除） ==")
     eng2 = vc.VisionEngine(background=BG_IMG, use_mog2=False)
@@ -128,12 +133,16 @@ def main():
     rc = eng3.detect(render(hex_bgr("#1F4FD8"), shape="circle"))
     ok("圆形被剔除", len(rc["results"]) == 0, "找到 %d 个" % len(rc["results"]))
 
-    print("== E. 稳定判定：静止只触发一次；离开后复位 ==")
+    print("== E. 稳定判定：静止持续触发；离开后复位 ==")
     eng4 = vc.VisionEngine(background=BG_IMG, use_mog2=False)
     frame = render(hex_bgr("#4CAF50"))
     fires = [bool(eng4.detect(frame.copy()).get("fire")) for _ in range(6)]
-    ok("6 帧内恰好触发 1 次", sum(fires) == 1, "触发次数=%d 序列=%s" % (sum(fires), fires))
-    ok("第 3 帧触发", fires[2] is True, "序列=%s" % fires)
+    # ★ 语义已按实机改为"实时模式"：稳定后**只要目标还在场就持续触发**（帧率节流交给上层
+    #   color_min_interval）。旧断言"6 帧恰好 1 次"与实现矛盾，属过期断言，这里更正。
+    first = fires.index(True) if any(fires) else -1
+    ok("第 1 帧不触发、第 2 帧起持续触发（实时模式，stable_frames=2）",
+       first == 1 and all(fires[1:]), "序列=%s" % fires)
+    ok("第 3 帧仍在触发", fires[2] is True, "序列=%s" % fires)
     for _ in range(12):                       # 目标离开
         eng4.detect(BG_IMG.copy())
     ok("目标离开后复位为 EMPTY", eng4.tracker.state == "EMPTY",
@@ -237,10 +246,94 @@ def main():
            vc.CHROMA_CUT,
            max(float(np.hypot(*vc.CARD_LAB[n][1:])) for n in vc.ACHROMATIC), mb_c))
 
+    # ------------------------------------------------------------------
+    # I. 只报一个目标（对齐参考实现 visual_object_detector.py）
+    # ------------------------------------------------------------------
+    print("== I. 只报一个：先过置信度阈值 → 取面积最大（并列取置信度高） ==")
+    rs = [
+        {"area": 100, "color": {"conf": 0.90, "name": "红"}},
+        {"area": 900, "color": {"conf": 0.30, "name": "绿"}},   # 面积最大但不达标
+        {"area": 500, "color": {"conf": 0.80, "name": "蓝"}},
+    ]
+    ok("过滤后取面积最大者（蓝）",
+       [r["color"]["name"] for r in vc.pick_best(rs, 0.5)] == ["蓝"],
+       str([r["color"]["name"] for r in vc.pick_best(rs, 0.5)]))
+    ok("只返回 0 或 1 个", len(vc.pick_best(rs, 0.0)) == 1)
+    ok("全不达标 → 空", vc.pick_best(rs, 0.95) == [])
+    ok("空/None 输入 → 空", vc.pick_best([], 0.0) == [] and vc.pick_best(None, 0.0) == [])
+    ok("面积并列取置信度高者（绿）",
+       [r["color"]["name"] for r in vc.pick_best(
+           [{"area": 100, "color": {"conf": 0.3, "name": "红"}},
+            {"area": 100, "color": {"conf": 0.9, "name": "绿"}}], 0.0)] == ["绿"])
+    # ★ 用**正**阈值（相机服务实际就用 color_conf>0）：conf=0 的"未知色"必须被过滤掉。
+    #   （阈值=0 时 conf=0 也会通过，这是"不过滤"的正常语义，不是缺陷。）
+    try:
+        a = vc.pick_best([{"area": None, "color": None},
+                          {"area": 10, "color": {"conf": 0.5, "name": "红"}}], 0.1)
+        b = vc.pick_best([{"area": None, "color": None}], 0.1)
+        ok("坏数据不炸，且正阈值下 conf=0/None 被过滤",
+           len(a) == 1 and a[0]["color"]["name"] == "红" and b == [],
+           "a=%s b=%s" % (a, b))
+    except Exception as ex:                      # noqa: BLE001
+        ok("坏数据不炸，且正阈值下 conf=0/None 被过滤", False, repr(ex))
+
+    # I2. color_only（实时链路口径）：只用颜色阈值，彩色矩形可检出、灰色物体不产生候选
+    e_col = vc.VisionEngine(color_only=True)
+    ok("color_only：彩色矩形可检出",
+       len(e_col.detect(render(hex_bgr("#1F4FD8")))["results"]) == 1)
+    e_col2 = vc.VisionEngine(color_only=True)
+    ok("color_only：低饱和灰物体不产生候选（只认彩色，是预期取舍）",
+       len(e_col2.detect(render(hex_bgr(vc.COLOR_CARD["灰"])))["results"]) == 0)
+
+    # I3. 绝对面积下限：小于 min_area_abs 的目标被挡掉（参考实现 MIN_AREA 口径）
+    e_abs = vc.VisionEngine(color_only=True)
+    small = np.full((H, W, 3), BG, np.uint8)
+    cv2.rectangle(small, (300, 220), (340, 260), hex_bgr("#1F4FD8"), -1)   # 40x40 = 1600 < 2500
+    ok("小于绝对面积下限的小块被挡掉",
+       len(e_abs.detect(small)["results"]) == 0,
+       "thr.min_area_abs=%s" % vc.DEFAULT_THR.get("min_area_abs"))
+
+    # ------------------------------------------------------------------
+    # J. 现场场景：物体被遮挡 / 移动 —— 实时链路必须照样检出
+    #    （用户现场反馈："物体移动时检测不到""只出现矩形的一部分"）
+    # ------------------------------------------------------------------
+    print("== J. 遮挡 / 移动场景：实时链路（纯颜色阈值）必须照样检出 ==")
+
+    # J1. 部分遮挡：矩形右下角被灰色夹具压住 ~1/4 → 仍应检出
+    #     （旧的实心度 0.90 会把这个带缺口的形状整块拒掉）
+    occ = render(hex_bgr("#1F4FD8"))
+    cv2.rectangle(occ, (int(W / 2) + 10, int(H / 2) + 10),
+                  (int(W / 2) + 140, int(H / 2) + 110), (BG, BG, BG), -1)
+    r_occ = vc.VisionEngine().detect(occ)
+    ok("被遮挡一部分的矩形仍被检出", len(r_occ["results"]) == 1,
+       "检出 %d 个（阈值 min_fill=%.2f solidity=%.2f）"
+       % (len(r_occ["results"]), vc.DEFAULT_THR["min_fill"], vc.DEFAULT_THR["solidity_min"]))
+
+    # J2. 移动：同一个物体分别在左/右两个位置各测一帧（各自新引擎，模拟逐帧）
+    #     ★ 纯颜色阈值与"物体动没动"无关；若退回背景差分/MOG2，静止物体会消失、
+    #       移动物体只会留下残影 → 这条会红。
+    hits = 0
+    for dx in (-140, 140):
+        mv = np.full((H, W, 3), BG, np.uint8)
+        bx = cv2.boxPoints(((W / 2 + dx, H / 2), (240, 150), 8)).astype(np.int32)
+        cv2.fillPoly(mv, [bx], hex_bgr("#4CAF50"))
+        if vc.VisionEngine().detect(mv)["results"]:
+            hits += 1
+    ok("物体在不同位置都能检出（不依赖背景差分）", hits == 2, "命中 %d/2" % hits)
+
+    # J3. 只报一个：同帧放一大一小两块物料 → 经 pick_best 只报面积最大的那块
+    #     ★ 注意分层：`VisionEngine.detect()` 按设计返回**全部候选**（离线/调试要看全量），
+    #       "只报一个"是 `pick_best()` 的职责（相机服务实时链路用的就是它）。
+    two = render(hex_bgr("#1F4FD8"))                     # 主体 260x150
+    cv2.rectangle(two, (40, 40), (40 + 120, 40 + 90), hex_bgr("#4CAF50"), -1)  # 次体更小
+    r_two = vc.VisionEngine().detect(two)
+    best_two = vc.pick_best(r_two["results"], 0.0)
+    names = [x["color"]["name"] for x in best_two]
+    ok("同帧多目标时只报一个（面积最大的蓝）", len(best_two) == 1 and names == ["蓝"],
+       "候选 %s → 选中 %s" % ([x["color"]["name"] for x in r_two["results"]], names))
+
     print("")
     print("结果: %d 通过 / %d 失败" % (pass_n, fail_n))
     return 1 if fail_n else 0
-
-
 if __name__ == "__main__":
     sys.exit(main())

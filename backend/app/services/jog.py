@@ -22,6 +22,10 @@ from app.core.config import get_config
 from app.core.logger import get_logger
 from app.services import jog_frames as jf
 from app.services.collector import collector
+# ★ 审计修复 P1-E1：限位读取的唯一实现在 services/limits.py。
+#   本文件原先有 _limits() / _limit_dicts() 两份（tuple 与 dict 各一份，
+#   还各写各的兜底），现在都只做转发 —— 判据只可能有一个。
+from app.services.limits import load_limits, load_ranges
 from app.services.motion import motion
 from app.services.runmode import runmode
 from app.services.safety_guard import check as guard_check
@@ -75,23 +79,15 @@ class JogEngine:
             return 100
 
     def _limits(self) -> List[tuple]:
-        # ★ `or []`：yaml 里 `joint_limits:` 留空时 get() 返回 None（键存在但不取值），
-        #   直接切片会 TypeError。缺配置就退回宽限位，点动本身不该因此崩掉。
-        lim = get_config().get("joint_limits", default=[]) or []
-        if lim:
-            return [(float(l["min"]), float(l["max"])) for l in lim][:6]
-        return [(-180.0, 180.0)] * 6
+        # ★ 审计修复 P1-E1：见 services/limits.py。原实现在"配置条数 < 6"时
+        #   不补默认值，`limits[j - 1]` 会直接 IndexError（点动按钮 500）。
+        #   现在长度恒为 6，且与 control / vision / motion 读的是同一份配置解析。
+        return load_ranges()
 
     def _limit_dicts(self) -> List[dict]:
         """关节限位（dict 形式）—— 直角求解器（jog_frames）要带名字，便于报"哪个轴到限位了"。"""
-        lim = get_config().get("joint_limits", default=[]) or []
-        out: List[dict] = []
-        for i, l in enumerate(lim[:6]):
-            out.append({"name": l.get("name") or f"J{i + 1}",
-                        "min": float(l["min"]), "max": float(l["max"])})
-        while len(out) < 6:
-            out.append({"name": f"J{len(out) + 1}", "min": -180.0, "max": 180.0})
-        return out
+        # ★ 审计修复 P1-E1：与 _limits() 同源，只是形态不同（多一个 name）。
+        return load_limits()
 
     # ---------- 直角系速度上限（单位按轴）----------
     @property
@@ -344,6 +340,13 @@ class JogEngine:
             self._stop_locked(reason)
         return {"ok": True, "action": "stop", "stopped_motion": was, **self.state()}
 
+    # ★ 审计修复 P1-A10：交给 motion.command 的中止判据（死人开关/看门狗/松手停止）。
+    #   只做裸读 bool —— 回调发生在**已持有 motion._exec_lock 的下发线程**里，
+    #   若这里去抢 jog._lock，一旦别的线程同时"持 jog._lock 调 motion.command"
+    #   就会锁序打架；bool 赋值在 CPython 下是原子的，裸读足够。
+    def _stopped_for_abort(self) -> bool:
+        return not self._active
+
     def _stop_locked(self, reason: str) -> None:
         self._active = False
         self._deadline = 0.0
@@ -397,7 +400,13 @@ class JogEngine:
                     elif nxt > hi:
                         nxt, hit_limit = hi, True
                     q[j - 1] = nxt
-                    res = motion.command([float(v) for v in q], self._speed_pct(sp), 0)
+                    # ★ 审计修复 P1-A10：点动下发必须可被"停止"打断。
+                    #   rc_jog_execute 同步阻塞最长 30s，只靠急停中断的话，
+                    #   看门狗超时/松手停止要等这一发走完才停（远超 watchdog_ms=1500）。
+                    #   判据用裸读 bool：**不能在回调里抢 jog._lock**，
+                    #   否则与"持有 _exec_lock 的下发线程"形成锁序耦合。
+                    res = motion.command([float(v) for v in q], self._speed_pct(sp), 0,
+                                         abort_check=self._stopped_for_abort)
                     scale = 1.0
                     limit_names = [f"J{j}"]
                 else:
@@ -414,7 +423,8 @@ class JogEngine:
                         log.warning("直角点动求解失败，已停止：%s", self._last_reason)
                         break
                     q = [float(v) for v in r["joints"]]
-                    res = motion.command(q, self._speed_pct(r["need_dps"]), 0)
+                    res = motion.command(q, self._speed_pct(r["need_dps"]), 0,
+                                         abort_check=self._stopped_for_abort)
                     scale = float(r.get("scale") or 1.0)
                     hit_limit = bool(r.get("hit_limit"))
                     limit_names = [h["joint"] for h in (r.get("hit_limit") or [])]

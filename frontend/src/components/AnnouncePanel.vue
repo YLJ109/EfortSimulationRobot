@@ -5,7 +5,8 @@ import { computed, onMounted, ref } from "vue";
 import Icon from "./Icon.vue";
 import { annCfg, setConfig, testAnnounce, annHistory, clearHistory, listVoices, unlockAudio, audioReady } from "../services/announcer.js";
 
-const props = defineProps({ open: { type: Boolean, default: false } });
+// ★ P1-E13：只声明不接引用（模板里直接用 open，本文件没有读 props.xxx）。
+defineProps({ open: { type: Boolean, default: false } });
 const emit = defineEmits(["close"]);
 
 const voices = ref([]);
@@ -135,7 +136,7 @@ const timeText = (d) => new Date(d).toLocaleTimeString("zh-CN", { hour12: false 
 </template>
 
 <style scoped>
-.ap-wrap { position: fixed; inset: 0; z-index: 60; background: var(--scrim); }
+.ap-wrap { position: fixed; inset: 0; z-index: 150; background: var(--scrim); }
 .ap-panel { position: absolute; right: 16px; top: 54px; width: 380px; max-height: calc(100vh - 76px);
   display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line);
   border-radius: 10px; box-shadow: var(--shadow-lg); overflow: hidden; }

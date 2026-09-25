@@ -15,7 +15,7 @@ from app.db.database import SessionLocal
 from app.db.crud import insert_pose
 from app.services.events import emit as emit_event
 from app.services.hub import hub
-from app.services.kinematics import simulate_pose, tcp_of
+from app.services.kinematics import tcp_of
 from app.services.modbus import ModbusRobot
 from app.services.motion import motion, real_write_enabled
 from app.services.runmode import runmode
@@ -26,6 +26,14 @@ log = get_logger("collector")
 # 寄存器快照（rc-status）并入 WS 的广播周期：与旧前端 4s 轮询节奏一致，
 # 点到 / 适度 —— rc_snapshot 是 3 个 FC3 事务，太高会拖采集循环，太低则点动体验迟钝。
 RC_STATUS_INTERVAL = 4.0
+
+
+def _backoff(restarts: int) -> float:
+    """采集循环崩溃后的重启退避秒数：0.5 → 1 → 2 → 4 → 8 → 封顶 30s。
+
+    ★ P1-A5：既要"立刻重试"（短暂故障秒级恢复），又不能退化成无限疯狂重启。
+    """
+    return min(30.0, 0.5 * (2 ** max(0, restarts - 1)))
 
 
 class Collector:
@@ -75,6 +83,17 @@ class Collector:
         """
         # ★ 与自动恢复保持一致：显式 simulate=always 时，手动重连也不切真实，
         #   否则演示/离线调试环境点一下"重连"就被拽回真机链路。
+        # ★ 审计修复 P1-C2：重连前先按**当前**配置刷新连接参数 ——
+        #   设置页把 connection.host/port/timeout 标成 apply="reconnect"，
+        #   原实现却一直用 import 时读死的旧地址探测，"改完没生效"。
+        #   collector 与 motion 各持一个 ModbusRobot 实例，两个都要刷。
+        try:
+            self.modbus.reload_config()
+            from app.services.motion import motion as _motion
+            if _motion.modbus is not self.modbus:
+                _motion.modbus.reload_config()
+        except Exception as e:
+            log.warning("刷新连接配置失败（保持原参数）: %s", e)
         mode = str(get_config().connection.get("simulate", "auto")).lower()
         ok = False if mode == "always" else self.modbus.reachable()
         with self._lock:
@@ -91,21 +110,59 @@ class Collector:
         return {"connected": self.connected, "simulated": self.simulated}
 
     def _loop(self) -> None:
-        cfg = get_config()
-        samp = cfg.sampling
+        """采集线程主入口：循环体异常兜底（★ 审计修复 P1-A5）。
+
+        采集线程一旦静默死掉，前端姿态/安全灯会永远停在最后一帧 —— 操作员
+        看到的是一台"画面正常、数据不动"的机器人，比直接报错危险得多。
+        这里把整个循环体包一层：任何未预料的异常只降级重启，不结束线程；
+        连续崩溃按指数退避，避免刷爆日志与事件总线。
+        """
+        restarts = 0
+        while self._running:
+            t_start = time.time()
+            try:
+                self._loop_impl()
+                return                       # _running=False 的正常退出
+            except Exception as e:
+                restarts += 1
+                log.exception("采集循环异常退出（第 %d 次），%.1f 秒后重启",
+                              restarts, _backoff(restarts))
+                try:
+                    emit_event("connection", "error", "collector.crashed",
+                               f"采集循环异常，已自动重启（第 {restarts} 次）",
+                               {"error": str(e)[:200]})
+                except Exception:
+                    pass                     # 事件总线本身出错也不能挡住重启
+                if not self._running:
+                    return
+                # 瞬时异常（进循环就崩）才退避；跑了一阵才崩说明系统仍在工作
+                elapsed = time.time() - t_start
+                if elapsed < 1.0:
+                    deadline = time.time() + _backoff(restarts)
+                    while self._running and time.time() < deadline:
+                        time.sleep(0.2)
+
+    @staticmethod
+    def _sample_rates() -> Dict[str, float]:
+        """★ 审计修复 P1-C3：采样频率必须**每轮**重读。
+
+        原实现 `_loop` 只在线程启动时读一次，而设置页把
+        ``sampling.read_hz/ws_push_hz/db_write_hz`` 标成 live/reload/reconnect
+        （字段 help 还写着"防止数据库膨胀"）—— 调整入库频率完全无效。
+        纯 dict 取值，成本可忽略。
+        """
+        samp = get_config().sampling
         read_hz = float(samp.get("read_hz", 10))
         push_hz = float(samp.get("ws_push_hz", 20))
         db_hz = float(samp.get("db_write_hz", 2))
-        loop_freq = max(read_hz, push_hz)
-        interval = 1.0 / loop_freq
-        read_interval = 1.0 / max(read_hz, 0.5)   # P0-2: 真实读取按 read_hz 节流
-        db_interval = 1.0 / max(db_hz, 0.1)
-        t0 = time.time()
+        return {
+            "interval": 1.0 / max(read_hz, push_hz),
+            "read_interval": 1.0 / max(read_hz, 0.5),
+            "db_interval": 1.0 / max(db_hz, 0.1),
+        }
 
-        # 是否允许自动切回真实链路：显式 simulate=always 时禁止（见下方第 1 步）
-        sim_mode = str(get_config().connection.get("simulate", "auto")).lower()
-        allow_real = sim_mode != "always"
-
+    def _loop_impl(self) -> None:
+        cfg = get_config()
         # 轴符号校准 (config/robot.yaml: axis_sign), 界面转向与真机不符时可逐轴翻转
         signs = [float(s) for s in cfg.get("axis_sign", default=[1] * 6)]
         if len(signs) < 6:
@@ -122,12 +179,34 @@ class Collector:
         #   有指令后由 sim_robot 推着走。
         last_joints = [0.0] * 6
         sim_tracking = False
+        # ★ P1-A6：最近一次真实读取是否失败（失败帧必须标 stale，绝不冒充真机数据）
+        read_stale = False
         last_rc_at = 0.0
+        # ★ P1-C3：循环变量先给默认值，随后每轮（按 rate_next 节流）重读配置。
+        allow_real = str(get_config().connection.get("simulate", "auto")).lower() != "always"
+        interval, read_interval, db_interval = 0.05, 0.1, 0.5
+        rate_next = 0.0
 
         while self._running:
             loop_start = time.time()
-            t = loop_start - t0
             joints = None
+
+            # ★ P1-C3：采样频率每轮重读（设置页标的是 live/reload，原来只在线程
+            #   启动时读一次 → 调整 db_write_hz"防止数据库膨胀"根本无效）。
+            #   顺带每 2s 重读 simulate 开关，reload 后模式也能真的变。
+            #   纯 dict 取值，2s 一次的成本可忽略。
+            if loop_start >= rate_next:
+                rate_next = loop_start + 2.0
+                rates = self._sample_rates()
+                interval = rates["interval"]
+                read_interval = rates["read_interval"]
+                db_interval = rates["db_interval"]
+                sim_mode = str(get_config().connection.get("simulate", "auto")).lower()
+                allow_real = sim_mode != "always"
+                # 轴符号也一起重读：现场"转向与真机不符"时改 axis_sign 后 reload 即生效
+                signs = [float(s) for s in get_config().get("axis_sign", default=[1] * 6)]
+                if len(signs) < 6:
+                    signs = signs + [1.0] * (6 - len(signs))
 
             # 0) 手动重连请求: 模式已由 reconnect() 同步更新, 这里仅重置失败计数/重试定时
             with self._lock:
@@ -165,6 +244,7 @@ class Collector:
                         self.connected = True
                         last_joints = rj
                         joints = rj
+                        read_stale = False
                     else:
                         fail_count += 1
                         self.connected = False
@@ -178,12 +258,20 @@ class Collector:
                                        {"fail_count": fail_count, "error": str(err)[:200]})
                         else:
                             log.warning("Modbus 读取失败(%d/%d): %s", fail_count, FAIL_LIMIT, err)
-                        # 真实模式的短暂补帧：仍用扫掠，但不进入 tracking 语义
-                        joints = simulate_pose(t)
+                        # ★ 审计修复 P1-A6：读失败**不再补帧冒充真机数据**。
+                        #   原实现 joints = simulate_pose(t) —— 用一条与机器人无关的
+                        #   正弦扫掠顶上，画面继续"动"，操作员看到的是假姿态却毫无察觉。
+                        #   现在：冻结在最后一次有效读数上，并打上 stale 标记
+                        #   （前端据 stale 点亮黄色"数据陈旧"灯，见 P1-D7/D8）。
+                        joints = last_joints
+                        read_stale = True
                         sim_tracking = False
                 else:
                     joints = last_joints
                     sim_tracking = False
+
+            if self.simulated:
+                read_stale = False           # 模拟数据本来就是"合成"的，不叫陈旧
 
             joints = [j * s for j, s in zip(joints, signs)]
 
@@ -212,6 +300,10 @@ class Collector:
                 "j4": joints[3], "j5": joints[4], "j6": joints[5],
                 "tcp": {"x": tcp[0], "y": tcp[1], "z": tcp[2]},
                 "simulated": self.simulated,
+                # ★ P1-A6/P1-D7/D8：stale = 这一帧不是刚从控制器读到的真机数据
+                #   （读失败时冻结上一帧）。at = 本帧产生时刻(epoch 秒)，供前端算新鲜度。
+                "stale": bool(read_stale),
+                "at": loop_start,
                 "cmd": cmd,
                 "cmd_tcp": cmd_tcp,
                 "tracking": tracking,
@@ -226,10 +318,13 @@ class Collector:
                 last_rc_at = loop_start
                 self._publish_rc_status()
 
-            now = time.time()
-            if now - self._last_db_write >= db_interval:
-                self._last_db_write = now
-                self._db_write(joints, tcp)
+            # ★ P1-A6：stale 帧不入库 —— 冻结的重复姿态写进 pose 表只会污染历史曲线，
+            #   让"回放"看起来像机器人一直停在原地不动（而真实情况是通讯断了）。
+            if not read_stale:
+                now = time.time()
+                if now - self._last_db_write >= db_interval:
+                    self._last_db_write = now
+                    self._db_write(joints, tcp)
 
             elapsed = time.time() - loop_start
             sleep_t = interval - elapsed

@@ -31,7 +31,8 @@ export const useRcReadyStore = defineStore("rcReady", {
     error: "",         // 快照不可用原因
     at: 0,             // 最近一次成功时间戳
     busy: false,       // 一键就绪执行中
-    lastResult: null,  // 最近一次 /ready 完整结果（steps/summary/error）
+    lastResult: null,  // 最近一次 /ready 或 /ready/cancel 的完整结果（steps/summary/error）
+    lastAction: "",    // 上一次结果属于哪个动作："ready" | "cancel"（文案分流用）
     wsAt: 0,           // 最近一次收到 WS rc_status 帧的时间（stale 判定依据）
   }),
 
@@ -109,6 +110,7 @@ export const useRcReadyStore = defineStore("rcReady", {
       if (this.busy) return false;
       this.busy = true;
       this.lastResult = null;
+      this.lastAction = "ready";
       try {
         const body = prog ? { prog: Number(prog) } : {};
         const r = await apiControl("/ready", {
@@ -140,6 +142,35 @@ export const useRcReadyStore = defineStore("rcReady", {
       const ok = await link.claimMode(mode);
       await this.load();
       return ok;
+    },
+    /** 取消就绪：停止运行中的程序，可选关闭伺服。 */
+    async cancelReady(servoOff = false) {
+      if (this.busy) return false;
+      this.busy = true;
+      this.lastResult = null;
+      this.lastAction = "cancel";
+      try {
+        const r = await apiControl("/ready/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ servo_off: servoOff }),
+        });
+        if (r.status === 401 || r.status === 403) {
+          const auth = useAuthStore();
+          if (auth.requestLogin) auth.requestLogin();
+          this.lastResult = { ok: false, error: "需要控制权限" };
+          return false;
+        }
+        const d = await r.json().catch(() => ({}));
+        this.lastResult = d;
+        await this.load();
+        return !!d.ok;
+      } catch (e) {
+        this.lastResult = { ok: false, error: (e && e.message) || "网络错误" };
+        return false;
+      } finally {
+        this.busy = false;
+      }
     },
   },
 });

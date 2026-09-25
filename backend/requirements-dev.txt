@@ -1,3 +1,8 @@
+# ★ 审计修复 P1-E7：本文件是「支持范围」，精确版本见 requirements.lock。
 -r requirements.txt
-pytest>=8.0,<9.0
+# pytest：★ 已验证环境实测跑的是 9.1.1，原 `<9.0` 与之矛盾 → 放开到 <10。
+pytest>=8.0,<10.0
 httpx>=0.27,<1.0
+# ★ 审计修复 P1-E13：lint 用 ruff（配置见 ruff.toml）。
+#   CI 里 `ruff check` 不通过即红；本地 `python -m ruff check .`（在 backend/ 下）。
+ruff>=0.14,<0.15

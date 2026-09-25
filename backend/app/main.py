@@ -6,11 +6,13 @@ EFORT Web Monitoring 后端入口 (FastAPI)。
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import (
@@ -38,8 +40,9 @@ from app.core.brand import (
 from app.core.exceptions import register_exception_handlers
 from app.core.logger import get_logger
 from app.core.middleware import RequestLogMiddleware
-from app.db.crud import prune_old_poses
+from app.db.crud import prune_old_poses, prune_system_events
 from app.db.database import SessionLocal, init_db
+from starlette.middleware.base import BaseHTTPMiddleware
 from app.services.collector import collector
 from app.services.events import emit as emit_event
 from app.services.vision_ingest import ingest
@@ -61,7 +64,7 @@ class NoCacheStaticFiles(StaticFiles):
 
 
 def _prune_history() -> None:
-    """按配置保留天数清理历史 (启动时执行一次)。"""
+    """按配置保留天数清理历史（分批，见 crud.prune_batched）。"""
     try:
         days = int(get_config().sampling.get("history_retention_days", 0) or 0)
         if days <= 0:
@@ -78,7 +81,7 @@ def _prune_history() -> None:
 
 
 def _prune_vision() -> None:
-    """按配置清理超期的视觉分拣记录（启动时执行一次）。"""
+    """按配置清理超期的视觉分拣记录（分批）。"""
     try:
         days = int(get_config().vision.get("retention_days", 0) or 0)
         if days <= 0:
@@ -90,22 +93,82 @@ def _prune_vision() -> None:
         log.warning("视觉记录清理失败: %s", e)
 
 
+def _prune_events() -> None:
+    """★ 审计修复 P1-C5：审计表（system_events）原来**没有任何保留策略**，
+    只增不减 → 点动/下发/登录每条一 commit，7×24 下无限膨胀。
+    保留天数取 retention.audit_days（缺省 90 天，<=0 表示不清理）。
+    """
+    try:
+        days = int(get_config().get("retention", "audit_days", default=90) or 0)
+        if days <= 0:
+            return
+        s = SessionLocal()
+        try:
+            n = prune_system_events(s, days)
+            if n:
+                log.info("审计事件清理: 删除 %d 条超过 %d 天的记录", n, days)
+        finally:
+            s.close()
+    except Exception as e:
+        log.warning("审计事件清理失败: %s", e)
+
+
+def _prune_all() -> None:
+    """一次完整清理（启动时跑一遍，之后由周期任务复用）。"""
+    _prune_history()
+    _prune_vision()
+    _prune_events()
+
+
+def _prune_interval_sec() -> int:
+    """清理周期（秒）。缺省 1 小时；retention.prune_interval_min 可调。"""
+    try:
+        mins = int(get_config().get("retention", "prune_interval_min", default=60) or 0)
+        return max(300, mins * 60)
+    except Exception:
+        return 3600
+
+
+async def _prune_loop():
+    """★ 审计修复 P0-5：清理原来**只在启动跑一次**。
+    7×24 运行的监控服务永远不再清理 → pose_history 按 1550 万行/年、
+    日志按 15~30 MB/天 无限增长，最终磁盘打满、查询变慢、启动更慢。
+    现在改成后台周期任务；单轮失败不影响下一轮（有兜底 try）。
+    """
+    while True:
+        try:
+            await asyncio.to_thread(_prune_all)
+        except Exception:
+            log.exception("周期清理失败，下一轮继续")
+        await asyncio.sleep(_prune_interval_sec())
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
     log.info("数据库就绪: %s", db_path())
-    _prune_history()
-    _prune_vision()
+    # ★ P0-4：prune 已改为分批 + 短事务，启动不再可能因欠账 OOM/长锁。
+    #   为避免"启动即做大量 IO 拖慢就绪"，启动只清理一次，后续交给周期任务。
+    await asyncio.to_thread(_prune_all)
     collector.start()
     ingest.start()          # 视觉事件摄入（相机服务没起时会自动重试, 不影响后端启动）
     emit_event("system", "info", "system.start",
                f"服务已启动（{'模拟' if collector.simulated else '真实'}链路）",
                {"simulated": collector.simulated, "connected": collector.connected})
-    yield
-    emit_event("system", "info", "system.stop", "服务正在关闭")
-    ingest.stop()
-    collector.stop()
-    log.info("采集器已停止")
+    # ★ P0-5：周期清理任务（必须在 finally 里 cancel，否则关闭时留下悬挂任务）
+    prune_task = asyncio.create_task(_prune_loop())
+    try:
+        yield
+    finally:
+        prune_task.cancel()
+        try:
+            await prune_task
+        except asyncio.CancelledError:
+            pass
+        emit_event("system", "info", "system.stop", "服务正在关闭")
+        ingest.stop()
+        collector.stop()
+        log.info("采集器已停止")
 
 
 app = FastAPI(
@@ -117,13 +180,42 @@ app = FastAPI(
 
 # CORS：同源部署（前端 dist 由本服务托管）+ 开发用 vite proxy，浏览器视角均为同源，
 # 故无需携带凭据；通配符 origin 与 allow_credentials=True 是浏览器禁止的非法组合。
+# ★ 审计修复 P1-B5：原 allow_origins=["*"] + allow_methods/headers=["*"] 会把
+#   无鉴权写接口暴露给**任意第三方网页**（只要运维在同机开着浏览器访问过本服务）。
+#   生产是同源，根本不需要 CORS；只有开发时的 vite(5173) 才需要。
+_CORS_DEV_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",      # vite preview
+    "http://127.0.0.1:4173",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_DEV_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Control-Token", "Authorization"],
 )
+
+# ★ 审计修复 P1-B7：请求体大小上限。
+#   原来没有任何限制 —— 匿名可 POST 一个几百 MB 的 JSON（/recordings、/system/import
+#   等）直接把进程内存打爆。8 MB 覆盖现有最大合法载荷（导入的程序/点位包）。
+MAX_BODY_BYTES = int(os.environ.get("EFORT_MAX_BODY", str(8 * 1024 * 1024)))
+
+
+class BodyLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        cl = request.headers.get("content-length", "")
+        if cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+            return JSONResponse(
+                {"code": "PAYLOAD_TOO_LARGE", "message": "请求体过大",
+                 "detail": None},
+                status_code=413,
+            )
+        return await call_next(request)
+
+
+app.add_middleware(BodyLimitMiddleware)
 
 # 请求日志 + 全局异常处理
 app.add_middleware(RequestLogMiddleware)

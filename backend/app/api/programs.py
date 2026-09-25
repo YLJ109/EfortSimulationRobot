@@ -11,6 +11,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.core.safety_const import SPEED_MIN, SPEED_MAX
 from app.api.auth import require_control, token_role
 from app.core.deps import get_db
 from app.db.crud import (
@@ -33,7 +34,9 @@ def _actor(tok: str) -> str:
 
 class ProgramItem(BaseModel):
     point_id: int
-    speed_pct: int = Field(default=100, ge=1, le=100)
+    # ★ 全维度审查 C-16：原 default=100 / ge=1 与控制层（default=5 / ge=5）口径相反，
+    #   构成一条绕过 5% 下限的通道。统一到安全常量。
+    speed_pct: int = Field(default=SPEED_MIN, ge=SPEED_MIN, le=SPEED_MAX)
     dwell_ms: int = Field(default=0, ge=0, le=60000)
 
 

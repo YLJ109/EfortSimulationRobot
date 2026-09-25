@@ -223,7 +223,7 @@ export function announce(o) {
 }
 
 export function stopSpeak() {
-  try { if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel(); } catch (e) {}
+  try { if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel(); } catch (e) { /* 部分浏览器取消会抛，忽略即可 */ }
   queue.length = 0;
 }
 

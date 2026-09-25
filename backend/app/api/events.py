@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.auth import require_admin, token_role
+from app.api.auth import require_admin, require_control, token_role
 from app.core.deps import get_db
 from app.db import crud
 from app.services.events import emit as emit_event
@@ -57,7 +57,7 @@ def _row(r) -> dict:
     }
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(require_control)])
 def api_list_events(
     category: Optional[str] = Query(None, description="system|connection|auth|control|config|safety"),
     level: Optional[str] = Query(None, description="最低级别：debug|info|warn|error|critical"),
@@ -80,7 +80,7 @@ def api_list_events(
             "limit": limit, "offset": offset}
 
 
-@router.get("/stats")
+@router.get("/stats", dependencies=[Depends(require_control)])
 def api_stats(
     hours: Optional[float] = Query(None, ge=0, description="最近 N 小时"),
     db: Session = Depends(get_db),
@@ -89,7 +89,7 @@ def api_stats(
     return crud.system_event_stats(db, since)
 
 
-@router.get("/export")
+@router.get("/export", dependencies=[Depends(require_admin)])
 def api_export_events(
     format: str = Query("json", description="json | csv"),
     category: Optional[str] = None,

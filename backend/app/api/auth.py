@@ -5,7 +5,8 @@
 设计：
   - 管理员密码在启动时从环境变量 EFORT_ADMIN_PASSWORD 或配置文件 auth.admin_password
     载入，并用 PBKDF2 哈希保存在内存（不落盘明文）。
-  - 未配置密码时，启动时生成随机临时密码并打印到日志（提醒尽快设置），保证服务可起。
+  - 未配置密码时，启动时生成随机临时密码并保证服务可起。
+    ★ P1-B9 修正：日志里**不再打印口令原文**，只提示已生成并给出设置方式。
   - 前端用密码调 POST /api/auth/login 换取控制令牌（默认不限时，直到后端重启 /
     主动登出；可在设置页改为限时，或用 EFORT_CONTROL_TTL 设启动默认值）。
   - 所有"控制类"接口（/api/control/*）需在请求头带 X-Control-Token（或 Bearer），
@@ -27,11 +28,12 @@ import hmac
 import logging
 import os
 import secrets
+import threading
 import time
 from typing import Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.config import get_config
 from app.services.events import emit as emit_event
@@ -44,12 +46,13 @@ def _env_ttl() -> int:
 
     ★ 上限 30 天：手滑填个天文数字时按"基本等于不限时"处理，同时把明显的
       负数/垃圾值归 0，而不是让后端起不来。
+    ★ 默认 7200 秒（2 小时）：现场常用 2 小时轮班制，避免"忘记登出导致权限泄露"。
     """
-    raw = str(os.environ.get("EFORT_CONTROL_TTL", "0")).strip()
+    raw = str(os.environ.get("EFORT_CONTROL_TTL", "7200")).strip()
     try:
         v = int(raw)
     except ValueError:
-        v = 0
+        v = 7200
     return max(0, min(v, 2_592_000))
 
 
@@ -97,10 +100,15 @@ def _load_role_hash(env_var: str, cfg_key: str, label: str,
         if not required:
             return None      # 可选角色：没配就是禁用
         pw = secrets.token_urlsafe(10)
+        # ★ 审计修复 P1-B9：**绝不能把口令原文写进日志**。
+        #   logs/app.log 是全仓共享文件（会被打包上传排障、被日志采集收集），
+        #   一旦带上临时口令，等于把控制权限贴在告示板上。
+        #   而且临时口令本身没有保留价值 —— 忘了就设环境变量重启即可。
         log.warning(
-            "未配置%s密码(%s / auth.%s)，已生成临时密码: %s "
-            "—— 请尽快通过环境变量或配置文件设置，否则任何人拿到该密码即可取得控制权限。",
-            label, env_var, cfg_key, pw,
+            "未配置%s密码(%s / auth.%s)，已自动生成临时密码（长度 %d，"
+            "出于安全不打印原文）。请设置该环境变量或配置项后重启服务；"
+            "在此之前如需登录，可直接设置口令重启。",
+            label, env_var, cfg_key, len(pw),
         )
     return _hash_of(pw)
 
@@ -221,20 +229,72 @@ def require_admin(
     return tok
 
 
+# ★ 全维度审查 B-16：只有在显式信任反向代理时才读 X-Forwarded-For。
+#   原实现无条件取 XFF 第一个值 → 登录限流（20 次/60s）可被任意伪造 XFF 绕过，
+#   审计日志里的 ip 字段同样可伪造。默认（内网直连）只用真实 socket 地址。
+TRUST_PROXY = os.environ.get("EFORT_TRUST_PROXY", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _client_ip(request: Optional[Request]) -> str:
     if request is None:
         return ""
     try:
-        fwd = request.headers.get("x-forwarded-for")
-        if fwd:
-            return fwd.split(",")[0].strip()
+        if TRUST_PROXY:
+            fwd = request.headers.get("x-forwarded-for")
+            if fwd:
+                return fwd.split(",")[0].strip()
         return (request.client.host if request.client else "") or ""
     except Exception:
         return ""
 
 
 class LoginIn(BaseModel):
-    password: str
+    # ★ 审计修复 P1-B4：口令字段定长。
+    #   - max_length 同时挡住"拿超长字符串打 PBKDF2 做 CPU DoS"（每次登录都算 10 万次哈希）；
+    #   - min_length=1 只为让空口令直接走 422，不进比对流程（比对空口令纯属浪费）。
+    #   真实口令长度上限 128 已远超任何正常口令。
+    password: str = Field(min_length=1, max_length=128)
+
+
+# ---------- P1-B4: 登录失败限流（按客户端 IP 滑动窗口） ----------
+# 触发后直接 429，不做额外 sleep（sleep 会让攻击者用慢速请求拖住 worker）。
+_LOGIN_FAIL_LIMIT = 20            # 窗口内允许的失败次数
+_LOGIN_FAIL_WINDOW = 60.0         # 窗口秒数
+_LOGIN_FAIL: Dict[str, list] = {}  # ip -> [失败时间戳, ...]
+_LOGIN_FAIL_LOCK = threading.Lock()
+
+
+def _login_blocked(ip: str) -> bool:
+    """窗口内失败次数是否已达上限（同时顺手清理过期记录）。"""
+    now = time.time()
+    with _LOGIN_FAIL_LOCK:
+        hits = _LOGIN_FAIL.get(ip) or []
+        hits = [t for t in hits if now - t < _LOGIN_FAIL_WINDOW]
+        if hits:
+            _LOGIN_FAIL[ip] = hits
+        else:
+            _LOGIN_FAIL.pop(ip, None)
+        return len(hits) >= _LOGIN_FAIL_LIMIT
+
+
+def _login_record_fail(ip: str) -> None:
+    with _LOGIN_FAIL_LOCK:
+        # 防内存被海量伪造 IP 撑爆：超量时先整体清一遍过期项。
+        if len(_LOGIN_FAIL) > 4096:
+            now = time.time()
+            for k in list(_LOGIN_FAIL):
+                hits = [t for t in _LOGIN_FAIL[k] if now - t < _LOGIN_FAIL_WINDOW]
+                if hits:
+                    _LOGIN_FAIL[k] = hits
+                else:
+                    del _LOGIN_FAIL[k]
+        _LOGIN_FAIL.setdefault(ip, []).append(time.time())
+
+
+def _login_clear(ip: str) -> None:
+    """登录成功即清空该 IP 的失败计数（合法用户手滑不该被长期惩罚）。"""
+    with _LOGIN_FAIL_LOCK:
+        _LOGIN_FAIL.pop(ip, None)
 
 
 @router.get("/status")
@@ -251,11 +311,20 @@ def api_status(x_control_token: Optional[str] = Header(default=None, alias="X-Co
 @router.post("/login")
 def api_login(body: LoginIn, request: Request):
     ip = _client_ip(request)
+    # ★ P1-B4：先看这个 IP 是不是在暴力试口令。
+    if _login_blocked(ip):
+        emit_event("auth", "warn", "auth.login_throttled",
+                   "登录被限流：短时间内失败次数过多", {"ip": ip},
+                   actor="anonymous", ip=ip)
+        raise HTTPException(status_code=429,
+                            detail="登录尝试过于频繁，请稍后再试")
     role = _role_from_password(body.password)
     if not role:
+        _login_record_fail(ip)
         emit_event("auth", "warn", "auth.login_failed",
                    "登录失败：密码错误", {"ip": ip}, actor="anonymous", ip=ip)
         raise HTTPException(status_code=401, detail="管理员密码错误")
+    _login_clear(ip)
     out = issue_token(role)
     emit_event("auth", "info", "auth.login",
                f"已获取控制令牌（{role}）", {"role": role}, actor=role, ip=ip)

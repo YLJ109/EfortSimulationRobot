@@ -11,6 +11,8 @@ const props = defineProps({
 // 24x24 viewBox，线性图标；个别需要填充的用 fill="currentColor" stroke="none"
 const ICONS = {
   camera: '<rect x="2" y="6" width="13" height="12" rx="2"/><path d="M15 10l6-3v10l-6-3z"/>',
+  cpu: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 12h16M8 4v2M16 4v2M8 18v2M16 18v2" fill="none" stroke="currentColor"/>',
+  copy: '<rect x="5" y="3" width="13" height="16" rx="2"/><rect x="9" y="7" width="9" height="12" rx="1.5"/>',
   chevronDown: '<path d="M6 9l6 6 6-6"/>',
   chevronLeft: '<path d="M15 6l-6 6 6 6"/>',
   chevronRight: '<path d="M9 6l6 6-6 6"/>',
@@ -25,6 +27,7 @@ const ICONS = {
   snapshot: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.4"/>',
   grip: '<circle cx="9" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.3" fill="currentColor" stroke="none"/>',
   lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  unlock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 7.4-1.8"/>',
   shield: '<path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/>',
   layers: '<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/>',
   film: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',

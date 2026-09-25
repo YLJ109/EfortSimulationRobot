@@ -33,7 +33,7 @@ D:\EFORT_Projects\EFORT_Web_Monitoring\
 │   │   │             events / kinematics / camera_client / vision_ingest / vision_rules
 │   │   ├── core\     config / exceptions / deps / middleware / logger / brand / app_settings
 │   │   └── db\       models / crud（SQLite: data\robot.db）
-│   └── tests\        pytest 142 例
+│   └── tests\        pytest 185 例（★ 2026-09-25 静态计数，随代码增减需同步）
 ├── frontend\         Vue 3(<script setup>) + Pinia + Vite + Three.js，★无 Router（tab 用 v-show 保活 3D）
 │   ├── src\
 │   │   ├── components\  18 个组件（详见 §10）
@@ -187,11 +187,11 @@ Start-Process -FilePath "D:\EFORT_Projects\EFORT_Web_Monitoring\backend\.venv\Sc
 ## 12. 测试与守卫体系
 
 ```bash
-# 后端（142 passed）
+# 后端（197 passed · ★ 2026-09-25；原 185 + 限位收敛 + /ready/cancel 4 例）
 cd backend && .venv/Scripts/python.exe -m pytest tests/ -q --basetemp=".pytest_tmp" -p no:cacheprovider
 # （跑完删 .pytest_tmp；被杀的 pytest 会残留进程锁 db 文件）
 
-# 前端（18 工具全绿）
+# 前端（18 工具全绿，0 FAIL）
 cd frontend && npm run verify
 # 构建：node node_modules/vite/bin/vite.js build （勿经 npm）
 ```

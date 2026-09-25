@@ -35,12 +35,26 @@ def update(state: str, zone_id: str = "", zone_name: str = "",
            clearance: float = 0.0, ratio: float = 1.0) -> Dict[str, Any]:
     """上报当前围栏状态（前端每帧评估后节流调用）。"""
     global _latest
+    # ★ 审计修复 P3：clearance/ratio 可能是 NaN —— `float('nan') or 0.0` 是
+    #   truthy，`or` 拦不住，NaN 会一路进快照再进 JSON（前端 JSON.parse 抛错）。
+    try:
+        c = float(clearance)
+    except (TypeError, ValueError):
+        c = 0.0
+    if c != c or c in (float("inf"), float("-inf")):
+        c = 0.0
+    try:
+        r = float(ratio)
+    except (TypeError, ValueError):
+        r = 1.0
+    if r != r or r in (float("inf"), float("-inf")):
+        r = 1.0
     rec = {
         "state": str(state or "safe"),
         "zone_id": str(zone_id or ""),
         "zone_name": str(zone_name or ""),
-        "clearance": float(clearance or 0.0),
-        "ratio": float(ratio or 1.0),
+        "clearance": c,
+        "ratio": r,
         "ts": time.time(),
     }
     with _lock:
@@ -85,6 +99,14 @@ def check() -> Tuple[bool, str, Dict[str, Any]]:
         return True, "未收到围栏实时状态（互锁未生效）", snap
 
     if not snap["fresh"]:
+        # ★ 审计修复 P2：过期时必须**保留最后状态的方向性**。
+        #   原实现"过期就放行"——浏览器崩溃前最后一帧是 danger，5s 后照常放行，
+        #   等于给了一条"只要让前端掉线就能解除互锁"的捷径。
+        #   现在：最后一帧是 danger/hit 且已过期 → 一律拒绝（fail-safe）；
+        #   恢复方式是前端恢复上报（安全态会覆盖掉），或操作员复位。
+        if snap.get("state") in UNSAFE:
+            return False, (f"围栏状态已过期({snap['age_sec']}s)，"
+                           f"且过期前最后状态为 {snap['state']}，拒绝下发"), snap
         if snap.get("interlocked"):
             return False, f"围栏状态已过期({snap['age_sec']}s)，拒绝下发", snap
         return True, f"围栏状态已过期({snap['age_sec']}s)，互锁未生效", snap

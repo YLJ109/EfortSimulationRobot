@@ -263,7 +263,8 @@ def ikine(target_T: np.ndarray, q0: List[float],
         q = q + dq
         if joint_limits:
             for i, lim in enumerate(joint_limits[:6]):
-                lo = float(lim.get("min", -360)); hi = float(lim.get("max", 360))
+                lo = float(lim.get("min", -360))
+                hi = float(lim.get("max", 360))
                 q[i] = min(hi, max(lo, q[i]))   # 迭代中夹到限位
         if float(np.linalg.norm(dq)) < 1e-9:
             break

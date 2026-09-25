@@ -1,6 +1,9 @@
+# ★ 审计修复 P1-E7：本文件是「支持范围」，精确版本见 requirements.lock（部署/复现优先用它）。
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.27,<1.0
 sqlalchemy>=2.0,<3.0
-websockets>=12.0,<14.0
+# websockets：★ E7 调整范围 —— 已验证环境实测装的是 17.1，原 `<14.0` 与之矛盾
+#   （代码里没有任何地方直接 import websockets，它是 uvicorn/Starlette 的 WS 传输实现）。
+websockets>=12.0,<18.0
 numpy>=1.26,<3.0
 pyyaml>=6.0,<7.0

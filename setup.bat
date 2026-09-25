@@ -99,7 +99,7 @@ if exist "package-lock.json" (
 )
 if errorlevel 1 set "FAILED=1"
 popd
-if defined FAILED (
+if %FAILED% NEQ 0 (
     echo [FAIL] npm install failed. Check your network / proxy settings.
     goto FAIL
 )
@@ -119,7 +119,7 @@ pushd frontend
 call npm run build
 if errorlevel 1 set "FAILED=1"
 popd
-if defined FAILED (
+if %FAILED% NEQ 0 (
     echo [WARN] frontend build failed - run.bat will try again on next launch.
 ) else (
     echo       built -^> frontend\dist

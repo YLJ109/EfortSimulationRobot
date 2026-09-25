@@ -1,0 +1,114 @@
+// =====================================================================
+// Pinia store 用法回归（headless，源码扫描）
+//
+// 背景（真实事故）：exec.js 把 `jointLockEnabled` / `jointLocked` 放进 **getters**，
+//   但别处按函数调用 `this.jointLockEnabled()` → 运行时报
+//   "this.jointLockEnabled is not a function"（getter 是"值"，不是函数）。
+//   这类错误**编译期不报、界面静态看也正常**，只在运行时炸，最该被钉死。
+//
+// 本脚本钉三条：
+//   A. getter 不得声明参数（Pinia 的 getter 不能接收参数；带参判定必须是 action）。
+//   B. 任何 `xxx.<getter>( )` 空括号调用都是误用（getter 按值访问，不加括号）。
+//   C. 真机链路卡：只保留一个"一键就绪/取消就绪"按钮，不得再出现
+//      「声明 AUTO」「声明远程」两个按钮。
+//
+// 运行： node tools/verify_stores.mjs
+// =====================================================================
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const read = (p) => readFileSync(join(root, p), "utf8");
+const readAbs = (p) => readFileSync(p, "utf8");
+
+let pass = 0, fail = 0;
+function ok(name, cond, extra = "") {
+  if (cond) { pass++; console.log("  PASS  " + name); }
+  else { fail++; console.log("  FAIL  " + name + (extra ? "   → " + extra : "")); }
+}
+
+/** 递归列出 src 下所有 .js/.vue。 */
+function listSrc(dir) {
+  const out = [];
+  for (const n of readdirSync(dir)) {
+    const p = join(dir, n);
+    if (statSync(p).isDirectory()) out.push(...listSrc(p));
+    else if (/\.(js|vue)$/.test(n)) out.push(p);
+  }
+  return out;
+}
+
+/** 取出 `getters: { ... }` 与 `actions: { ... }` 之间的片段（花括号配平）。 */
+function sliceBlock(src, key) {
+  const at = src.search(new RegExp("\\b" + key + "\\s*:\\s*\\{"));
+  if (at < 0) return "";
+  const open = src.indexOf("{", at);
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") { depth--; if (depth === 0) return src.slice(open + 1, i); }
+  }
+  return src.slice(open + 1);
+}
+
+console.log("== Pinia store 用法回归 ==");
+
+const srcDir = join(root, "src");
+const storeFiles = listSrc(join(srcDir, "stores"));
+const allFiles = listSrc(srcDir);
+
+// ---- A. getter 不得接收"应用级参数" ----
+// ★ 注意：Pinia 的 getter **允许**接收 state 作为首个参数（本仓约定命名为 s / state），
+//   这不算误用；真正会炸的是 getter 带一个"普通业务参数"（如 jointLocked(j)）——
+//   调用方会写成 this.jointLocked(joint) 或 this.jointLocked()，前者拿不到函数、后者直接抛错。
+const valueGetters = [];   // {file, name}
+let paramGetters = 0;
+const STATE_PARAM = /^(s|state|_s)$/;
+for (const f of storeFiles) {
+  const src = readAbs(f);
+  const g = sliceBlock(src, "getters");
+  if (!g) continue;
+  // 只认"顶格 4 空格"的声明行（getter 体内的行缩进更深，不能当声明）
+  const re = /^ {4}([A-Za-z_$][\w$]*)\s*(?:\(([^)]*)\)|\s*:)/gm;
+  let m;
+  while ((m = re.exec(g)) !== null) {
+    const name = m[1];
+    const params = m[2];
+    if (params !== undefined && params.trim() !== "" && !STATE_PARAM.test(params.trim())) {
+      paramGetters++;
+      console.log(`  FAIL  getter 带业务参数: ${relative(root, f)} -> ${name}(${params.trim()})`);
+      fail++;
+    } else {
+      valueGetters.push({ file: f, name });
+    }
+  }
+}
+ok("A. getters 不接收业务参数（带参判定必须是 action）", paramGetters === 0);
+
+// ---- B. getter 不得被当函数调用（.name( )）----
+const names = [...new Set(valueGetters.map((v) => v.name))];
+let misuse = 0;
+if (names.length) {
+  const re = new RegExp("\\.\\s*(" + names.join("|") + ")\\s*\\(\\s*\\)", "g");
+  for (const f of allFiles) {
+    const src = readAbs(f);
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const line = src.slice(0, m.index).split("\n").length;
+      console.log(`  FAIL  getter 被当函数调用: ${relative(root, f)}:${line} -> ${m[0]}`);
+      misuse++; fail++;
+    }
+  }
+}
+ok("B. 无 `xxx.<getter>( )` 空括号误用（getter 按值访问）", misuse === 0);
+
+// ---- C. 真机链路卡按钮精简 ----
+const card = read("src/components/RcReadyCard.vue");
+ok("C1. 已移除「声明 AUTO」按钮（无 claimMode('AUTO')）", !card.includes("claimMode(\"AUTO\")"));
+ok("C2. 已移除「声明远程」按钮（无 claimMode('REMOTE')）", !card.includes("claimMode(\"REMOTE\")"));
+ok("C3. 仍保留绿/红就绪切换按钮", card.includes("ready-toggle") && card.includes("一键就绪")
+  && card.includes("取消就绪"));
+
+console.log(`\n== store 回归: ${pass} passed, ${fail} failed ==`);
+process.exit(fail ? 1 : 0);

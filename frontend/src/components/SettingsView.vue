@@ -595,7 +595,9 @@ onMounted(() => {
 
 <style scoped>
 .stg { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 14px;
-  display: flex; flex-direction: column; gap: 12px; }
+  display: flex; flex-direction: column; gap: 12px; align-items: center; }
+/* ★ 需求：设置页内容宽度 1200px 并水平居中（每张卡片/分组各自居中，超宽屏不再拉满） */
+.stg > * { width: 100%; max-width: 1200px; }
 
 /* ---- 顶部 ---- */
 .stg-top { display: flex; align-items: center; gap: 12px; padding: 14px 16px;

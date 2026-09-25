@@ -12,9 +12,15 @@
 #  (由 EFORT_MVS_SDK_DIR 指定, 见 camera_service.py 顶部)。
 # =====================================================================
 
+# ★ 审计修复 P1-E8：给依赖加上界。没有上界的依赖在隔了几个月安装时会
+#   静默拿到一个**从未测过**的大版本(例如 ultralytics 9.x 换了 API),
+#   现象是"今天还能跑、明天换台机器就 ImportError/行为变了", 而且
+#   vision_ingest / camera_service 里的调用点根本不会报出真正的原因。
+#   升级时显式地改这里的上界 + 重跑 camera 相关回归, 不要靠 pip 自己飘。
+
 # 抓帧管线: 相机原始 buffer -> numpy 数组 -> PIL 图像 -> JPEG
 numpy>=1.26,<3.0
-pillow>=10.0
+pillow>=10.0,<13.0
 
 # 目标检测 (会连带安装 torch / torchvision, 首次安装下载量较大)
-ultralytics>=8.3
+ultralytics>=8.3,<9.0

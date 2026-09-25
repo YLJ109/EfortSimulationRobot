@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -64,9 +64,15 @@ class EventOut(BaseModel):
     ratio: float = 0.0
 
 
+# ★ 审计修复 P2-E：原文件在 :67 与 :227 定义了**两个同名 _iso**，
+#   Python 后者覆盖前者 → :145 的 `_iso(ts) + "Z"` 实际拿到的已经是带 Z 的
+#   字符串，拼出 `…ZZ` 这种非法时间戳（前端 new Date() 得到 Invalid Date）。
+#   这里只保留一份，并让它统一负责"naive datetime → UTC Z 后缀"。
 def _iso(dt) -> str:
     try:
-        return dt.isoformat()
+        if not dt:
+            return ""
+        return dt.isoformat() + "Z" if dt.tzinfo is None else dt.isoformat()
     except Exception:
         return ""
 
@@ -142,7 +148,7 @@ def api_list_events(limit: int = Query(100, ge=1, le=1000),
     return [
         EventOut(
             id=r.id,
-            timestamp=_iso(r.timestamp) + "Z",
+            timestamp=_iso(r.timestamp),   # ★ P2-E：_iso 已负责 Z 后缀，不再二次拼接
             zone_id=r.zone_id,
             zone_name=r.zone_name,
             state=r.state,
@@ -154,10 +160,13 @@ def api_list_events(limit: int = Query(100, ge=1, le=1000),
 
 
 @router.post("/safety/events")
-def api_add_event(body: EventIn, db: Session = Depends(get_db)):
+def api_add_event(body: EventIn, tok: str = Depends(require_control),
+                  db: Session = Depends(get_db)):
     """记录一条报警事件。只在状态变严重/恢复时调用，避免每帧刷库。
 
     ★ 同时镜像一份到统一事件总线，让「运维时间线」里能看到报警，不必两个数据源来回翻。
+    ★ 审计修复 P2：本接口原来**无鉴权**（同文件 DELETE 却要 admin），
+      匿名可无限伪造"碰撞报警"刷库 + 污染审计时间线。与下发侧同一把钥匙。
     """
     if body.state not in ("danger", "hit", "clear"):
         raise AppError("state 必须是 danger / hit / clear", 400, "BAD_SAFETY_STATE")
@@ -199,8 +208,20 @@ class LiveIn(BaseModel):
 
 
 @router.post("/safety/live")
-def api_report_live(body: LiveIn):
-    """前端每帧评估围栏后节流上报（1s 一次），后端据此拦截危险状态下的下发。"""
+def api_report_live(body: LiveIn, tok: str = Depends(require_control)):
+    """前端每帧评估围栏后节流上报（1s 一次），后端据此拦截危险状态下的下发。
+
+    ★ 审计修复 P0-3：本接口**原来无鉴权** —— 任何能连到 8000 的客户端都可以
+      持续上报 state="safe" 来**架空围栏互锁**，或伪造 danger 让产线停摆。
+      由于下发侧 /api/control/* 本来就要求控制令牌，上报侧挂同一把钥匙是自洽的：
+      能下发的人才有资格告诉后端"围栏安全"。
+    """
+    if body.state not in ("safe", "warn", "danger", "hit"):
+        raise AppError("state 必须是 safe / warn / danger / hit",
+                       400, "BAD_SAFETY_STATE")
+    import math
+    if not math.isfinite(float(body.clearance)) or not math.isfinite(float(body.ratio)):
+        raise AppError("clearance/ratio 必须是有限数值", 400, "BAD_SAFETY_NUMBER")
     return guard_update(body.state, body.zone_id, body.zone_name,
                         body.clearance, body.ratio)
 
@@ -222,13 +243,6 @@ class VersionOut(BaseModel):
     note: str = ""
     zones: int = 0
     enabled: bool = True
-
-
-def _iso(dt) -> str:
-    try:
-        return dt.isoformat() + "Z" if dt and dt.tzinfo is None else (dt.isoformat() if dt else "")
-    except Exception:
-        return ""
 
 
 @router.get("/safety/versions", response_model=List[VersionOut])

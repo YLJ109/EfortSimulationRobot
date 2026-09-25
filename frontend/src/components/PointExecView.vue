@@ -22,7 +22,8 @@ import { useAuthStore } from "../stores/auth.js";
 import { useRobotStore } from "../stores/robot.js";
 import { useSafetyStore } from "../stores/safety.js";
 import { useExecStore, JOG_STEPS } from "../stores/exec.js";
-import { apiUrl, cameraBase } from "../config.js";
+import { useRcReadyStore } from "../stores/rcReady.js";
+import { apiUrl } from "../config.js";
 import { apiControl } from "../net/control.js";
 import { highlightJoint } from "../three/manager.js";
 
@@ -30,9 +31,15 @@ const auth = useAuthStore();
 const robot = useRobotStore();
 const safe = useSafetyStore();
 const exec = useExecStore();
+const rc = useRcReadyStore();
 
 // ★ 控制权限必须同时满足：有令牌 + 机器人已连接
-const canControl = computed(() => auth.controlActive && robot.connected);
+const canControl = computed(() => auth.controlActive && robot.connected && !robot.telemetryStale);
+
+// ★ 需求：滑块示教 / 点动 J1~J6 的**所有组件**（含角速度、步长等设置项）只有在
+//   「一键就绪」成功后（伺服上电 + 程序运行）才允许修改/点击 —— 否则整块锁死。
+//   伺服没上电时改这些也没用，还会让人以为"点了没反应 = 坏了"。
+const readyOk = computed(() => rc.ready);
 
 const fileInput = ref(null);
 
@@ -163,13 +170,17 @@ watch(() => auth.controlActive, (v) => {
       <h3><Icon name="sliders" :size="15" /> 滑块示教
         <span class="h3-sub">拖动即预演（残影跟随），确认后下发</span>
       </h3>
+      <!-- ★ 需求：示教区的**所有组件**在"未就绪"时一律不可修改/不可点（伺服没上电时改了也没用）。 -->
+      <p v-if="!readyOk" class="lock-hint">
+        <Icon name="lock" :size="13" /> 需先在「真机链路」点「一键就绪」（伺服上电 + 程序运行）后，才可示教。
+      </p>
       <div class="seg">
-        <button :class="{ on: exec.teachMode === 'joint' }"
+        <button :class="{ on: exec.teachMode === 'joint' }" :disabled="!readyOk"
                 @click="exec.teachMode = 'joint'; exec.schedulePreview()">关节角</button>
-        <button :class="{ on: exec.teachMode === 'cartesian' }"
+        <button :class="{ on: exec.teachMode === 'cartesian' }" :disabled="!readyOk"
                 @click="exec.teachMode = 'cartesian'; exec.schedulePreview()">直角坐标</button>
         <label class="ghost-toggle">
-          <input type="checkbox" v-model="exec.teachGhost"
+          <input type="checkbox" v-model="exec.teachGhost" :disabled="!readyOk"
                  @change="exec.teachGhost ? exec.schedulePreview() : exec.hideGhost()" />
           残影预演
         </label>
@@ -180,6 +191,7 @@ watch(() => auth.controlActive, (v) => {
              @mouseenter="highlightJoint(i)" @mouseleave="highlightJoint(-1)">
           <label>{{ n }}</label>
           <input type="range" :min="LIMITS[i].min" :max="LIMITS[i].max" step="0.5"
+                 :disabled="!readyOk"
                  :value="exec.teachQ[i]" @input="exec.onTeachSlider(i, $event)" />
           <span class="deg">{{ Number(exec.teachQ[i]).toFixed(1) }}</span>
         </div>
@@ -188,11 +200,12 @@ watch(() => auth.controlActive, (v) => {
         <div class="axis" v-for="ax in ['x', 'y', 'z']" :key="ax">
           <label>{{ ax.toUpperCase() }}</label>
           <input type="number" class="tcp-in" v-model.number="exec.teachTcp[ax]"
+                 :disabled="!readyOk"
                  @change="exec.schedulePreview()" />
           <span class="deg">mm</span>
         </div>
         <div class="btns" style="margin-top:6px">
-          <button :disabled="!canControl || exec.teachBusy" @click="exec.solveCartesian()">
+          <button :disabled="!readyOk || exec.teachBusy" @click="exec.solveCartesian()">
             <Icon name="target" :size="13" /> 解算为关节角
           </button>
         </div>
@@ -200,7 +213,7 @@ watch(() => auth.controlActive, (v) => {
 
       <div class="pf-row" style="margin-top:8px">
         <label>速度</label>
-        <input type="range" min="1" max="100" v-model.number="exec.teachSpeed" />
+        <input type="range" min="1" max="100" v-model.number="exec.teachSpeed" :disabled="!readyOk" />
         <span class="v" style="width:44px;text-align:right">{{ exec.teachSpeed }}%</span>
       </div>
 
@@ -225,10 +238,10 @@ watch(() => auth.controlActive, (v) => {
                 @click="exec.applyTeach()">
           <Icon name="target" :size="13" /> 执行到位姿
         </button>
-        <button :disabled="!canControl || exec.teachBusy" @click="exec.syncTeachFromRobot()">
+        <button :disabled="!readyOk || exec.teachBusy" @click="exec.syncTeachFromRobot()">
           <Icon name="refresh" :size="13" /> 取当前位姿
         </button>
-        <button :disabled="!canControl" @click="saveTeachAsPoint">
+        <button :disabled="!readyOk" @click="saveTeachAsPoint">
           <Icon name="file" :size="13" /> 存为点位
         </button>
       </div>
@@ -243,16 +256,20 @@ watch(() => auth.controlActive, (v) => {
             : '按住连续走 / 单击走一格' }}
         </span>
       </h3>
+      <!-- ★ 需求：点动区所有组件同样要求"已就绪"（不只按钮，角速度/步长也不可改）。 -->
+      <p v-if="!readyOk" class="lock-hint">
+        <Icon name="lock" :size="13" /> 需先在「真机链路」点「一键就绪」（伺服上电 + 程序运行）后才可点动。
+      </p>
       <div class="pf-row">
         <label>角速度</label>
-        <input type="range" min="1" max="10" v-model.number="exec.jogSpeed" />
+        <input type="range" min="1" max="10" v-model.number="exec.jogSpeed" :disabled="!readyOk" />
         <span class="v" style="width:45px;text-align:right">{{ exec.jogSpeed }}°/s</span>
       </div>
       <div class="pf-row">
         <label>步长</label>
         <div class="seg mini">
           <button v-for="s in JOG_STEPS" :key="s" :class="{ on: exec.jogStepDeg === s }"
-                  @click="exec.jogStepDeg = s">{{ s }}°</button>
+                  :disabled="!readyOk" @click="exec.jogStepDeg = s">{{ s }}°</button>
         </div>
       </div>
       <div class="jog-grid">
@@ -367,3 +384,14 @@ watch(() => auth.controlActive, (v) => {
     </div>
   </MonitorLayout>
 </template>
+
+<style scoped>
+/* ★ 未就绪时示教/点动区的"锁"提示条（说明为什么整块点不动） */
+.lock-hint {
+  display: flex; align-items: center; gap: 6px;
+  margin: 2px 0 8px; padding: 7px 10px;
+  font-size: 11px; line-height: 1.5;
+  color: var(--warn); background: var(--warn-soft);
+  border: 1px solid var(--warn-line); border-radius: 8px;
+}
+</style>

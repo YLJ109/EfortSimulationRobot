@@ -1,0 +1,43 @@
+# =====================================================================
+# ruff 配置 —— ★ 审计修复 P1-E13（建立 lint）
+#
+# 取向：**先让 lint 成为一道能长期开着的守卫**，而不是一上来报 800 条、
+#   第二天就没人看。所以只开"能直接指出真 bug / 真歧义"的规则族，
+#   并且当前代码必须是全绿的（CI 里 `ruff check` 失败即红）。
+#
+# 尚未开启的规则族与**实测数量**（2026-09-25，要开得先做专项整改）：
+#   UP  现代化写法    500+ 条（typing 写法 / %-格式化），--fix 可修但 diff 极大
+#   B   bugbear       ~67 条（其中 41 条 B008 是 FastAPI `Depends()` 默认参数的惯用法）
+#   SIM 化简          ~21 条
+#   S   安全(bandit)  未评估
+#   ruff format      未启用（与现有 4 空格缩进 + 中文注释 + 手工断行风格冲突）
+#
+# 用法（★ 必须在 backend/ 目录下运行，配置按就近发现）：
+#   cd backend && .venv/Scripts/python -m ruff check .
+#   cd backend && .venv/Scripts/python -m ruff check --statistics .   # 看分类计数
+# =====================================================================
+
+target-version = "py313"
+line-length = 120
+
+extend-exclude = [
+    ".venv",
+    ".pytest_tmp",
+    "__pycache__",
+    "data",           # SQLite / 导出文件，不是源码
+]
+
+[lint]
+# E4  语法级问题
+# E7  风格里**会造成误读**的写法（8/O/0 易混的变量名、裸 lambda 赋值、
+#     单行多语句、非 def 的 lambda 赋值）
+# E9  会直接让进程炸掉的语法类
+# F   pyflakes：未定义名 / 未使用的导入与变量 / 重定义遮蔽 —— 最容易藏真 bug 的一族
+# B023 闭包捕获循环变量（bugbear 里最典型的"现在能跑、改一行就串值"的隐患，
+#      见 app/api/control.py `_f` 处的注释）。整个 B 族只开这一条。
+select = ["E4", "E7", "E9", "F", "B023"]
+
+[lint.per-file-ignores]
+# scripts/init_db.py 必须先把仓库根加进 sys.path 才能 import app.*，
+# 这类"引导 import"不可能放在文件顶部 —— 属于**有意为之**的 E402。
+"scripts/*.py" = ["E402"]

@@ -52,9 +52,9 @@ def invalidate() -> None:
 
 def _timeout() -> float:
     try:
-        return float(get_config().vision.get("timeout_s") or 3.0)
+        return float(get_config().vision.get("timeout_s") or 5.0)  # ★ 5s：相机服务重连/加载模型可能久一点
     except Exception:
-        return 3.0
+        return 5.0
 
 
 def _request(method: str, path: str, body: Optional[dict] = None,

@@ -8,13 +8,26 @@ import Icon from "./Icon.vue";
 import { useAuthStore } from "../stores/auth.js";
 import { useExecStore } from "../stores/exec.js";
 import { useRobotStore } from "../stores/robot.js";
+import { useRcReadyStore } from "../stores/rcReady.js";
 
 const auth = useAuthStore();
 const exec = useExecStore();
 const robot = useRobotStore();
+const rc = useRcReadyStore();
 
-// ★ 控制权限必须同时满足：有令牌 + 机器人已连接
-const canControl = computed(() => auth.controlActive && robot.connected);
+// ★ 控制权限必须同时满足：有令牌 + 机器人已连接 + 遥测未冻结（F-05：读数不可信时不放行）
+const canControl = computed(() => auth.controlActive && robot.connected && !robot.telemetryStale);
+
+// ★ 需求：「已获得控制权限」这句话**只有一键就绪成功后**才显示。
+//   拿到令牌只是"授权"，真正能动还得控制器处于就绪态（伺服上电+程序运行+AUTO/无报警/非急停）。
+//   只写"已获得控制权限"会让人以为随时可下发，与真机实际状态脱节。
+const granted = computed(() => canControl.value && rc.ready);
+
+// ★ 审计修复 P1-D9：急停/复位**只看令牌**，不能被「机器人离线」（WS 连接态）禁掉。
+//   原实现急停按钮跟其它写操作共用 canControl —— WS 断了的那一刻（恰恰是最可能
+//   需要急停的时候）按钮变灰点不动；而后端急停本来就是本地标志位 + 尽力下发，
+//   离线时也必须能按下（至少让引擎状态与前端一致）。
+const canEstop = computed(() => auth.controlActive);
 
 const estopText = computed(() => {
   const s = exec.estopState;
@@ -31,8 +44,10 @@ const estopText = computed(() => {
     </h3>
     <div class="row">
       <span class="k">状态</span>
-      <span class="v" :style="{ color: canControl ? 'var(--ok)' : 'var(--warn)' }">
-        {{ canControl ? "已获得控制权限" : (!robot.connected ? "机器人离线" : "未获得控制权限") }}
+      <span class="v" :style="{ color: granted ? 'var(--ok)' : 'var(--warn)' }">
+        {{ granted ? "已获得控制权限"
+           : (!robot.connected ? "机器人离线"
+              : (!canControl ? "未获得控制权限" : "已授权 · 待一键就绪")) }}
       </span>
     </div>
     <div class="btns">
@@ -50,11 +65,17 @@ const estopText = computed(() => {
       {{ !robot.connected ? "机器人未连接，请先连接机器人再获取控制权限。" : "连接真机执行前须先获取限时控制令牌；所有写操作受此门控。" }}
     </p>
 
+    <!-- ★ 审计修复 P1-D8：执行前必须知道读数是不是"冻住的旧值"。
+         WS 没断 ≠ 有新数据；真机执行时照着定格的姿态判断会出事。 -->
+    <p v-if="robot.connected && robot.telemetryStale" class="pf-err">
+      <Icon name="alert" :size="13" /> 遥测已冻结（超过 3 秒无新帧），读数不可信，请先排查后端采集
+    </p>
+
     <hr class="sp-hr" />
 
     <div class="pf-row">
       <label>速度</label>
-      <input type="range" min="1" max="100" v-model.number="exec.speed" />
+      <input type="range" min="5" max="100" v-model.number="exec.speed" />
       <span class="v" style="width:48px;text-align:right">{{ exec.speed }}%</span>
     </div>
 
@@ -63,11 +84,11 @@ const estopText = computed(() => {
     </p>
 
     <div class="btns" style="margin-top:8px">
-      <button class="rec-on" :disabled="!canControl || exec.estopBusy"
+      <button class="rec-on" :disabled="!canEstop || exec.estopBusy"
               @click="exec.doEstop()">
         <Icon name="power" :size="14" /> 急停
       </button>
-      <button :disabled="!canControl || exec.estopBusy" @click="exec.resetEstop()">
+      <button :disabled="!canEstop || exec.estopBusy" @click="exec.resetEstop()">
         <Icon name="refresh" :size="14" /> 复位急停
       </button>
     </div>

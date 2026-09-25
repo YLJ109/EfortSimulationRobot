@@ -19,6 +19,8 @@ import { buildLab } from "./lab.js";
 import { SafetyFence, STATE_RANK } from "./safety.js";
 import { createGhost } from "./ghost.js";
 import { buildOwnerMap } from "./jointOwner.js";
+import { SKIN_BODY, SKIN_HARD, SKIN_JOINT, SKIN_LOGO, SKIN_METAL, skinMat } from "./materials.js";
+import { buildEndEffector } from "./endEffector.js";
 
 // ---- 单例资源 ----
 let renderer = null;
@@ -59,16 +61,9 @@ const NAME_TO_LINK = { "转座": 1, "大臂": 2, "手腕体": 4, "手腕": 5, "�
 
 // ---------------------------------------------------------------------
 // 官方数模配色（对照现场真机照片：白色漆面机身 + 深灰五金 + 铝银法兰）
+// ★ 材质与"J6 末端工具"已抽到共享模块（materials.js / endEffector.js），
+//   因为**残影 Ghost 也要用同一份**，避免两边外观漂移。
 // ---------------------------------------------------------------------
-const SKIN_BODY = 0xe9ecef;
-const SKIN_JOINT = 0x4a5057;
-const SKIN_HARD = 0x23272c;
-const SKIN_METAL = 0xc2c8d0;
-const SKIN_LOGO = "#c8232c";
-
-function skinMat(color, metalness, roughness) {
-  return new THREE.MeshStandardMaterial({ color, metalness, roughness });
-}
 
 function skinOf(p) {
   if (p.name === "法兰") return skinMat(SKIN_METAL, 0.80, 0.28);
@@ -125,97 +120,6 @@ function buildArmLogo(width, height, cx, cz, yTop, yBot) {
 }
 
 // ---------------------------------------------------------------------
-// 末端执行器：J6 法兰上的气动平行夹爪（按现场照片复刻）
-// ---------------------------------------------------------------------
-const EE_FACE = 8;
-const EE_SCALE = 2;
-const EE_OPEN0 = 46;
-
-function buildEndEffector() {
-  const outer = new THREE.Group();
-  outer.name = "end-effector";
-  // J6 末端：吸盘默认就沿法兰 +z（前方）开口，避免多余旋转导致朝向错乱。仅改末端模型，不动机器人关节。
-  outer.rotation.set(0, 0, 0);
-  const g = new THREE.Group();
-  g.scale.setScalar(EE_SCALE);
-  outer.add(g);
-
-  // 本局部坐标为设计尺寸(近似 mm)，整体经 g 放大 EE_SCALE 倍渲染。
-  const m = (c, mr, mm) => skinMat(c, mr, mm);
-
-  // ---- 法兰定位盘 + 6 颗螺栓（沿用） ----
-  const plate = new THREE.Mesh(new THREE.CylinderGeometry(30, 30, 10, 36), m(SKIN_METAL, 0.8, 0.28));
-  plate.rotation.x = Math.PI / 2;
-  plate.position.z = EE_FACE + 5;
-  g.add(plate);
-  for (let k = 0; k < 6; k++) {
-    const a = (k / 6) * Math.PI * 2;
-    const b = new THREE.Mesh(new THREE.CylinderGeometry(3.5, 3.5, 6, 12), m(SKIN_HARD, 0.85, 0.3));
-    b.rotation.x = Math.PI / 2;
-    b.position.set(Math.cos(a) * 23, Math.sin(a) * 23, EE_FACE + 11);
-    g.add(b);
-  }
-
-  // ---- 真空吸盘夹具：两块大矩形立板贴住法兰，每块外表面各装一个吸盘，垂直于矩形中心、开口朝外 ----
-  const plateW = 10;             // 立板厚度(x)
-  const plateH = 50;             // 立板高度(y)
-  const plateD = 90;             // 立板深度(z，沿法兰轴向)
-  const plateGap = 30;           // 两块立板内间距(x方向净空)
-  const plateZ = EE_FACE + plateD / 2;  // 立板中心z
-
-  // 1) 两块大矩形立板，分置 x±，贴住法兰前端
-  for (let s = -1; s <= 1; s += 2) {
-    const plate = new THREE.Mesh(
-      new THREE.BoxGeometry(plateW, plateH, plateD),
-      m(0x9aa2ab, 0.6, 0.4)
-    );
-    plate.position.set(s * (plateW / 2 + plateGap / 2), 0, plateZ);
-    g.add(plate);
-  }
-
-  // 2) 每块立板外表面各装一个红色吸盘，吸盘垂直于矩形中心、开口朝外(±x)
-  function cup(side) {
-    // side = -1(左板, 开口朝 -x) 或 +1(右板, 开口朝 +x)
-    const grp = new THREE.Group();
-    const xOuter = side * (plateW + plateGap / 2);  // 立板外表面 x 坐标
-
-    // 阀体：圆柱贴在立板外表面
-    const valve = new THREE.Mesh(
-      new THREE.CylinderGeometry(7, 7, 12, 16),
-      m(0x8a8f95, 0.6, 0.5)
-    );
-    valve.rotation.z = Math.PI / 2;   // 圆柱轴沿 x
-    valve.position.set(xOuter + side * 6, 0, plateZ);
-    grp.add(valve);
-
-    // 波纹吸盘：圆锥开口朝外
-    const bell = new THREE.Mesh(
-      new THREE.ConeGeometry(15, 20, 24),
-      m(0x7a1f1f, 0.15, 0.25)
-    );
-    bell.rotation.z = side * Math.PI / 2;  // 圆锥开口朝 ±x
-    bell.position.set(xOuter + side * 18, 0, plateZ);
-    grp.add(bell);
-
-    // 橡胶圈
-    const rim = new THREE.Mesh(
-      new THREE.CylinderGeometry(16.5, 16.5, 3, 24),
-      m(0x5a1717, 0.25, 0.5)
-    );
-    rim.rotation.z = Math.PI / 2;
-    rim.position.set(xOuter + side * 28, 0, plateZ);
-    grp.add(rim);
-
-    return grp;
-  }
-  g.add(cup(-1));   // 左板吸盘
-  g.add(cup(1));    // 右板吸盘
-
-  // 吸盘夹具无"开合指"：吸气/放气由业务信号驱动，无需张开动画
-  return { group: outer };
-}
-
-// ---------------------------------------------------------------------
 // WebGL 上下文健康状态：lost / ok
 // ★ 以前 context lost 只打一条 console.warn，界面继续黑着，现场只能靠 F5 自救。
 //   现在把它做成一条可订阅的状态：App.vue 据此显示"正在恢复"浮条，
@@ -258,8 +162,14 @@ function ensureRenderer() {
   renderer.domElement.addEventListener("webglcontextrestored", () => {
     // three.js 内部会重建 GL 状态并重新上传几何/纹理，这里只需把画布尺寸与
     // 像素比重新对齐（丢失期间容器可能已变宽），再通知界面恢复渲染。
-    if (camera) resizeView();
+    //
+    // 审计修复 P0-ui-2：恢复瞬间若容器还是 display:none（正在切视图），
+    // resizeView 会因尺寸 0 **早退**，画布尺寸就永远停在丢失前的旧值 ——
+    // 补一条重试；尺寸正常则立刻强制渲染一帧，避免"上下文已恢复但这一帧是
+    // 清空过的空帧"再黑闪一下。
+    if (camera && !resizeView()) scheduleSizeFixup();
     setGlState("ok");
+    if (camera) renderFrame();
     console.info("WebGL 上下文已恢复，3D 渲染继续");
   });
   return renderer;
@@ -519,25 +429,61 @@ export function switchView(view) {
   const el = containers[view];
   if (!el) return;
   if (renderer.domElement.parentElement !== el) el.appendChild(renderer.domElement);
-  resizeView();
+  // 审计修复 P0-ui-3：调用方（App.vue setView）是**同步**调用的，此时 Vue 还没把
+  // 新视图 v-show 显示出来（目标容器仍 display:none → clientWidth/Height 为 0 →
+  // resizeView 早退），画布停在旧缓冲尺寸/空帧上；等 ResizeObserver 发现尺寸变化
+  // 还要再走 MonitorLayout 的 240ms debounce 才 setSize —— 这段窗口正是
+  // "3D 偶尔黑屏闪一下"的来源之一。
+  // 这里搬完画布立刻校正 + 强制渲染一帧；若此刻还没尺寸就用 rAF 连续补，
+  // Vue 一翻页即可在**下一次绘制之前**完成 setSize + 重绘，不再留黑帧窗口。
+  if (!resizeView()) scheduleSizeFixup();
+  else if (glState === "ok") renderFrame();   // 搬移画布后补一帧，避免合成层清空露出黑底
+}
+
+// ---- 审计修复 P0-ui-3：切视图后的尺寸补救（容器 0 尺寸时的重试） ----
+let sizeFixRaf = 0;
+/**
+ * 容器暂时没有尺寸（v-show 尚未生效 / 正在布局）时，逐帧重试 resizeView，
+ * 一旦有尺寸立刻 setSize + 强制渲染一帧。上限 60 帧（约 1s）后放弃 ——
+ * 之后的尺寸修正交回 ResizeObserver（那是"宽度变化"场景的正路）。
+ */
+function scheduleSizeFixup() {
+  if (sizeFixRaf) cancelAnimationFrame(sizeFixRaf);
+  let tries = 60;
+  const tick = () => {
+    sizeFixRaf = 0;
+    if (resizeView()) {
+      if (glState === "ok") renderFrame();
+      return;
+    }
+    if (tries-- > 0) sizeFixRaf = requestAnimationFrame(tick);
+  };
+  sizeFixRaf = requestAnimationFrame(tick);
 }
 
 // 当前已生效的像素比：只有它变了才调 setPixelRatio。
 // ★ setPixelRatio 内部会重建绘制缓冲，每帧调等于每帧抖一次缓冲（黑闪）。
 let lastPixelRatio = 0;
 
+/**
+ * 按当前活动容器的实际尺寸重设画布。
+ * @returns {boolean} 是否真的完成 resize；false = 容器不存在或尺寸为 0（早退）。
+ *   审计修复 P0-ui-3：把"早退"变成可判据的返回值，调用方才能补救
+ *   （否则 0 尺寸早退后无人知晓，画布一直停在旧尺寸上）。
+ */
 export function resizeView() {
   ensureScene();
   const el = containers[activeView];
-  if (!el) return;
+  if (!el) return false;
   const w = el.clientWidth, h = el.clientHeight;
-  if (w === 0 || h === 0) return;
+  if (w === 0 || h === 0) return false;
   // 把窗口拖到另一块显示器时 devicePixelRatio 会变，这时才需要重新设置。
   const pr = Math.min(window.devicePixelRatio || 1, 1.25);
   if (pr !== lastPixelRatio) { renderer.setPixelRatio(pr); lastPixelRatio = pr; }
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  return true;
 }
 
 export function renderFrame() {
@@ -628,13 +574,14 @@ function buildArticulatedOfficial(parts, dh, mounting) {
   const J = dh.joints;
   const d1 = Math.abs(J[0].d), a1 = Math.abs(J[0].a);
   const a2 = Math.abs(J[1].a), a3 = Math.abs(J[2].a);
-  const d4 = Math.abs(J[3].d), d6 = Math.abs(J[5].d);
+  const d4 = Math.abs(J[3].d);
   const zJ2 = d1;
   const zJ3 = d1 + a2;
   const zJ4 = zJ3 + a3;
   const xJ4 = a1;
   const xJ5 = a1 + d4;
-  const xJ6 = xJ5 + d6;
+  // ★ P1-E13：原 const xJ6 = xJ5 + d6 从未被读（零件归类只用到 xJ5，见下），
+  //   连带 d6 也是死变量 —— 一并删掉，免得下次有人改 xJ5 时以为 J6 那段还在生效。
 
   const info = parts.map((m) => {
     m.geometry.computeBoundingBox();
@@ -906,6 +853,8 @@ function cachedTextures() {
  * 调用后所有单例置空，若再次 ensureScene() 会重新建一整套。
  */
 export function disposeAll() {
+  // 审计修复 P0-ui-3：撤掉切视图遗留的尺寸补救 rAF，避免单例置空后仍去渲染
+  if (sizeFixRaf) { cancelAnimationFrame(sizeFixRaf); sizeFixRaf = 0; }
   // 1) 各子模块自清（从场景摘除自己的 group，并释放自有资源）
   [sim, fence, ghost, lab, cell].forEach((m) => {
     try { if (m && m.dispose) m.dispose(); } catch (e) { /* 忽略 */ }

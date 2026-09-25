@@ -8,8 +8,6 @@
 """
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from app.core import safety_config as sc
@@ -44,8 +42,8 @@ def _h(client, password="test1234"):
 # 统一事件总线 / 审计
 # =====================================================================
 def test_login_emits_auth_event(client):
-    _tok(client)                                    # 一次成功登录
-    r = client.get("/api/events?category=auth&limit=50")
+    h = _h(client)                                  # 一次成功登录（带控制令牌）
+    r = client.get("/api/events?category=auth&limit=50", headers=h)
     assert r.status_code == 200
     actions = [e["action"] for e in r.json()["items"]]
     assert "auth.login" in actions
@@ -54,24 +52,25 @@ def test_login_emits_auth_event(client):
 def test_failed_login_emits_warn_event(client):
     bad = client.post("/api/auth/login", json={"password": "definitely-wrong"})
     assert bad.status_code == 401
-    r = client.get("/api/events?category=auth&level=warn&limit=50")
+    h = _h(client)
+    r = client.get("/api/events?category=auth&level=warn&limit=50", headers=h)
     assert any(e["action"] == "auth.login_failed" for e in r.json()["items"])
 
 
 def test_events_filters_and_stats(client):
-    _tok(client)
-    lst = client.get("/api/events?limit=200").json()
+    h = _h(client)
+    lst = client.get("/api/events?limit=200", headers=h).json()
     assert "items" in lst and "total" in lst
-    st = client.get("/api/events/stats").json()
+    st = client.get("/api/events/stats", headers=h).json()
     assert st["total"] >= 1
     assert "auth" in st["by_category"]
 
 
 def test_events_export_json_and_csv(client):
-    _tok(client)
-    j = client.get("/api/events/export?format=json")
+    h = _h(client)
+    j = client.get("/api/events/export?format=json", headers=h)
     assert j.status_code == 200 and "efort-events/v1" in j.text
-    c = client.get("/api/events/export?format=csv")
+    c = client.get("/api/events/export?format=csv", headers=h)
     assert c.status_code == 200
     assert "timestamp,category,level" in c.text.replace('"', "")
 
@@ -88,7 +87,7 @@ def test_move_emits_control_event(client):
     h = _h(client)
     r = client.post("/api/control/move", json={"joints": [0, 0, 0, 0, 0, 0]}, headers=h)
     assert r.status_code == 200
-    r = client.get("/api/events?category=control&limit=50")
+    r = client.get("/api/events?category=control&limit=50", headers=h)
     actions = [e["action"] for e in r.json()["items"]]
     assert "control.move" in actions
 
@@ -209,8 +208,9 @@ def test_versions_require_token(client):
 def test_live_state_blocks_move_when_unsafe(client):
     h = _h(client)
     # 上报危险状态 -> 下发应被 409 拦截
+    # ★ P0-3：上报接口已要求控制令牌，测试同步改为带令牌（与前端 apiControl 一致）
     client.post("/api/safety/live", json={"state": "danger", "zone_id": "z1",
-                                          "zone_name": "主工作区"})
+                                          "zone_name": "主工作区"}, headers=h)
     live = client.get("/api/safety/live").json()
     assert live["reported"] is True and live["state"] == "danger"
 
@@ -220,13 +220,35 @@ def test_live_state_blocks_move_when_unsafe(client):
     assert "互锁" in (body.get("message") or body.get("detail") or "")
 
     # 被拦截要留痕（事后追责）
-    ev = client.get("/api/events?category=control&level=warn&limit=50").json()
+    ev = client.get("/api/events?category=control&level=warn&limit=50", headers=h).json()
     assert any(e["action"] == "control.move_blocked" for e in ev["items"])
 
     # 恢复安全 -> 可以正常下发
-    client.post("/api/safety/live", json={"state": "safe", "ratio": 1.0})
+    client.post("/api/safety/live", json={"state": "safe", "ratio": 1.0}, headers=h)
     r = client.post("/api/control/move", json={"joints": [0, 0, 0, 0, 0, 0]}, headers=h)
     assert r.status_code == 200 and r.json()["ok"] is True
+
+
+def test_live_requires_token(client):
+    """★ P0-3 回归钉：无令牌不得上报/架空围栏互锁（原实现匿名可改）。"""
+    r = client.post("/api/safety/live", json={"state": "safe"})
+    assert r.status_code == 401, r.text
+    # 也不能伪造危险状态来恶意停线
+    r2 = client.post("/api/safety/live", json={"state": "danger"})
+    assert r2.status_code == 401, r2.text
+
+
+def test_live_rejects_bad_state_and_nan(client):
+    """★ P0-3：非法 state / NaN 数值一律 400（NaN 会绕过一切比较）。"""
+    h = _h(client)
+    r = client.post("/api/safety/live", json={"state": "boom"}, headers=h)
+    assert r.status_code == 400
+    # NaN 不是合规 JSON，httpx 的 json= 编码器会拒；这里手工发原始体，
+    # 模拟"客户端塞了 Python 才认的 NaN 字面量"这种脏输入。
+    h2 = dict(h, **{"Content-Type": "application/json"})
+    r2 = client.post("/api/safety/live",
+                     content='{"state":"safe","clearance":NaN}', headers=h2)
+    assert r2.status_code == 400
 
 
 def test_missing_live_state_warns_but_allows(client):

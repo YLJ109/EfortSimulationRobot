@@ -246,9 +246,15 @@ export const useSafetyStore = defineStore("safety", {
       const now = Date.now();
       if (lastEventAt[key] && now - lastEventAt[key] < EVENT_COOLDOWN_MS) return;
       lastEventAt[key] = now;
+      // ★ 审计修复 P2：后端已给 POST /safety/events 加 require_control，
+      //   这里补上控制令牌（auth 需在本作用域取，store 内没有现成变量）。
+      const auth = useAuthStore();
+      // ★ 未登录就跳过写库：GET 列表是公开的（时间线照常能看），
+      //   但匿名访客每次报警都换一个 401 回来，控制台会被刷满。
+      if (!auth.controlActive) return;
       fetch(apiUrl("/safety/events"), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...auth.controlHeaders() },
         body: JSON.stringify({
           zone_id: s.zoneId || "", zone_name: s.zoneName || "",
           state: recovered ? "clear" : st,

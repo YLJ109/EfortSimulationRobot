@@ -235,7 +235,7 @@ def test_ingest_writes_record_and_event(client, fake_camera):
     assert r.status_code == 200
     items = r.json()["items"]
     assert any(x["color"] == "蓝" and x["seq"] == 1001 for x in items), items
-    r = client.get("/api/events?category=vision&limit=20")
+    r = client.get("/api/events?category=vision&limit=20", headers=_h(client))
     acts = [e["action"] for e in r.json()["items"]]
     assert "vision.detect" in acts
 
@@ -253,6 +253,40 @@ def test_ingest_is_idempotent(client, fake_camera):
     r = client.get("/api/vision/records?color=黄&limit=50")
     seqs = [x["seq"] for x in r.json()["items"]]
     assert seqs.count(1002) == 1, seqs
+
+
+def test_ingest_waits_for_event_not_bare_seq(client, fake_camera):
+    """★ 审计修复 P0-cam-2 回归：`{seq: N, event: None}` 绝不能推进游标。
+
+    这就是"摄像头偶尔才检测到"的根因：相机侧 seq 曾在**落盘三张图之前**自增，
+    而 event 要等落盘之后才发布 —— 该窗口内 `/vision/last` 返回的正是
+    {seq: N, event: None}（或 event 还是上一条）。旧实现无条件
+    `last_seq = max(last_seq, 响应里的 seq)`，游标一旦越过 N，事件 N 之后永远不满足
+    `event.seq > since` → 这次检测被当成已消费而**永久丢弃**。
+
+    同一条用例顺带覆盖 P0-cam-2b：两条事件挤在一个轮询窗口里时，
+    `/vision/last` 只留最新一条，中间那条必须靠 /vision/records 补洞回来。
+    """
+    from app.services.vision_ingest import ingest
+    _push_event(1006, "红")
+    ingest._tick()                                  # 首跳 backfill → 游标应到 1006
+    assert ingest.last_seq == 1006, ingest.last_seq
+
+    # 模拟竞态窗口：序号已经自增到 1099，但事件尚未发布（event=None）
+    fake_camera["seq"] = 1099
+    fake_camera["events"].pop(1099, None)
+    ingest._tick()
+    assert ingest.last_seq == 1006, \
+        "裸 seq 推进了游标(旧实现): %s —— 事件 1099 将被永久丢弃" % ingest.last_seq
+
+    # 窗口过去、两条事件真的发布了：中间的 1050 与最新的 1099 都必须入库
+    _push_event(1050, "蓝")
+    _push_event(1099, "绿")
+    ingest._tick()
+    assert ingest.last_seq == 1099, ingest.last_seq
+    recs = client.get("/api/vision/records?limit=200").json()["items"]
+    assert any(x["seq"] == 1050 for x in recs), "P0-cam-2b 补洞失败: 1050 丢了"
+    assert any(x["seq"] == 1099 for x in recs), "P0-cam-2: 最新事件 1099 丢了"
 
 
 def test_records_filter_and_stats(client, fake_camera):
@@ -330,7 +364,6 @@ def test_rule_not_executed_without_global_switch(client, fake_camera, tmp_rules_
 
 def test_rule_disabled_not_executed(client, fake_camera):
     from app.services import vision_rules as vr
-    from app.services.motion import motion
     vr.save_rules({"rules": [{"color": "红", "program_id": 1, "auto": True,
                               "enabled": False}]})
     rule = vr.rule_for("红")
@@ -398,7 +431,9 @@ def test_execute_rule_runs_program_when_all_allowed(client, fake_camera, monkeyp
         rule = vr.rule_for("红")
         calls = []
         orig = motion.command
-        motion.command = lambda joints, sp=100, dw=0: (
+        # ★ 接受 abort_check 关键字：execute_rule 现在会传中止判据
+        #   （运行中关闭 auto_execute 开关可立即停下发），mock 必须兼容该签名。
+        motion.command = lambda joints, sp=100, dw=0, abort_check=None: (
             calls.append(([float(x) for x in joints], sp)), {"ok": True,
                                                              "mode": "simulate"})[1]
         try:

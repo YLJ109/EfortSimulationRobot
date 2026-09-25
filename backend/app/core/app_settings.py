@@ -53,7 +53,7 @@ import copy
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.core.config import CONFIG_PATH, project_root
 
@@ -190,6 +190,9 @@ SCHEMA: List[Dict[str, Any]] = [
                help="★ 还需同时设置环境变量 EFORT_REAL_MOTION=1 才会真正写控制器；两者缺一即保持模拟"),
             _f("motion.require_live_safety", "围栏互锁严格模式", "bool", admin=True, apply="live",
                help="开启后，前端未实时上报围栏状态（或状态过期）就拒绝下发运动"),
+            # ★ 取消 `motion.collision_tolerance_deg`（碰撞预测容差）：
+            #   现场最终口径是"残影跟随变红即拒绝，不做角度放宽" —— 该字段没有任何
+            #   消费方，留着只会让人以为"调大就能过"。真撞上去没有撤销键，宁可不给这个旋钮。
             _f("motion.mode_claim", "当前运行模式", "enum",
                options=["T1", "T2", "AUTO", "REMOTE"], admin=True, apply="live",
                help="★ 2026-09-23 实机确认：只有 AUTO/远程档接受上位机指令；"
@@ -246,7 +249,7 @@ RUNTIME_ENV_KEYS = [
     ("EFORT_REAL_MOTION", "真实运动总开关", "必须为 1 且 motion.real_write=true 才真正写控制器"),
     ("EFORT_ADMIN_PASSWORD", "管理员口令", "已在 .env 配置（内容不回显）；修改请用下方『修改管理员密码』"),
     ("EFORT_OPERATOR_PASSWORD", "操作员口令", "未配置则操作员角色禁用，所有令牌都是管理员"),
-    ("EFORT_CONTROL_TTL", "控制令牌有效期", "秒，默认 1800（30 分钟）"),
+    ("EFORT_CONTROL_TTL", "控制令牌有效期", "秒，默认 7200（2 小时），0=不限时"),
 ]
 
 

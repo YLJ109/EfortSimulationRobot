@@ -52,7 +52,8 @@ export const MODULE_GUIDE = [
     key: "live", icon: "camera", label: "真实监控",
     desc: "只读页：看真机现在到哪了。",
     use: "日常盯机、交接班确认机器人当前姿态。",
-    tips: ["读数条展示 J1~J6 与 TCP", "鼠标悬停某个关节，3D 里对应关节高亮", "本页不提供任何下发按钮，避免误操作"],
+    tips: ["读数条展示 J1~J6 与 TCP", "鼠标悬停某个关节，3D 里对应关节高亮", "本页不提供任何下发按钮，避免误操作",
+          "摄像头：海康型号尾缀 -GM/UM/EM 为**灰度相机**，画面无彩色信息、无法做红/绿/蓝识别；颜色识别需切换**彩色相机**（USB 彩色 / 海康 GC 系列）"],
   },
   {
     key: "sim", icon: "layers", label: "模拟仿真",
@@ -71,7 +72,10 @@ export const MODULE_GUIDE = [
     key: "program", icon: "play", label: "程序执行", needAuth: true,
     desc: "把点位串成程序（含停留时间）连续执行，可中止。",
     use: "跑一段固定流程，例如取放料。",
-    tips: ["运行日志区可滚动，自动跟随最新一行", "空格键 = 运行/停止当前程序", "每步下发前有残影预演下一步位置"],
+    tips: ["**示教器程序**：控制器上可直接执行的程序（示教器导出的 .XPL）—— 下发给控制器跑。",
+          "**本地程序**：本机 programs 目录里的本地文件与数据库点位序列 —— 由上位机逐点下发。",
+          "**手动执行**：填文件名 →「测试」只做解析/IK/限位校验（绝不下发）→「直接运行」才真正执行。",
+          "运行日志在左下角浮动面板，自动跟随最新一行", "空格键 = 运行/停止当前程序"],
   },
   {
     key: "ops", icon: "activity", label: "运维审计", needAdmin: true,
@@ -106,7 +110,10 @@ export const SAFETY_NOTES = [
     level: "danger",
     title: "真实下发默认关闭，且需要双重确认",
     text: "只有 EFORT_REAL_MOTION=1 与 motion.real_write=true 同时成立才会真正写控制器。"
-        + "写寄存器地址在手册核对完成前一律标着 TODO —— 地址填错可能造成非预期动作。",
+        + "★ 审计修复 P1-E5：原话是「写寄存器地址在按手册核对前一律标着 TODO」—— "
+        + "已按 2026-09-23 实测勘察报告更新：写路径走 40101 指令字（0x1001/0x1011/0x1013/0x1005）、"
+        + "40103 速度设定、40135 点动触发位、40139~44 目标角；"
+        + "旧的 write_base_addr=30 / write_speed_addr / estop_addr 三个假设已实测证伪并废弃。",
   },
   {
     level: "warn",
@@ -297,7 +304,7 @@ export const PRECAUTIONS = [
     icon: "shield",
     items: [
       { level: "danger", title: "软件急停 ≠ 安全回路", text: "界面的急停与 Esc 只停止「下发」，不切断伺服动力。人身相关的场合必须使用硬件急停按钮。" },
-      { level: "danger", title: "真实下发默认关闭，开启需双重确认", text: "必须 EFORT_REAL_MOTION=1 与 motion.real_write=true 同时成立。写寄存器地址在按手册核对前一律标着 TODO —— 地址填错可能造成非预期动作。" },
+      { level: "danger", title: "真实下发默认关闭，开启需双重确认", text: "必须 EFORT_REAL_MOTION=1 与 motion.real_write=true 同时成立。写路径已按 2026-09-23 实测勘察报告实现（40101 指令字 / 40103 速度 / 40135 点动触发 / 40139~44 目标角）；旧的 write_base_addr=30、estop_addr 方案已实测证伪并废弃 —— 这几个地址曾经写错会直接造成非预期动作。" },
       { level: "danger", title: "任何时候不要进入机器人运动范围", text: "哪怕确认已急停。一旦有人进入，先停止下发再说话。" },
       { level: "warn", title: "围栏是预警不是防护罩", text: "围栏由 DH 模型推算，与真机存在标定误差（DH 的 d1/d6/α 仍是估算值）。可以当「提醒」，不能当「保护」。" },
       { level: "warn", title: "不要绕过界面直接调接口", text: "写接口都要令牌，Bash/脚本直接打 API 一样会真的下发。绕界面不绕安全，只是少了提示。" },

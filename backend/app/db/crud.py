@@ -5,9 +5,39 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, true
 
 from app.db.models import Event, PoseHistory, SafetyEvent, Session
+
+# ★ 审计修复 P0-4：清理必须**分批 + 小事务**。
+#   原实现把整表 ORM 对象全部读进内存再逐行 session.delete() + 单次 commit：
+#   - 内存：180 天欠账 ≈ 1550 万行 × ORM 实例 ≈ 数 GB → 启动即 OOM；
+#   - 锁：单个巨型事务在整个清理期间独占写锁 → 采集线程 insert_pose 静默失败丢数据。
+PRUNE_BATCH = 5000          # 每批删除行数
+PRUNE_MAX_BATCHES = 20000   # 单次调用最多批次（1 亿行上限，防死循环）
+
+
+def prune_batched(session, model, where_cond, batch: int = PRUNE_BATCH,
+                  max_batches: int = PRUNE_MAX_BATCHES) -> int:
+    """按条件分批删除，返回总删除行数。
+
+    用 `DELETE ... WHERE id IN (SELECT id ... LIMIT n)` 子查询，行 ID 只在
+    子查询里物化（不加载 ORM 实例），每批一个短事务，内存与锁窗口都受控。
+    """
+    total = 0
+    for _ in range(max_batches):
+        try:
+            subq = select(model.id).where(where_cond).limit(batch)
+            res = session.execute(delete(model).where(model.id.in_(subq)))
+            session.commit()
+        except Exception:
+            session.rollback()          # 半批失败必须回滚，避免悬空事务
+            raise
+        n = int(getattr(res, "rowcount", 0) or 0)
+        total += n
+        if n < batch:
+            break
+    return total
 
 
 def insert_pose(session, j1, j2, j3, j4, j5, j6, tcp, source="real") -> PoseHistory:
@@ -58,16 +88,17 @@ def end_session(session, sid: int) -> None:
         session.commit()
 
 
-def prune_old_poses(session, retention_days: int) -> int:
-    """删除超过保留天数的历史行, 返回删除条数。"""
+def prune_old_poses(session, retention_days: int, batch: int = PRUNE_BATCH) -> int:
+    """删除超过保留天数的历史行, 返回删除条数。
+
+    ★ 审计修复 P0-4：改为分批 DELETE（原实现全表 ORM 加载 → 启动 OOM +
+      单事务长期持写锁 → 采集写入被静默顶掉）。
+    """
+    if retention_days <= 0:
+        return 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
-    stmt = select(PoseHistory).where(PoseHistory.timestamp < cutoff)
-    rows = session.execute(stmt).scalars().all()
-    n = len(rows)
-    for r in rows:
-        session.delete(r)
-    session.commit()
-    return n
+    return prune_batched(session, PoseHistory, PoseHistory.timestamp < cutoff,
+                         batch=batch)
 
 
 # ---------------- 录制 CRUD ----------------
@@ -319,39 +350,42 @@ def _at_or_above(level: str):
 
 
 def count_system_events(session, since=None) -> int:
-    stmt = select(SystemEvent)
+    # ★ 审计修复 P1-C1：计数用 SQL COUNT，不再全表 ORM 加载
+    #   （原实现 50 万行会把 50 万行 ORM 对象拉进内存只为数个数）。
+    from sqlalchemy import func
+    stmt = select(func.count(SystemEvent.id))
     if since is not None:
         stmt = stmt.where(SystemEvent.timestamp >= since)
-    return len(list(session.execute(stmt).scalars()))
+    return int(session.execute(stmt).scalar() or 0)
 
 
 def system_event_stats(session, since=None) -> dict:
-    """按类别/级别统计条数（时间线页头部概览）。"""
-    rows = list(session.execute(select(SystemEvent)).scalars())
+    """按类别/级别统计条数（时间线页头部概览）。
+
+    ★ 审计修复 P1-C1：改用 group_by 聚合，不再 select(SystemEvent) 整表加载。
+    """
+    from sqlalchemy import func
+    base = select(SystemEvent.category, func.count(SystemEvent.id)).group_by(SystemEvent.category)
+    by_lv_q = select(SystemEvent.level, func.count(SystemEvent.id)).group_by(SystemEvent.level)
     if since is not None:
-        rows = [r for r in rows if r.timestamp >= since]
-    by_cat: dict = {}
-    by_lv: dict = {}
-    for r in rows:
-        by_cat[r.category] = by_cat.get(r.category, 0) + 1
-        by_lv[r.level] = by_lv.get(r.level, 0) + 1
-    return {"total": len(rows), "by_category": by_cat, "by_level": by_lv}
+        base = base.where(SystemEvent.timestamp >= since)
+        by_lv_q = by_lv_q.where(SystemEvent.timestamp >= since)
+    by_cat = {str(k): int(v) for k, v in session.execute(base).all()}
+    by_lv = {str(k): int(v) for k, v in session.execute(by_lv_q).all()}
+    return {"total": sum(by_cat.values()), "by_category": by_cat, "by_level": by_lv}
 
 
 def prune_system_events(session, days: int) -> int:
-    """删除 N 天前的事件，返回删除条数。days<=0 表示清空。"""
+    """删除 N 天前的事件，返回删除条数。days<=0 表示清空。
+
+    ★ 审计修复 P0-4/P1-C6：分批删除；清空分支用恒真条件同样走分批。
+    """
     if days and days > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        rows = list(session.execute(
-            select(SystemEvent).where(SystemEvent.timestamp < cutoff)
-        ).scalars())
+        cond = SystemEvent.timestamp < cutoff
     else:
-        rows = list(session.execute(select(SystemEvent)).scalars())
-    n = len(rows)
-    for r in rows:
-        session.delete(r)
-    session.commit()
-    return n
+        cond = true()
+    return prune_batched(session, SystemEvent, cond)
 
 
 # =====================================================================
@@ -383,16 +417,24 @@ def get_safety_version(session, vid: int) -> SafetyConfigVersion | None:
 
 
 def prune_safety_versions(session, keep: int = 30) -> int:
-    """只保留最近 keep 条历史版本，返回清理条数。"""
-    rows = list(session.execute(
-        select(SafetyConfigVersion).order_by(SafetyConfigVersion.id.desc())
-    ).scalars())
-    extra = rows[keep:]
-    for r in extra:
-        session.delete(r)
-    if extra:
-        session.commit()
-    return len(extra)
+    """只保留最近 keep 条历史版本，返回清理条数。
+
+    ★ 审计修复 P2：原实现把**整表（含 config JSON 文本列）**读进内存只为切片。
+      现在只取 keep 个主键（几十个 int），再按主键集合删除。
+    """
+    if keep <= 0:
+        return prune_batched(session, SafetyConfigVersion, true())
+    kept = [r[0] for r in session.execute(
+        select(SafetyConfigVersion.id)
+        .order_by(SafetyConfigVersion.id.desc())
+        .limit(int(keep))
+    ).all()]
+    if not kept:
+        return 0
+    res = session.execute(delete(SafetyConfigVersion)
+                          .where(SafetyConfigVersion.id.notin_(kept)))
+    session.commit()
+    return int(getattr(res, "rowcount", 0) or 0)
 
 
 # ============================ 视觉分拣记录 ============================
@@ -496,19 +538,14 @@ def update_vision_record(session, rid: int, **fields) -> VisionRecord | None:
     return row
 
 
-def prune_vision_records(session, days: int) -> int:
-    """删除 N 天前的视觉记录，返回条数。"""
+def prune_vision_records(session, days: int, batch: int = PRUNE_BATCH) -> int:
+    """删除 N 天前的视觉记录，返回条数。
+
+    ★ 审计修复 P0-4：days<=0 的"清空"分支原用 count()+query.delete()
+      （单条语句无事务分批，大量行时锁窗口长），统一走分批。
+    """
     if days <= 0:
-        n = session.query(VisionRecord).count()
-        session.query(VisionRecord).delete()
-        session.commit()
-        return int(n)
+        return prune_batched(session, VisionRecord, true(), batch=batch)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = list(session.execute(
-        select(VisionRecord).where(VisionRecord.timestamp < cutoff)
-    ).scalars())
-    for r in rows:
-        session.delete(r)
-    if rows:
-        session.commit()
-    return len(rows)
+    return prune_batched(session, VisionRecord, VisionRecord.timestamp < cutoff,
+                         batch=batch)

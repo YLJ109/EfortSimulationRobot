@@ -24,8 +24,10 @@ import { apiControl } from "../net/control.js";
 import { useAuthStore } from "./auth.js";
 import { useRobotStore } from "./robot.js";
 import { useSafetyStore } from "./safety.js";
+import { useRcReadyStore } from "./rcReady.js";
 import { setGhostPose, showGhost, highlightJoint, evalSafety } from "../three/manager.js";
 import { STATE_RANK } from "../three/safety.js";
+import { DEFAULT_ONLY_JOINT, JOINT_LOCK_TOL_DEG } from "../core/safetyConst.js";
 
 export const JOG_STEPS = [0.1, 1, 5, 10];
 const HOLD_MS = 260;      // 按住超过该时长 → 连续点动；否则视为单击走一格
@@ -36,6 +38,10 @@ let keepAliveTimer = null;
 let pollTimer = null;
 let pressTimer = null;
 let pressInfo = null;
+// ★ 全维度审查 F-01：按压"世代"令牌。每按一次 +1、松手 +1。
+//   startJog 是异步的，返回时用户可能早已松手 —— 没有这个令牌，
+//   松手后仍会把连续点动跑起来（机器人在按钮已松开时继续运动）。
+let pressToken = 0;
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -55,10 +61,14 @@ export const useExecStore = defineStore("exec", {
     // ---- 公共执行参数 ----
     // ★ 全局执行速度：默认 5%（安全档位，避免误发时机器人窜太快）。
     //   顶栏滑块调整后经 saveSpeed 持久化，页面刷新后保持用户设过的值。
+    // ★ 审计修复 P1-D10：localStorage 在隐私模式 / 禁用 Cookie 下读会直接抛
+    //   SecurityError —— 原实现没有 try/catch，整页 state() 建不起来 → 白屏。
     speed: (() => {
-      const v = parseInt(
-        (typeof localStorage !== "undefined" && localStorage.getItem("exec.speed")) || "5", 10
-      );
+      let raw = "5";
+      try {
+        if (typeof localStorage !== "undefined") raw = localStorage.getItem("exec.speed") || "5";
+      } catch (e) { /* 隐私模式读不到就用默认值 */ }
+      const v = parseInt(raw, 10);
       return isFinite(v) && v >= 1 && v <= 100 ? v : 5;
     })(),
     dryRun: true,
@@ -82,6 +92,12 @@ export const useExecStore = defineStore("exec", {
     jogState: null,
     holding: -1,                              // 当前按住的轴 1..6，-1 未按住
     holdingDir: 0,
+
+    // ---- 轴锁模式（来自后端 /api/system/health 的 joint_lock）----
+    //   ★ null = 尚未拉取；enabled=false（默认）时 jointLocked() 恒返回 false → J1–J6 全轴可动。
+    //     仅 AI 测试模式（由你开 config motion.joint_lock.enabled=true 并重启）下 enabled=true，
+    //     此时除 only 轴外其余轴被锁定。后端 motion.command 同样强制，前端只做即时提示。
+    jointLock: null,
 
     // ---- 急停 / 引擎 ----
     estopState: null,
@@ -110,7 +126,7 @@ export const useExecStore = defineStore("exec", {
 
   getters: {
     /** 关节限位（后端未返回时用兜底值，保证滑块永远能拖）。 */
-    limits(s) {
+    limits() {
       const l = useRobotStore().limits;
       return (l && l.length === 6)
         ? l
@@ -122,7 +138,13 @@ export const useExecStore = defineStore("exec", {
      * ★ 只给点动用：点动是"就地增量走"，没有目标位姿可预演，只能看现在在哪。
      */
     UNSAFE() {
-      return ["danger", "hit"].includes(useSafetyStore().lastState);
+      const s = useSafetyStore();
+      // ★ 全维度审查 F-02：点动判据必须限定 source === "robot"。
+      //   残影预演（source==="ghost"）会把 lastState 改写成残影的结论，而点动动的是
+      //   实体机当前位姿 —— 判据与动作对象错位：实体机明明安全却被灰掉按钮，
+      //   或实体机已在危险区而按钮仍亮。
+      if (s.lastSource !== "robot") return false;
+      return ["danger", "hit"].includes(s.lastState);
     },
     /**
      * 残影**预演的目标位姿**是否危险 —— 点位 / 示教 / 程序的拦截依据。
@@ -133,18 +155,49 @@ export const useExecStore = defineStore("exec", {
       const s = useSafetyStore();
       return s.lastSource === "ghost" && ["danger", "hit"].includes(s.lastState);
     },
-    canExec() {
-      return useAuthStore().controlActive && !this.ghostUnsafe;
+    /**
+     * ★ 全维度审查 F-05：可下发的唯一判据（组件不再各写一份 canControl）。
+     *   原实现只判令牌 —— 机器人断链或遥测冻结（读数不可信）时按钮照样可用。
+     */
+    canControl() {
+      const a = useAuthStore(), r = useRobotStore();
+      return !!a.controlActive && !!r.connected && !r.telemetryStale;
     },
-    /** 点动按钮的可用性：与点位/示教分开判据（点动没有目标预演）。 */
+    /**
+     * ★ 需求（硬顺序）：示教 / 点动 / 下发 一律要求「控制器已就绪」——
+     *   即"一键就绪"成功过（伺服已上电 + 点动服务程序在运行 + AUTO + 无报警）。
+     *   只拿到令牌是不够的：伺服没上电时点下去也不动，用户会以为"坏了"；
+     *   把这条固化成门控，也就固化了"先一键就绪、再操作"的现场纪律。
+     *   ★ 取消就绪（程序停/伺服下电）后 ready=false → 这些按钮立即回到不可用。
+     */
+    readyGate() {
+      return !!useRcReadyStore().ready;
+    },
+    canExec() {
+      return this.canControl && !this.ghostUnsafe && this.readyGate;
+    },
+    /** 点动按钮的可用性：与点位/示教分开判据（点动没有目标预演），但同样要求已就绪。 */
     canJog() {
-      return useAuthStore().controlActive && !this.UNSAFE;
+      return this.canControl && !this.UNSAFE && this.readyGate;
+    },
+    /** ★ 轴锁：模式驱动。默认关闭 → J1~J6 全轴可动（操作员需求）。
+     *  ★ 这是 **getter**（计算属性，是个"值"）：外部/内部一律按 `this.jointLockEnabled`
+     *    访问，**绝不能加括号 `()`** —— 否则报 "this.jointLockEnabled is not a function"。 */
+    jointLockEnabled() {
+      return !!(this.jointLock && this.jointLock.enabled);
+    },
+    /** 顶栏/执行页徽标文案：让操作员随时知道当前是哪一种轴策略。 */
+    axisHint() {
+      return this.jointLockEnabled
+        ? `轴锁模式：仅 J${this.jointLock?.only || DEFAULT_ONLY_JOINT} 可动`
+        : "J1–J6 全轴可动";
     },
     /** 禁止下发的具体原因（给界面显示用，避免用户猜）。 */
     blockReason() {
       const s = useSafetyStore();
       if (this.ghostUnsafe) return `残影预演的目标位姿处于 ${s.lastState}，已禁止下发`;
       if (!useAuthStore().controlActive) return "未获得控制权限，无法下发";
+      if (!this.readyGate) return "控制器未就绪：请先在「真机链路」点「一键就绪」（伺服上电 + 程序运行 + 无报警）";
       return "";
     },
     jogActive: (s) => !!(s.jogState && s.jogState.active),
@@ -169,6 +222,16 @@ export const useExecStore = defineStore("exec", {
   },
 
   actions: {
+    // ================= 轴锁判定（带参数，必须是 action） =================
+    /** 关节 j 在当前轴锁模式下是否被禁止运动。
+     *  ★ 必须放在 **actions** 而不是 getters：Pinia 的 getter 不能接收参数，
+     *    写成 getter 会被当成"无参计算属性"，`this.jointLocked(joint)` 调用必然失败。 */
+    jointLocked(j) {
+      if (!this.jointLockEnabled) return false;        // 默认全轴可动
+      const only = Number(this.jointLock?.only || DEFAULT_ONLY_JOINT);
+      return Number(j) !== only;
+    },
+
     // ================= 日志 =================
     logLine(level, text) {
       this.log.push({ t: hhmmss(), level, text: String(text) });
@@ -217,7 +280,16 @@ export const useExecStore = defineStore("exec", {
       } catch (e) { /* 静默 */ }
     },
     async loadAll() {
-      await Promise.all([this.loadPoints(), this.loadPrograms(), this.loadFiles()]);
+      await Promise.all([this.loadPoints(), this.loadPrograms(), this.loadFiles(), this.loadLock()]);
+    },
+    /** 拉取轴锁模式（来自后端 /api/system/health.joint_lock），驱动顶栏徽标与按钮禁用。 */
+    async loadLock() {
+      try {
+        const r = await fetch(apiUrl("/system/health"));
+        if (!r.ok) return;
+        const d = await r.json();
+        if (d && d.joint_lock) this.jointLock = d.joint_lock;
+      } catch (e) { /* 后端不可用时静默，保持 null → 全轴可动默认 */ }
     },
 
     // ================= 滑块示教 =================
@@ -323,6 +395,25 @@ export const useExecStore = defineStore("exec", {
         // ★ 残影门控：按目标位姿量围栏/地面，危险或碰撞直接拒绝（不按实体机当前位姿拦）。
         const gate = this.gateAt(target);
         if (!gate.ok) { this.teachResult = { ok: false, error: gate.reason }; return; }
+        // ★ 全维度审查 F-03 v2.1：轴锁模式（仅 AI 测试）开启时，示教也只有 J6 能偏离当前位姿。
+        //   默认关闭（jointLock.enabled=false）→ 不拦截，J1–J6 全轴可动（操作员需求）。
+        //   后端 motion.command 同样会强制，这里只是让前端即时给出原因、不必等点下去才报。
+        if (this.jointLockEnabled && this.teachMode === "joint") {
+          const cur = useRobotStore().readoutQ || [];
+          const only = Number(this.jointLock?.only || DEFAULT_ONLY_JOINT);
+          const bad = [];
+          for (let i = 0; i < 6; i++) {
+            if ((i + 1) === only) continue;
+            const dev = Math.abs((+target[i] || 0) - (+cur[i] || 0));
+            if (dev > JOINT_LOCK_TOL_DEG) bad.push(`J${i + 1}`);
+          }
+          if (bad.length) {
+            this.teachResult = { ok: false,
+              error: `轴锁模式：仅 J${only} 可动，${bad.join("/")} 偏离当前位姿被拒绝` };
+            this.logLine("err", `示教被轴锁拦截：${bad.join("/")}`);
+            return;
+          }
+        }
         const r = await apiControl("/control/move", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ joints: target, speed_pct: this.teachSpeed }),
@@ -356,10 +447,34 @@ export const useExecStore = defineStore("exec", {
         if (r.ok) this.jogState = await r.json();
       } catch (e) { /* 静默 */ }
     },
+    /**
+     * 点动前置闸：权限不足 / 实体机当前位姿不安全时**拒绝并留痕**。
+     * ★ 原来这三处都是静默 `return` —— 点半天没反应、运行日志里一条都没有，
+     *   用户根本分不清是被"没控制权限"拦了，还是被"围栏/碰撞判定"拦了。
+     *   点动是 J1~J6 最常用的操作，必须能在日志里看到"点了什么、被什么拦了"。
+     * @returns {boolean} true = 已拦截（调用方直接 return）
+     */
+    _jogGuard() {
+      if (!useAuthStore().controlActive) {
+        this.needAuth();     // 弹出验证框
+        this.logLine("warn", "点动被拦截：未获得控制权限（已弹出验证框）");
+        return true;
+      }
+      if (this.UNSAFE) {
+        const s = useSafetyStore();
+        this.logLine("warn", `点动被拦截：实体机当前位姿判定为 ${s.lastState}（围栏/碰撞），已拒绝下发`);
+        return true;
+      }
+      return false;
+    },
     /** 按住 → 连续点动；周期性 keepalive（死人开关）+ 轮询目标姿态驱动 3D。 */
-    async startJog(joint, dir) {
-      if (this.needAuth()) return;
-      if (this.UNSAFE) return;
+    async startJog(joint, dir, token) {
+      if (this._jogGuard()) return;
+      // ★ F-03 v2.1：轴锁只在模式开启时生效（默认全轴可动）
+      if (this.jointLocked(joint)) {
+        this.logLine("warn", `轴锁模式：J${joint} 不可动，仅 J${this.jointLock?.only || DEFAULT_ONLY_JOINT} 可动`);
+        return;
+      }
       this.stopTimers();
       this.jogBusy = true;
       try {
@@ -373,6 +488,14 @@ export const useExecStore = defineStore("exec", {
           const msg = d.message || d.error || "点动被拒绝";
           this.execState = { ok: false, error: msg };
           this.logLine("err", `连续点动 J${joint} 被拒绝：${msg}`);
+          return;
+        }
+        // ★ 全维度审查 F-01：接口返回时用户可能已经松手。
+        //   此时必须立即发一次 stop，绝不建立 keepalive/poll 定时器，
+        //   否则机器人会在按钮已松开的情况下持续运动。
+        if (token !== undefined && token !== pressToken) {
+          try { await apiControl("/control/jog/stop", { method: "POST" }); } catch (e) { /* 静默 */ }
+          this.logLine("warn", "松手早于启动返回，已取消连续点动");
           return;
         }
         this.holding = joint;
@@ -392,7 +515,11 @@ export const useExecStore = defineStore("exec", {
             // ★ 不再直接驱动 3D：把点动引擎的当前目标记入指令通道，
             //   由 App.vue 渲染循环统一显示；真机模式下遥测会跟上真实位置。
             if (s && s.active && s.target) useRobotStore().noteCommand(s.target.map(Number));
-            if (s && !s.active) { this.stopTimers(); this.refreshSessionPose(); }
+            if (s && this.holding >= 0 && !s.active) {
+              const j = this.holding;
+              this.stopTimers(); this.refreshSessionPose();
+              this.logLine("info", `连续点动 J${j} 已结束（控制器报告已停）`);
+            }
           } catch (e) { /* 静默 */ }
         }, 180);
       } catch (e) { this.execState = { ok: false, error: e.message }; }
@@ -400,17 +527,24 @@ export const useExecStore = defineStore("exec", {
     },
     async endJog() {
       if (this.holding < 0) return;
+      const j = this.holding;          // ★ 先记下来：stopTimers() 会把它清成 -1
       this.stopTimers();
+      let ok = false;
       try {
         const r = await apiControl("/control/jog/stop", { method: "POST" });
-        if (r.ok) this.jogState = await r.json();
+        if (r.ok) { this.jogState = await r.json(); ok = true; }
       } catch (e) { /* 静默 */ }
       this.refreshSessionPose();
+      this.logLine(ok ? "info" : "warn",
+        `连续点动 J${j} 已停止` + (ok ? "" : "（停止请求未确认，请确认机器人已停）"));
     },
     /** 增量点动：按一次走固定角度。 */
     async stepJog(joint, dir) {
-      if (this.needAuth()) return;
-      if (this.UNSAFE) return;
+      if (this._jogGuard()) return;
+      if (this.jointLocked(joint)) {
+        this.logLine("warn", `轴锁模式：J${joint} 不可动，仅 J${this.jointLock?.only || DEFAULT_ONLY_JOINT} 可动`);
+        return;
+      }
       await this.endJog();
       this.jogBusy = true;
       try {
@@ -430,6 +564,15 @@ export const useExecStore = defineStore("exec", {
         this.execState = { ok: true, target: d.target, mode: d.mode };
         useRobotStore().noteCommand(d.target.map(Number));
         if (d.warnings && d.warnings.length) this.execState.warning = d.warnings[0];
+        // ★ 成功也要留痕：原来只有"被拒绝"才写日志，于是正常点动在运行日志里
+        //   一条都看不到（用户报的"点动 J1~J6 为什么不显示"就是这条）。
+        {
+          const jIdx = Number(joint) - 1;
+          const after = Array.isArray(d.target) ? Number(d.target[jIdx]) : NaN;
+          this.logLine("ok", `增量点动 J${joint} ${dir > 0 ? "+" : "−"}${this.jogStepDeg}°`
+            + (Number.isFinite(after) ? ` → ${after.toFixed(1)}°` : "")
+            + `（${d.mode === "real" ? "真实" : "模拟"} @${this.jogSpeed}°/s）`);
+        }
         this.syncTeachFromRobot();
       } catch (e) { this.execState = { ok: false, error: e.message }; }
       finally { this.jogBusy = false; }
@@ -438,16 +581,23 @@ export const useExecStore = defineStore("exec", {
     //   长按会先 start(连续)，松手又触发一次 click(步进)，两个动作打架。
     //   这里统一到 pointer 事件：按住 >260ms 视为连续点动，短按视为走一格。
     jogPress(joint, dir) {
-      if (this.needAuth()) return;
-      if (this.UNSAFE) return;
-      pressInfo = { joint, dir };
+      if (this._jogGuard()) return;
+      if (this.jointLocked(joint)) {
+        this.logLine("warn", `轴锁模式：J${joint} 不可动，仅 J${this.jointLock?.only || DEFAULT_ONLY_JOINT} 可动`);
+        return;
+      }
+      const my = ++pressToken;                 // ★ F-01：新一次按压
+      pressInfo = { joint, dir, token: my };
       if (pressTimer) clearTimeout(pressTimer);
       pressTimer = setTimeout(() => {
         pressTimer = null;
-        if (pressInfo) this.startJog(pressInfo.joint, pressInfo.dir);
+        const info = pressInfo;
+        pressInfo = null;                      // ★ 起步即作废，避免松手后被当成短按
+        if (info) this.startJog(info.joint, info.dir, my);
       }, HOLD_MS);
     },
     jogRelease() {
+      pressToken++;                            // ★ F-01：松手即作废在途的 startJog
       if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
       const info = pressInfo;
       pressInfo = null;
@@ -475,6 +625,15 @@ export const useExecStore = defineStore("exec", {
      *   - 判据来自**残影的目标位姿**，不是实体机当前位姿；
      *   - 同步执行（不依赖渲染循环那一帧），所以"没悬停过就直接点执行"也拦得住；
      *   - 侧栏围栏面板与残影同源变色，拒绝时用户看到的就是那片红。
+     *
+     * ★ 判据（现场最终口径）：**残影跟随目标位姿实测，变红即拒绝 —— 没有角度容差。**
+     *   四墙/四角：`ratio < 10%` → danger；`ratio <= 0` → hit。
+     *   地面：最低点 ≤ danger_mm → danger；≤ hit_mm → hit。
+     *   只要有一处变红就不放行；不红就放行。不引入"±N° 内视为不碰撞"之类的
+     *   放宽 —— 那类阈值在默认值下会把整道拦截关掉，而真撞上去没有撤销键。
+     *   与此配套：三个执行入口（点位/示教/程序）的按钮绑的是 `canExec`
+     *   （= 控制权限 && !ghostUnsafe），变红时**按钮直接点不动**，不必等到点下去才报。
+     *   gateAt 仍保留 —— 它是同步兜底，管"没悬停过就直接点执行"这一种。
      *
      * @param {number[]} qDeg 目标关节角(度)
      * @returns {{ok:boolean, state?:string, reason?:string}}
@@ -567,6 +726,15 @@ export const useExecStore = defineStore("exec", {
         this.execState = { ok: false, error: e.message };
         this.logLine("err", "点位下发异常：" + e.message);
       } finally { this.runBusy = false; }
+    },
+    /**
+     * ★ 审计修复 P1-D2：把"当前选中的程序"登记为空格键（runOrAbort）的执行目标。
+     *   原实现里 lastRunTarget **只有 execProgram 自己写** —— 也就是说只有"已经跑过
+     *   一次"的程序才能被空格重复运行；刚在列表里选中的程序按空格只会回一句
+     *   "请先…选一个程序跑一次"，快捷键等于空转。选中即登记，语义也更直白。
+     */
+    setRunTarget(pr) {
+      this.lastRunTarget = pr || null;
     },
     /** 运行"点位序列"程序：逐步下发 + 残影预演下一步 + 逐步日志 + 可中止。 */
     async execProgram(pr) {
@@ -664,6 +832,12 @@ export const useExecStore = defineStore("exec", {
     /** 按文件名执行：程序 / 点位 / programs 目录 JSON；dryRun 只校验不下发。 */
     async runFile() {
       if (this.needAuth()) return;
+      // ★ 审计修复 P1-D4：中止后立即再点"执行"会开第二个并发循环
+      //   （两套 runStep/日志互相覆盖）。busy 时直接拒绝重入。
+      if (this.runBusy || this.fileBusy) {
+        this.logLine("warn", "已有执行在进行中，先中止或等待其结束");
+        return;
+      }
       if (!this.fileName.trim()) {
         this.fileResult = { ok: false, error: "请先选择或输入文件名" };
         return;
@@ -673,6 +847,9 @@ export const useExecStore = defineStore("exec", {
       if (this.ghostUnsafe && !this.dryRun) return;
       this.fileBusy = true;
       this.runBusy = true;
+      // ★ P0-7：每次执行分配一个 run_id，中止时精确指向本次执行
+      this.runId = `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      this.runAbort = false;
       this.runKind = "file";
       this.runName = this.fileName.trim();
       this.runTotal = 0;
@@ -689,6 +866,7 @@ export const useExecStore = defineStore("exec", {
           body: JSON.stringify({
             filename: this.runName, dry_run: this.dryRun,
             speed_pct: this.speed, steps: 40,
+            run_id: this.runId,               // ★ P0-7：供 /control/run-cancel 精确中止
           }),
         });
         if (r.status === 401 || r.status === 403) { this.needAuth(); return; }
@@ -712,13 +890,22 @@ export const useExecStore = defineStore("exec", {
               + candidates.map((c) => c && (c.name || c.id)).join("、"));
           }
         } else {
+          if (d.run_id) this.runId = d.run_id;
+          // ★ P1-D3：runKind 以**后端返回的真实 kind**为准（program/file/point），
+          //   原来 runFile 一律写死 "file"，导致"程序"分支的步骤高亮永远进不去。
+          if (d.kind) this.runKind = d.kind;
           this.runTotal = d.count || 0;
           this.runStep = this.runTotal;
           const name = (d && (d.name || (d.target && d.target.name))) || this.runName;
           const stepTxt = (d && Number.isFinite(d.count)) ? `（${d.passed || 0}/${d.count} 步）` : "";
-          this.logLine(d.ok ? "ok" : "err",
-            (d.dry_run ? "试运行" : "执行") + (d.ok ? "通过" : "发现问题") + `：${name}${stepTxt}`);
-          if (!d.ok && d.message) this.logLine("err", String(d.message));
+          if (d.cancelled) {
+            // ★ P0-7：后端确认已中止 —— 这是"真正停下"的回执，不是失败
+            this.logLine("warn", `已中止「${name}」${stepTxt}（机器人已停止继续下发）`);
+          } else {
+            this.logLine(d.ok ? "ok" : "err",
+              (d.dry_run ? "试运行" : "执行") + (d.ok ? "通过" : "发现问题") + `：${name}${stepTxt}`);
+            if (!d.ok && d.message) this.logLine("err", String(d.message));
+          }
         }
         if (d.ok && !d.dry_run && d.steps && d.steps.length) {
           const last = [...d.steps].reverse().find((s) => s.target);
@@ -740,10 +927,42 @@ export const useExecStore = defineStore("exec", {
         this.running = false;
       }
     },
-    abortRun() {
+    /**
+     * 中止当前执行。
+     *
+     * ★ 审计修复 P0-7：原实现只把 runAbort 置 true —— 这个标志**只有前端
+     *   execProgram 的 for 循环在看**，runFile 的真实下发在后端请求线程里跑，
+     *   压根不知道有人点了中止 → 界面显示"已中止"、机器人把整份文件跑完。
+     *   现在必须**同时通知后端**（POST /control/run-cancel），由后端在每步之间
+     *   检查取消表并就地 break；后端回执 cancelled=true 才算真的停了。
+     *   接口失败也不吞：软标志照常置位，日志里明说"中止可能未生效"。
+     */
+    async abortRun() {
       this.runAbort = true;
       this.running = false;
-      this.logLine("warn", "已请求中止（当前步结束后停止）");
+      this.logLine("warn", "已请求中止…");
+      try {
+        const r = await apiControl("/control/run-cancel", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            run_id: this.runId || null,
+            filename: this.runKind === "file" ? this.runName : null,
+          }),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          this.logLine("ok", d.matched && d.matched.length
+            ? `后端已受理中止（${d.matched.length} 个执行）`
+            : "后端已受理中止（当前没有在跑的执行）");
+        } else if (r.status === 401 || r.status === 403) {
+          this.needAuth();
+          this.logLine("err", "中止失败：控制令牌无效，请重新登录后再试");
+        } else {
+          this.logLine("err", `中止请求返回 ${r.status}，中止可能未生效！`);
+        }
+      } catch (e) {
+        this.logLine("err", "中止请求失败，中止可能未生效：" + e.message);
+      }
     },
 
     /**
@@ -773,25 +992,46 @@ export const useExecStore = defineStore("exec", {
 
     // ================= 急停 / 引擎状态 =================
     async doEstop() {
-      if (this.needAuth()) return;
       this.estopBusy = true;
       try {
         this.stopTimers();                 // ★ 点动是独立线程，先停它再急停
         this.runAbort = true;
+        // ★ 审计修复 P1-D9①：先停本地再问权限 —— 就算没令牌，点动线程也已经停了。
+        // ★ 审计修复 P1-D6/D9②：急停**任何一条路径都必须有反馈**。
+        //   原实现是 `if (needAuth()) return;` + 无 catch：没令牌 / 网络炸 / 后端 500
+        //   三种情况界面都是"按了没反应"，现场会以为急停坏了去拍硬急停（或更糟：
+        //   以为已经停了）。
+        if (this.needAuth()) {
+          this.logLine("err", "急停未发出：没有控制令牌（已弹出验证框，验证后请再次按下 Esc）");
+          return;
+        }
         const r = await apiControl("/control/estop", { method: "POST" });
         if (r.ok) {
           this.estopState = await r.json();
           this.logLine("err", "已下发急停");
+        } else {
+          this.logLine("err", `急停请求失败（HTTP ${r.status}），请立即改用硬急停并检查后端`);
+          if (r.status === 401 || r.status === 403) this.needAuth();
         }
         await this.refreshJog();
+      } catch (e) {
+        this.logLine("err", "急停异常："
+          + (e && e.message ? e.message : e)
+          + "（未收到后端确认，请立即改用硬急停）");
       } finally { this.estopBusy = false; }
     },
     async resetEstop() {
       if (this.needAuth()) return;
-      const r = await apiControl("/control/estop/reset", { method: "POST" });
-      if (r.ok) {
-        this.estopState = await r.json();
-        this.logLine("ok", "急停已复位");
+      try {
+        const r = await apiControl("/control/estop/reset", { method: "POST" });
+        if (r.ok) {
+          this.estopState = await r.json();
+          this.logLine("ok", "急停已复位");
+        } else {
+          this.logLine("err", `急停复位失败（HTTP ${r.status}）`);
+        }
+      } catch (e) {
+        this.logLine("err", "急停复位异常：" + (e && e.message ? e.message : e));
       }
     },
     async refreshState() {
@@ -821,3 +1061,22 @@ export const useExecStore = defineStore("exec", {
     },
   },
 });
+
+// ★ 审计修复 P1-D1：点动是"按住才动"的死人开关（后端 1.5s 收不到 keepalive 自动停）。
+//   但窗口失焦 / 切到后台时浏览器不再派发 keyup，前端的 endJog 永远不会被触发，
+//   只能干等后端 keepalive 超时 —— guide 里承诺的"失焦即停"就成了空话。
+//   这里在离开窗口（blur / hidden）时立刻补一发 stop，双保险。
+if (typeof window !== "undefined") {
+  const stopJogIfHolding = () => {
+    try {
+      const ex = useExecStore();
+      if (ex && ex.holding >= 0) ex.endJog();
+    } catch (e) { /* pinia 未就绪 / 已卸载 */ }
+  };
+  window.addEventListener("blur", stopJogIfHolding);
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stopJogIfHolding();
+    });
+  }
+}

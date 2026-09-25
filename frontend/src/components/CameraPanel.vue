@@ -4,7 +4,7 @@
 //
 // ★ 本组件在四个视图里各挂一份（真实监控 / 点位执行 / 程序执行），全部 v-show 保活。
 //   因此"我是不是当前活跃的那一份"必须判准，否则会同时打出多条 MJPEG 连接。
-import { ref, reactive, computed, watch, onMounted, onBeforeUnmount } from "vue";
+import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
 import { useCameraStore } from "../stores/camera.js";
 import { useRobotStore } from "../stores/robot.js";
 import { cameraBase } from "../config.js";
@@ -16,7 +16,8 @@ const props = defineProps({
 
 const cam = useCameraStore();
 const robot = useRobotStore();
-const imgEl = ref(null);
+// 审计修复 P0-ui-1：不再持有单一 imgEl —— MJPEG 改为双缓冲（imgA/imgB，见下方
+// "MJPEG 流"一节），重连绝不再改写/移除**显示路**的 src。
 const liveFlag = ref(false);
 const expanded = ref(false);
 const snapMsg = ref("");
@@ -117,7 +118,12 @@ const stateText = computed(() => {
   if (!s) return "未连接";
   if (s.opening) return "打开中…";
   if (s.closing) return "关闭中…";
-  if (s.opened) return streamStalled.value ? "画面中断" : "已开启";
+  if (s.opened) {
+    // 审计修复 P0-ui-1：区分"画面中断（显示路已判死）"与"正在建连（等首帧）"
+    if (streamStalled.value) return "画面中断";
+    if (connecting.value) return "连接中…";
+    return "已开启";
+  }
   return "已关闭";
 });
 
@@ -126,13 +132,20 @@ const placeholderTitle = computed(() => {
   const s = cam.status;
   if (s && s.opening) return "正在打开相机…";
   if (s && s.closing) return "正在关闭…";
-  if (s && s.opened) return streamStalled.value ? "画面中断，正在自动重连…" : "等待画面…";
+  if (s && s.opened) {
+    // 审计修复 P0-ui-1：占位层永远带文字 + 深色底（见 .cam-placeholder），
+    // "连接中"不再表现为一块没有任何提示的纯黑
+    if (streamStalled.value) return "画面中断，正在自动重连…";
+    if (connecting.value) return "正在连接画面…";
+    return "等待画面…";
+  }
   return "相机未开启";
 });
 
 const placeholderSub = computed(() => {
   if (cam.serviceDown) return "请启动 camera/camera_service.py 后点「重试」";
   if (streamStalled.value) return "MJPEG 连接已断开，正在重新建连";
+  if (connecting.value) return "首帧到达后自动显示画面";
   return "";
 });
 
@@ -179,32 +192,134 @@ let streamRetryMs = 1000;
 let streamRetryTimer = null;
 const streamStalled = ref(false);
 
-function onFrameLoad() {
+// 审计修复 P0-ui-1：MJPEG 双缓冲（两路 <img> 叠放，消除重连黑帧窗口）。
+// 旧实现重连时**直接改写/移除显示用 <img> 的 src**：src 一改，浏览器立刻丢弃旧图，
+// 新连接首帧到达前该 <img> 处于"无图"状态 —— 叠上 .cam-img 的 var(--screen)(#000)
+// 黑底就是一段几百 ms ~ 数秒的纯黑窗口；onFrameError 又只清时间戳，得等 2.5s 兜底
+// tick 才发现断流。现在改为：
+//   front（显示路）= 正在显示的那一路，重连期间**始终保留旧帧**，绝不动它的 src；
+//   back （预连接路）= .cam-back（透明底）的一路，重连时在它身上挂新 URL(cache-bust)，
+//        首帧到达即"换正"；旧路随后被清掉 src（它此时已退居幕后，被新路的不透明底
+//        完全遮住，清 src 不会露出黑底）。
+// 于是重连全程要么是"旧帧 + 半透明重连覆盖层"，要么是"深色占位层 + 文字"，
+// 任何时刻都不露纯黑底。
+const imgA = ref(null);
+const imgB = ref(null);
+const front = ref("a");                  // 当前显示的是哪一路（"a" | "b"）
+const connecting = ref(false);           // 预连接路已挂上 URL、正在等首帧
+
+const elOf = (slot) => (slot === "a" ? imgA.value : imgB.value);
+const backSlot = () => (front.value === "a" ? "b" : "a");
+
+function onFrameLoad(e) {
+  const t = e.target;
   lastFrameAt = Date.now();
   streamRetryMs = 1000;                    // 有帧回来 → 退避复位
-  if (streamStalled.value) streamStalled.value = false;
+  if (t !== elOf(backSlot()) || !connecting.value) return;   // 显示路在出帧（正常状态）
+  // 预连接路首帧到达 → 换正：显示路从头到尾一帧都没丢过
+  const old = front.value;
+  front.value = backSlot();
+  liveFlag.value = true;
+  connecting.value = false;
+  streamStalled.value = false;
+  lastReconnectAt = Date.now();
+  // ★★ 退回：必须清掉旧路的 src。
+  //    曾经为了"消除换帧闪黑"改成"保留旧帧作底衬"，结果是**严重回归**：
+  //    dom 顺序里 imgB 在 imgA 之上（后面的元素盖前面的），而 .cam-back 只把 CSS 背景设成
+  //    透明 —— **图片本身仍然是不透明地画在上层的**。于是旧帧一直盖着新显示路，
+  //    画面冻在旧帧、检测框自然"看着不动了"（现场表现为"怎么不检测了"）。
+  //    正解仍是：换正之后立刻释放旧路，让它不再绘制。
+  //    先让 Vue 把 .cam-back 类更新到 DOM（"先遮后放"），再清 src。
+  nextTick(() => {
+    const oldEl = elOf(old);
+    if (oldEl && front.value !== old) oldEl.removeAttribute("src");
+  });
 }
-function onFrameError() {
-  // img 取流失败（服务端断开 / 404）：走与"卡住"同一套重连逻辑
+
+// ★ 现场问题（画面左上角偶尔闪出一个白色小方块 + 浏览器"破图"图标）：
+//   失败的 <img> 会渲染浏览器的破图占位。直接 removeAttribute("src") 有两个毛病：
+//     ① 迟到/已被忽略的错误会走 early-return，**根本没清** → 图标留在那儿；
+//     ② 有些浏览器对"曾经失败过的 img"仍保留破图状态。
+//   改成：只要不是"正在显示的活帧"，一律把 src 换成 **1×1 透明像素**（真实可解码的图，
+//   浏览器会立刻退出破图状态，且不占带宽、不建立任何连接）。
+const BLANK_PX = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+
+function onFrameError(e) {
+  // 审计修复 P0-ui-1：错误**即时处置**。旧版只 `lastFrameAt = 0`，要等 2.5s 兜底
+  // tick 才发现断流，期间画面层已经没有帧、露着 #000 黑底且没有任何提示。
+  const t = e.target;
+  const killBroken = () => { try { t.src = BLANK_PX; } catch (err) { /* 忽略 */ } };
+  if (t === elOf(backSlot())) {
+    // ★ 先把破图占位干掉，再判"这次尝试是否还需要处理" ——
+    //   迟到的错误（connecting 已复位）以前直接 return，图标就留下了。
+    killBroken();
+    if (!connecting.value) return;
+    connecting.value = false;              // 预连接失败：显示路旧帧不动，退避后重试
+    scheduleRetry();
+    return;
+  }
+  if (!liveFlag.value) { killBroken(); return; }    // 显示路还没画面 → 交给 checkStall 自愈
+  // 显示路已出过帧：**保留最后一帧**（不清 src，避免黑一下），仅标记断流并另起一路预连接
   lastFrameAt = 0;
+  streamStalled.value = true;
+  if (!connecting.value) beginConnect();
+}
+
+/** 在**预连接路**上挂新 URL（时间戳 cache-bust）；显示路的 src 一律不动。 */
+function beginConnect() {
+  if (connecting.value) return true;
+  const back = elOf(backSlot());
+  if (!back) return false;
+  lastReconnectAt = Date.now();
+  lastFrameAt = Date.now();                // 与旧版一致：给新连接一个起点
+  connecting.value = true;
+  back.src = CAM_URL + "/stream?t=" + Date.now();
+  return true;
+}
+
+/** 指数退避重连（1s 起，封顶 8s）。 */
+function scheduleRetry() {
+  const d = streamRetryMs;
+  streamRetryMs = Math.min(streamRetryMs * 2, 8000);   // 指数退避，避免疯狂重连
+  if (streamRetryTimer) clearTimeout(streamRetryTimer);
+  streamRetryTimer = setTimeout(() => {
+    streamRetryTimer = null;
+    if (isActive() && !document.hidden && cam.canStream) connectStream();
+  }, d);
+}
+
+/** 停止取流（关相机 / 切走视图 / 页面隐藏）：两路都释放，回到带文字的深色占位层。 */
+function releaseStream() {
+  if (streamRetryTimer) { clearTimeout(streamRetryTimer); streamRetryTimer = null; }
+  ["a", "b"].forEach((s) => { const el = elOf(s); if (el) el.removeAttribute("src"); });
+  liveFlag.value = false;
+  connecting.value = false;
+  streamStalled.value = false;
 }
 
 function connectStream() {
   // 页面隐藏时不断 MJPEG：隐藏页仍会持续解码视频流（GPU/网络大头）
   const want = cam.canStream && isActive() && !document.hidden;
   if (want) {
-    if (!liveFlag.value && imgEl.value) {
-      lastFrameAt = Date.now();
-      lastReconnectAt = Date.now();        // ★ 记录重连时间，进入稳定期
-      streamStalled.value = false;
-      imgEl.value.src = CAM_URL + "/stream?t=" + Date.now();
-      liveFlag.value = true;
-    }
-  } else if (liveFlag.value) {
-    if (imgEl.value) imgEl.value.removeAttribute("src");
-    liveFlag.value = false;
-    streamStalled.value = false;
+    // ★ 有在途连接、或正处在退避等待期 → 都不动（否则 1s 一次的状态轮询会把
+    //   指数退避冲掉，服务一挂就变成每秒猛敲）。
+    if (connecting.value || streamRetryTimer) return;
+    if (!liveFlag.value) { beginConnect(); return; }   // 还没画面：占位层 + 预连接
+    if (streamStalled.value) beginConnect();           // 显示路已判死：另一路预连接（旧帧继续显示）
+  } else {
+    // 审计修复 P0-ui-1：无条件释放（幂等），连退避中的重连定时器也一起清掉，
+    // 否则关掉相机后还挂着一个到点的重连定时器。
+    releaseStream();
   }
+}
+
+/** 预连接首帧超时：放弃这一路（清的是隐藏路的连接，不露黑底），退避后重试。 */
+function checkConnectTimeout() {
+  if (Date.now() - lastReconnectAt < RECONNECT_GRACE_MS) return;   // 新连接首帧给 8s 宽限
+  const back = elOf(backSlot());
+  if (back) back.removeAttribute("src");
+  connecting.value = false;
+  scheduleRetry();
 }
 
 function checkStall() {
@@ -213,26 +328,26 @@ function checkStall() {
   //   以前这里遇到 !liveFlag 直接 return，建连**只**由 cam.status 变化触发；
   //   只要那一次触发落空（imgEl 尚未就绪、正好在切换视图、状态恰好没变），
   //   画面就再也不会出来 —— 表现就是"一直显示正在打开相机，刷新页面才见画面"。
-  //   现在看门狗每 2.5s 兜一次，最迟 2.5s 自动接上，不必再刷新。
+  //   现在看门狗每 1s 兜一次（审计修复 P0-ui-1 把 2.5s 缩到 1s），最迟 1s 自动接上。
   if (!liveFlag.value) {
+    if (connecting.value) { checkConnectTimeout(); return; }
     if (cam.canStream) connectStream();
+    return;
+  }
+  // 有画面：要么盯着预连接首帧超时，要么盯着显示路是否断流
+  if (connecting.value) { checkConnectTimeout(); return; }
+  if (streamStalled.value) {
+    if (!streamRetryTimer) beginConnect();   // 判死后没有在途连接也没在退避 → 立刻补一次
     return;
   }
   // ★ 重连后稳定期：新连接刚建立，第一帧可能慢（浏览器建连 + 服务端编码），
   //   这时不看门狗，避免"刚连上又断"的闪来闪去循环。
   if (Date.now() - lastReconnectAt < RECONNECT_GRACE_MS) return;
   if (Date.now() - lastFrameAt < STREAM_STALL_MS) return;
-  // 15 秒没有新帧 → 主动清 src 重新建连（不清的话浏览器永远等在那条死连接上）
+  // 15 秒没有新帧 → 判死显示路。**不清显示路的 src**：旧帧继续留在屏幕上，
+  // 换正之前用户看到的是"冻结画面 + 正在重连覆盖层"，而不是黑屏。
   streamStalled.value = true;
-  if (imgEl.value) imgEl.value.removeAttribute("src");
-  liveFlag.value = false;
-  const d = streamRetryMs;
-  streamRetryMs = Math.min(streamRetryMs * 2, 8000);   // 指数退避，避免疯狂重连
-  if (streamRetryTimer) clearTimeout(streamRetryTimer);
-  streamRetryTimer = setTimeout(() => {
-    streamRetryTimer = null;
-    if (isActive() && !document.hidden && cam.canStream) connectStream();
-  }, d);
+  if (!beginConnect()) scheduleRetry();
 }
 
 watch(() => cam.status, connectStream);
@@ -246,7 +361,9 @@ onMounted(() => {
   loadLayout();
   poll();
   cam.loadDevices();  // 加载可用相机设备列表
-  stallTimer = setInterval(checkStall, 2500);
+  // 审计修复 P0-ui-1：兜底 tick 从 2.5s 缩到 1s —— 真正的断流已由 onFrameError
+  // 即时处置，这里只剩"无声卡死"（连接还活着但不再出帧）的检测，密一点代价可忽略。
+  stallTimer = setInterval(checkStall, 1000);
 });
 onBeforeUnmount(() => {
   stopPoll();
@@ -262,10 +379,9 @@ watch(() => robot.activeView, (v) => {
     connectStream();
   } else {
     stopPoll();
-    if (liveFlag.value) {
-      if (imgEl.value) imgEl.value.removeAttribute("src");
-      liveFlag.value = false;
-    }
+    // 审计修复 P0-ui-1：两路一起释放（原来只清显示路的 src）。
+    // 本面板已不在活跃视图，界面被 v-show 藏着，回到深色占位层不会被看见。
+    releaseStream();
   }
 });
 
@@ -350,14 +466,19 @@ async function retryService() {
 
     <!-- 画面区域 -->
     <div class="cam-screen" :style="{ height: (expanded ? size.h : 200) + 'px' }">
-      <img v-show="liveFlag" ref="imgEl" class="cam-img" alt=""
+      <!-- 审计修复 P0-ui-1：双缓冲两路画面 —— front 是显示路（保留旧帧 + 不透明底），
+           .cam-back 是预连接路（透明底，拿到首帧才接管显示，重连窗口零黑帧） -->
+      <img ref="imgA" class="cam-img" :class="{ 'cam-back': front !== 'a' }" alt=""
+           @load="onFrameLoad" @error="onFrameError" />
+      <img ref="imgB" class="cam-img" :class="{ 'cam-back': front !== 'b' }" alt=""
            @load="onFrameLoad" @error="onFrameError" />
       <div v-if="!liveFlag" class="cam-placeholder">
         <Icon :name="cam.serviceDown ? 'alert' : 'camera'" :size="32" class="cam-ph-icon" />
         <span class="cam-ph-title">{{ placeholderTitle }}</span>
         <span v-if="placeholderSub" class="cam-ph-sub">{{ placeholderSub }}</span>
       </div>
-      <!-- 画面卡住时的角标：明确告诉用户"在自动重连"，而不是让人以为死机了 -->
+      <!-- 重连覆盖层：半透明盖在**仍然可见的旧帧**上（不是黑底），
+           明确告诉用户"在自动重连"，而不是让人以为死机/黑屏 -->
       <div v-if="liveFlag && streamStalled" class="cam-stall">
         <Icon name="refresh" :size="12" class="spin" /> 正在重连画面…
       </div>
@@ -408,10 +529,8 @@ async function retryService() {
 
     <!-- 展开后的详细控制 -->
     <div v-show="expanded" class="cam-body">
-      <!-- 灰度相机提示：无彩色信息，无法做颜色识别 -->
-      <div class="color-unavail" v-if="cam.colorSupported && !cam.colorCapable">
-        <span class="dot"></span> 当前相机为<strong>灰度相机</strong>，画面无彩色信息，无法做红/绿/蓝识别。请切换到<strong>彩色相机</strong>（USB 彩色 / 海康 GC 系列）。
-      </div>
+      <!-- ★ 需求：原"当前相机为灰度相机…"说明框已移除，移到「关于」页（见 AboutView）。
+           这里不再重复占位。 -->
 
       <!-- 颜色分拣开关 -->
       <div class="control-row" v-if="cam.colorSupported && cam.colorCapable">
@@ -534,9 +653,20 @@ async function retryService() {
   border-bottom: 1px solid var(--line); overflow: hidden;
   transition: height .18s ease;
 }
-.cam-img { width: 100%; height: 100%; object-fit: contain; background: var(--screen); display: block; }
+/* 审计修复 P0-ui-1：两路 <img> 绝对定位叠放（双缓冲）。
+   .cam-back 是预连接路 —— **透明底**（没有 var(--screen) 黑底），所以它在还没拿到
+   首帧时完全看不见，绝不会把显示路的旧帧盖成黑块；首帧一到它才自然接管显示。
+   不用 opacity/display 隐藏：那样浏览器可能不给它解码出帧，首帧事件就收不到了。 */
+.cam-img {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  object-fit: contain; background: var(--screen); display: block;
+}
+.cam-back { background: transparent; pointer-events: none; }
 .cam-placeholder {
   position: absolute; inset: 0;
+  /* 审计修复 P0-ui-1：占位层自带深色底（不是 --screen 的纯 #000）——
+     "等待/连接中"与真正的黑屏在视觉上必须能一眼分开 */
+  background: linear-gradient(160deg, #171d25, #10151b);
   display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 6px;
   color: var(--muted); pointer-events: none; text-align: center; padding: 0 14px;
@@ -544,12 +674,14 @@ async function retryService() {
 .cam-ph-icon { opacity: .5; }
 .cam-ph-title { font-size: 13px; color: var(--txt); }
 .cam-ph-sub { font-size: 11px; line-height: 1.5; }
+/* 审计修复 P0-ui-1：重连覆盖层 —— 由原来的左下角小角标升级为整屏半透明覆盖，
+   盖在仍然可见的旧帧上（不露黑底），明确提示"正在自动重连" */
 .cam-stall {
-  position: absolute; left: 8px; bottom: 8px;
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 8px; border-radius: 5px; font-size: 11px;
-  color: var(--warn); background: var(--glass);
-  border: 1px solid var(--warn-line);
+  position: absolute; inset: 0; z-index: 2;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 0; border-radius: 0; font-size: 12px;
+  color: var(--warn); background: rgba(12, 16, 22, .55);
+  border: none; pointer-events: none;
 }
 
 /* ---- 主控制区域 ---- */

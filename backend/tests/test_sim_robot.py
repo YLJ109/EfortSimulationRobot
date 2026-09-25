@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from app.services.sim_robot import MIN_DURATION_S, SimRobot, sim_robot
+from app.services.sim_robot import SimRobot, sim_robot
 
 
 @pytest.fixture(autouse=True)

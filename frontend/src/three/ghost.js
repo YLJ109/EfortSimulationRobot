@@ -17,6 +17,7 @@
 // =====================================================================
 import * as THREE from "three";
 import { buildRobot } from "../robot/robotModel.js";
+import { buildEndEffector } from "./endEffector.js";
 
 export const GHOST_OPACITY = 0.26;      // 半透明程度（越小越"虚"）
 export const GHOST_COLOR = 0x2f9bff;    // 统一淡蓝，和实体机的灰白明显区分
@@ -29,8 +30,26 @@ const GHOST_K = 10;                     // 残影自身的一阶收敛速率（�
  *            setAlarm(on):void, withTarget(fn):any, visible:boolean, alarmed:boolean,
  *            dispose():void, meshCount:number}}
  */
+
 export function createGhost(dh, mounting = "floor", liftY = 0) {
   const model = buildRobot(dh, mounting);
+
+  // ★ 需求：残影也要显示 J6 上的那个末端工具（吸盘 + 两块矩形立板），并跟随 J6 一起动。
+  //   ★★ 复用**同一个** buildEndEffector()（官方模型也用它）—— 从此两边外观不可能不一致；
+  //      以前残影自己手写了一份简化版，才出现"残影看不到 J6 工具"。
+  //   ★ 尺度：该工具是按官方那条 **root.scale = 0.001** 的链设计的（几何值是"近似 mm"），
+  //     而程序化模型本身是"米"（robotModel 里 j.d / SCALE，SCALE=1000）→ 这里必须再乘 0.001，
+  //     否则整套工具会被放大 1000 倍（残影文件头的铁律同样适用于末端工具）。
+  //   ★ 挂载点用 model.flangeNode（按 DH 的 d6 算出的法兰面）；**不要硬编码 z**，
+  //     往腕部筒身里偏一点，工具就整块埋进去看不见了。
+  //   必须在下面"统一染成半透明蓝 + 收集 tint"之前挂上去，末端工具才会一起泛红。
+  try {
+    if (model.flangeNode) {
+      const ee = buildEndEffector();
+      ee.group.scale.setScalar(0.001);   // 对齐官方 0.001 缩放链（单位：米）
+      model.flangeNode.add(ee.group);
+    }
+  } catch (e) { /* 末端工具缺失不影响残影本体 */ }
 
   const tint = [];          // 参与报警着色的材质（基色统一 GHOST_COLOR）
   let meshCount = 0;

@@ -125,9 +125,10 @@
       @keyframes ctrl-settle { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
 
       /* ---- 顶部 Tab ---- */
-      #tabs { display: flex; background: var(--panel); border-bottom: 1px solid var(--line); }
-      #tabs .tab { flex: 0 0 140px; background: transparent; color: var(--muted); border: none;
-        border-bottom: 2px solid transparent; border-radius: 0; padding: 12px 0; font-size: 14px;
+      #tabs { display: flex; background: var(--panel); border-bottom: 1px solid var(--line);
+        overflow-x: auto; }   /* ★ U-01：1201–1400px 段也允许横向滚动，避免 Tab 被裁且无滚动 */
+      #tabs .tab { flex: 0 0 auto; min-width: 88px; background: transparent; color: var(--muted); border: none;
+        border-bottom: 2px solid transparent; border-radius: 0; padding: 12px 10px; font-size: 14px;
         cursor: pointer; font-weight: 600; position: relative;
         transition: color .16s ease, background .16s ease; }
       #tabs .tab:hover { color: var(--txt); background: var(--panel2); }
@@ -280,8 +281,11 @@
         font-variant-numeric: tabular-nums; font-family: var(--num); }
       .btns { display: flex; gap: 8px; }
       /* ---- 按钮：统一外形 + 过渡 + 按下反馈 ---- */
-      button { flex: 1; min-width: 0; background: var(--panel); color: var(--txt);
-        border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px;
+      /* ★ 需求（按钮过宽）：原来 `flex:1` 让按钮在 .btns 里**强制撑满整行** ——
+         单个按钮就会占满整行、看着又宽又空。改为按内容宽度（可收缩、不强制伸展），
+         需要等宽铺满的行请在各自 .btns 上显式加 flex。 */
+      button { flex: 0 1 auto; max-width: 100%; background: var(--panel); color: var(--txt);
+        border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 12px;
         cursor: pointer; font-size: 13px; font-family: inherit;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         transition: background .14s ease, border-color .14s ease, color .14s ease; }

@@ -128,7 +128,7 @@ def test_unclaimed_allows_but_warns(client):
     assert st.json()["ok"] is True
     assert "未声明" in st.json().get("mode_warning", "")
 
-    ev = client.get("/api/events", params={"category": "control", "limit": 50})
+    ev = client.get("/api/events", params={"category": "control", "limit": 50}, headers=h)
     assert ev.status_code == 200, ev.text
     actions = [e["action"] for e in ev.json()["items"]]
     assert "control.jog_mode_unclaimed" in actions, actions
@@ -169,7 +169,7 @@ def test_clear_resets(client):
 def test_claim_emits_event(client):
     h = _h(client)
     _claim(client, h, "T2")
-    ev = client.get("/api/events", params={"category": "control", "limit": 50})
+    ev = client.get("/api/events", params={"category": "control", "limit": 50}, headers=h)
     assert ev.status_code == 200
     items = ev.json()["items"]
     hit = [e for e in items if e["action"] == "control.run_mode"]
@@ -398,6 +398,7 @@ def test_feed_run_mode_wires_collector_to_runmode(client):
     assert rm["source"] == "controller" and rm["level"] == "ok"
     assert rm["observed_age_sec"] is not None
 
-    ev = client.get("/api/events", params={"category": "control", "limit": 50})
+    h = _h(client)
+    ev = client.get("/api/events", params={"category": "control", "limit": 50}, headers=h)
     actions = [e["action"] for e in ev.json()["items"]]
     assert "control.run_mode_observed" in actions, actions

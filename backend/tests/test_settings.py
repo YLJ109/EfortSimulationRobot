@@ -241,7 +241,6 @@ def test_overlay_is_sparse_and_field_reset(client):
 def test_saving_yaml_value_removes_it_from_overlay(client):
     """把值改回 yaml 原值 → 自动从覆盖层消失（不写冗余条目）。"""
     h = _admin(client)
-    fields = {f["key"]: f for g in client.get("/api/settings").json()["groups"] for f in g["fields"]}
     yaml_val = None
     base = st.base_config()
     node = base
@@ -340,7 +339,7 @@ def test_reset_clears_overlay_and_emits_critical_event(client):
     assert st.load_overlay() == {}, "重置后覆盖层应为空"
 
     # 审计留痕：不可撤销操作必须以 critical 级别落库，并把改动前的内容留下来
-    events = client.get("/api/events").json()["items"]
+    events = client.get("/api/events", headers=_admin(client)).json()["items"]
     hit = [e for e in events if e["action"] == "config.settings_reset"]
     assert hit, "重置没有写审计事件"
     assert hit[0]["level"] == "critical"

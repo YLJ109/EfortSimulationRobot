@@ -9,7 +9,7 @@
 // 运行逻辑全在 stores/exec.js（execProgram / runFile / abortRun），
 // 与点位执行页共用同一套权限、围栏互锁与急停。
 // =====================================================================
-import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue";
 import MonitorLayout from "./MonitorLayout.vue";
 import Icon from "./Icon.vue";
 import CameraPanel from "./CameraPanel.vue";
@@ -75,6 +75,20 @@ const localItems = computed(() => {
 // 「测试跑」（空跑校验）可用性：持有控制令牌且当前没有其它运行在进行。
 // ★ 测试跑无论残影是否危险都能做 —— 它不下发、不移动，只是解析 + IK/限位预演。
 const canTest = computed(() => auth.controlActive && !exec.fileBusy && !exec.runBusy);
+
+/**
+ * ★ 需求（手动执行重设计）：两个按钮走同一条 runFile 通道，只差 dryRun 开关。
+ *   「测试」= dryRun（只解析/IK/限位校验，绝不下发）；「直接运行」= dryRun=false（真下发）。
+ *   不在界面上暴露 dryRun 勾选框，避免"以为在测试其实在下发"的误判。
+ */
+async function runTest() {
+  exec.dryRun = true;
+  await exec.runFile();
+}
+async function runNow() {
+  exec.dryRun = false;
+  await exec.runFile();
+}
 /** 某个目标是否正处于测试跑中（用于列表行内"校验中…"提示）。 */
 const testBusy = (name) => exec.fileBusy && exec.fileName === name;
 const refetching = ref(false);
@@ -83,22 +97,9 @@ async function refetchFiles() {
   try { await exec.loadFiles(); } finally { refetching.value = false; }
 }
 
-// ---------- 运行日志：自动滚到底 ----------
-// ★ 只在"用户本来就在底部"时才自动滚。现场经常一边运行一边往回翻日志，
-//   无脑自动滚会把正在看的那几行顶走 —— 那比不滚还烦人。
-const logEl = ref(null);
-const stickBottom = ref(true);
-function onLogScroll() {
-  const el = logEl.value;
-  if (!el) return;
-  stickBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-}
-watch(() => exec.log.length, async () => {
-  if (!stickBottom.value) return;
-  await nextTick();
-  const el = logEl.value;
-  if (el) el.scrollTop = el.scrollHeight;
-});
+// ---------- 运行日志 ----------
+// ★ 右侧栏的"运行日志"卡片已移除，日志统一由 MonitorLayout 的左下角浮动面板显示
+//   （自动跟随最新的"粘底"逻辑也在那边实现）。此处不再保留本地日志视图代码。
 
 const steps = computed(() => {
   const pr = selProgram.value;
@@ -116,10 +117,18 @@ const steps = computed(() => {
   });
 });
 
-/** 运行中：已完成 / 正在执行 / 待执行 */
+/** 运行中：已完成 / 正在执行 / 待执行
+ *
+ *  ★ 审计修复 P1-D3：原实现读 `exec.trackStep` / `exec.trackName` ——
+ *    这两个字段**在 store 里根本不存在**（grep 全前端只有这两处引用），
+ *    `!exec.trackStep` 恒为 true → 函数永远返回 "" → 步骤高亮从未生效过。
+ *    改用真实存在的 runStep / runRunName，并用"当前选中程序名"做归属判断，
+ *    避免跑 A 程序时把 B 程序的列表染色。
+ */
 function stepCls(i) {
-  if (!exec.trackStep || exec.runKind !== "program") return "";
-  if (exec.runName !== exec.trackName) return "";
+  if (exec.runKind !== "program") return "";
+  const selName = (selProgram.value && selProgram.value.name) || "";
+  if (!selName || exec.runName !== selName) return "";
   if (i < exec.runStep) return "done";
   if (i === exec.runStep) return "on";
   return "";
@@ -128,7 +137,15 @@ function stepCls(i) {
 function exportProgram(pr) { window.open(apiUrl(`/programs/${pr.id}/export`), "_blank"); }
 
 function pickProgram(pr) {
-  selProgram.value = selProgram.value && selProgram.value.id === pr.id ? null : pr;
+  const same = selProgram.value && selProgram.value.id === pr.id;
+  selProgram.value = same ? null : pr;
+  // ★ 审计修复 P2-D：点选必须同步写 exec.fileName。
+  //   原实现只切 selProgram（组件内部状态），store 的 fileName 不变 →
+  //   选中态高亮着，点「执行」却弹"请先选择或输入文件名"。
+  exec.fileName = same ? "" : String(pr.name || "");
+  // ★ 审计修复 P1-D2：选中即登记空格键（runOrAbort）的目标。
+  //   否则只有"跑过一次"的程序才能被空格重复运行，刚选中的按空格等于空转。
+  exec.setRunTarget(same ? null : pr);
 }
 
 watch(() => robot.activeView, (v) => { if (v !== "program") exec.leaveView(); });
@@ -187,7 +204,7 @@ watch(() => auth.controlActive, (v) => {
       </div>
       <div class="prog-bar"><i :style="{ width: exec.runPct + '%' }"></i></div>
       <div class="btns" style="margin-top:8px">
-        <button class="rec-on" :disabled="!exec.running" @click="exec.abortRun()">
+        <button class="rec-on" :disabled="!exec.running && !exec.fileBusy" @click="exec.abortRun()">
           <Icon name="close" :size="13" /> 中止
         </button>
       </div>
@@ -214,7 +231,7 @@ watch(() => auth.controlActive, (v) => {
           <Icon name="refresh" :size="13" />
         </span>
       </h3>
-      <p class="small muted">示教器导出的 .XPL 程序，可在控制器上执行。「测试跑」只解析校验（IK / 限位 / 可达），绝不下发、不加载、不移动机器人。</p>
+      <p class="small muted">示教器导出的 .XPL 程序，可在控制器上执行。</p>
       <div class="pt-list">
         <div v-for="f in exec.teachFiles" :key="'teach:' + f.name" class="pt-item"
              :class="{ on: exec.fileName === f.name }">
@@ -244,7 +261,7 @@ watch(() => auth.controlActive, (v) => {
           <Icon name="refresh" :size="13" />
         </span>
       </h3>
-      <p class="small muted">数据库点位序列程序、programs 目录里的 .json 程序与预设点位。「测试跑」同样只校验，不发任何指令、不移动机器人。</p>
+      <p class="small muted">本机 programs 目录里的本地文件与数据库点位序列。</p>
       <div class="pt-list">
         <div v-for="it in localItems" :key="'local:' + it.kind + ':' + it.name" class="pt-item"
              :class="{ on: (it.kind === 'program' && selProgram && selProgram.id === it.id) || exec.fileName === it.name }">
@@ -291,37 +308,38 @@ watch(() => auth.controlActive, (v) => {
       </div>
     </div>
 
-    <!-- 手动执行（高级：自己输入目标名） -->
+    <!-- 手动执行：填写文件名 → 测试（只校验不下发）/ 直接运行 -->
     <div class="card">
       <h3><Icon name="file" :size="15" /> 手动执行
-        <span class="h3-sub">示教器 / 程序 / 点位 / JSON · 高级</span>
+        <span class="h3-sub">填文件名 · 先测试再运行</span>
       </h3>
       <div class="pf-row">
-        <label>目标</label>
+        <label>文件名</label>
         <input list="efort-files" v-model="exec.fileName" type="text"
-               placeholder="输入文件名或选择…" />
+               placeholder="填写文件名，或从下拉选择…" />
         <datalist id="efort-files">
           <option v-for="f in exec.files" :key="f.kind + ':' + f.name" :value="f.name">
             {{ f.file_ext === 'xpl' ? '示教器' : f.kind === 'program' ? '程序' : f.kind === 'point' ? '点位' : '文件'
             }}{{ f.no != null ? ' · #' + f.no : '' }}{{ f.steps ? ' · ' + f.steps + ' 步' : '' }}
           </option>
         </datalist>
-        <button :disabled="exec.fileBusy" @click="exec.loadFiles()">
+        <button :disabled="exec.fileBusy" title="重新扫描可执行文件清单"
+                @click="exec.loadFiles()">
           <Icon name="refresh" :size="12" />
         </button>
       </div>
-      <label class="ap-line"
-             style="display:flex;gap:6px;align-items:center;font-size:12px;margin:6px 0">
-        <input type="checkbox" v-model="exec.dryRun" />
-        <Icon name="flask" :size="13" /> 试运行（空跑测试：只校验与解算，<b>绝不下发</b>）
-      </label>
       <div class="btns">
-        <button class="primary" :disabled="exec.fileBusy || (!exec.dryRun && !exec.canExec)"
-                @click="exec.runFile()">
-          <Icon :name="exec.dryRun ? 'flask' : 'play'" :size="13" />
-          {{ exec.dryRun ? "试运行" : "执行" }}
+        <button :disabled="!canTest || !exec.fileName.trim()" @click="runTest">
+          <Icon name="flask" :size="13" /> {{ exec.fileBusy ? "测试中…" : "测试" }}
+        </button>
+        <button class="primary" :disabled="exec.fileBusy || !exec.canExec || !exec.fileName.trim()"
+                @click="runNow">
+          <Icon name="play" :size="13" /> 直接运行
         </button>
       </div>
+      <p class="small muted" style="margin-top:6px">
+        「测试」只解析校验（IK / 限位 / 可达），**绝不下发**；「直接运行」才会真下发。
+      </p>
       <div v-if="exec.fileResult" class="teach-res"
            :class="exec.fileResult.ok ? 'ok' : 'err'">
         <Icon :name="exec.fileResult.ok ? 'check' : 'alert'" :size="13" />
@@ -341,24 +359,8 @@ watch(() => auth.controlActive, (v) => {
       </div>
     </div>
 
-    <!-- 运行日志 -->
-    <div class="card">
-      <h3><Icon name="terminal" :size="15" /> 运行日志
-        <span class="h3-sub">{{ exec.log.length }} 条</span>
-      </h3>
-      <div class="run-log" ref="logEl" @scroll="onLogScroll">
-        <div v-for="(l, i) in exec.log" :key="i" class="rl" :class="l.level">
-          <span class="rl-t">{{ l.t }}</span>
-          <span>{{ l.text }}</span>
-        </div>
-        <p v-if="!exec.log.length" class="small">暂无日志。运行程序或执行文件后在这里留痕。</p>
-      </div>
-      <div class="btns" style="margin-top:8px">
-        <button :disabled="!exec.log.length" @click="exec.clearLog()">
-          <Icon name="trash" :size="13" /> 清空日志
-        </button>
-      </div>
-    </div>
+    <!-- ★ 需求：运行日志已从右侧栏移到 3D 视口左下角（MonitorLayout 的浮动日志面板），
+         这里不再重复渲染，避免"同一份日志出现两处"。 -->
   </MonitorLayout>
 </template>
 

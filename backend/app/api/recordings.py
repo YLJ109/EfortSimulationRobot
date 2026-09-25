@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
+from app.api.auth import require_control   # ★ P1-B3：写接口鉴权
 from app.db.crud import (
     create_recording,
     delete_recording,
@@ -45,7 +46,9 @@ class RecordingIn(BaseModel):
     description: str = Field(default="", max_length=512)
     source: str = Field(default="sim")
     duration_ms: int = Field(default=0, ge=0)
-    frames: List[Frame] = Field(default_factory=list)
+    # ★ P1-B3/P1-B7：帧数组上限（配合 8MB body limit 双保险）。
+    #   60s@100Hz = 6000 帧，20 万帧已远超正常录制，够用且不会被打爆内存。
+    frames: List[Frame] = Field(default_factory=list, max_length=200_000)
 
 
 class RecordingUpdate(BaseModel):
@@ -53,7 +56,7 @@ class RecordingUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=128)
     description: Optional[str] = Field(default=None, max_length=512)
     duration_ms: Optional[int] = Field(default=None, ge=0)
-    frames: Optional[List[Frame]] = None
+    frames: Optional[List[Frame]] = Field(default=None, max_length=200_000)
 
 
 class ImportIn(BaseModel):
@@ -63,7 +66,7 @@ class ImportIn(BaseModel):
     description: str = Field(default="", max_length=512)
     source: str = Field(default="sim")
     duration_ms: Optional[int] = None
-    frames: List[Frame] = Field(default_factory=list)
+    frames: List[Frame] = Field(default_factory=list, max_length=200_000)  # ★ P1-B3
 
 
 def _summary(row) -> dict:
@@ -95,7 +98,9 @@ def _detail(row) -> dict:
 
 # ---------- 导入 (放在 /{rid} 之前, 避免路径歧义) ----------
 @router.post("/import")
-def api_import_recording(body: ImportIn, db: Session = Depends(get_db)):
+def api_import_recording(body: ImportIn, db: Session = Depends(get_db),
+                         tok: str = Depends(require_control)):
+    """★ P1-B3：导入会写库，原来无鉴权（匿名可灌数据）。"""
     frames_json = json.dumps([f.model_dump() for f in body.frames], ensure_ascii=False)
     dur = body.duration_ms
     if dur is None or dur <= 0:
@@ -112,7 +117,9 @@ def api_list_recordings(db: Session = Depends(get_db)):
 
 
 @router.post("")
-def api_create_recording(body: RecordingIn, db: Session = Depends(get_db)):
+def api_create_recording(body: RecordingIn, db: Session = Depends(get_db),
+                         tok: str = Depends(require_control)):
+    """★ P1-B3：写库接口原来无鉴权。"""
     frames_json = json.dumps([f.model_dump() for f in body.frames], ensure_ascii=False)
     row = create_recording(db, body.name, frames_json, body.duration_ms,
                            body.description, _norm_source(body.source))
@@ -153,7 +160,10 @@ def api_get_recording(rid: int, db: Session = Depends(get_db)):
 
 
 @router.put("/{rid}")
-def api_update_recording(rid: int, body: RecordingUpdate, db: Session = Depends(get_db)):
+def api_update_recording(rid: int, body: RecordingUpdate,
+                         db: Session = Depends(get_db),
+                         tok: str = Depends(require_control)):
+    """★ P1-B3：写库接口原来无鉴权。"""
     frames_json = None
     if body.frames is not None:
         frames_json = json.dumps([f.model_dump() for f in body.frames], ensure_ascii=False)
@@ -165,7 +175,9 @@ def api_update_recording(rid: int, body: RecordingUpdate, db: Session = Depends(
 
 
 @router.delete("/{rid}")
-def api_delete_recording(rid: int, db: Session = Depends(get_db)):
+def api_delete_recording(rid: int, db: Session = Depends(get_db),
+                         tok: str = Depends(require_control)):
+    """★ P1-B3：删除接口原来无鉴权（同文件其它接口用令牌，这里漏了）。"""
     if not delete_recording(db, rid):
         raise HTTPException(404, "录制不存在")
     return {"ok": True, "id": rid}

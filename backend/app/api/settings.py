@@ -327,7 +327,9 @@ def api_test(body: TestIn, tok: str = Depends(require_control)):
             return {"ok": False, "target": tgt, "error": "端口不是数字"}
         if not host:
             return {"ok": False, "target": tgt, "error": "未配置控制器地址"}
-        ok, err = _tcp_probe(host, port, timeout=1.2)
+        # ★ P1-B8：「测试连接」是用户主动触发，必须绕过 3s 缓存 ——
+        #   否则改完地址点测试，拿到的还是 3 秒前旧地址的结论（"改了没生效"）。
+        ok, err = _tcp_probe(host, port, timeout=1.2, use_cache=False)
         # 网口通 ≠ Modbus 通：顺带把当前采集器状态一并回传，避免"ping 通了就以为好了"
         return {
             "ok": bool(ok), "target": tgt, "host": host, "port": port,
@@ -347,7 +349,7 @@ def api_test(body: TestIn, tok: str = Depends(require_control)):
         if host and port:
             base = "http://%s:%d" % (host, int(port))
         t0 = time.time()
-        code, data, err = camera_client.get_json("/status", timeout=2.0, base=base)
+        code, data, err = camera_client.get_json("/status", timeout=5.0, base=base)
         ms = int((time.time() - t0) * 1000)
         if code != 200 or not isinstance(data, dict):
             return {"ok": False, "target": tgt, "base": base, "ms": ms, "level": "err",
@@ -449,7 +451,8 @@ def api_password(body: PasswordIn, request: Request, tok: str = Depends(require_
     校验顺序很重要：**先验当前口令**，验过了才写。反过来的话，一个被临时授权的人
     可以靠"改口令"把自己永久留下 —— 这是越权，不是改名。
     """
-    cfg = get_config()
+    # ★ 审计修复 P1-E13：这里原本有一句 `cfg = get_config()` —— 赋了值却从没用过
+    #   （口令走的是 env 直读，不经过 config）。留着会让人误以为配置表参与了口令校验。
     role = str(body.role or ROLE_ADMIN).strip().lower()
     if role not in (ROLE_ADMIN, ROLE_OPERATOR):
         raise HTTPException(400, detail="角色只能是 admin / operator")

@@ -75,11 +75,11 @@ export function buildRobot(dh, mounting = "floor") {
 
   const J = dh.joints;
   const d1 = Math.abs(J[0]?.d || 376) / SCALE;   // 基座到 J2 轴高
-  const a1 = Math.abs(J[0]?.a || 49.6) / SCALE;  // 肩偏距
   const a2 = Math.abs(J[1]?.a || 330) / SCALE;   // 大臂
   const a3 = Math.abs(J[2]?.a || 40) / SCALE;    // 肘偏距
-  const d4 = Math.abs(J[3]?.d || 329) / SCALE;   // 小臂
-  const d6 = Math.abs(J[5]?.d || 80) / SCALE;    // 腕长
+  // ★ P1-E13：a1（肩偏距）/ d4（小臂）/ d6（腕长）这三个 DH 尺寸本文件从没用到 ——
+  //   造型一律在下面的关节循环里直接读 j.a / j.d。留着会让人以为"它们参与了建模"。
+  //   需要这几个值时读 DH 表本身：J[0].a / J[3].d / J[5].d（单位 mm，除以 SCALE）。
 
   // ===================== 固定底座 (不随 J1 旋转) =====================
   const Rbase = 0.175; // 官方安装半径 R175
@@ -108,6 +108,10 @@ export function buildRobot(dh, mounting = "floor") {
   const joints = [];
   let parent = root;
   let tcpDot = null;
+  // ★ J6 法兰坐标系：末端工具（吸盘/夹爪）的挂载点。位置由 DH 的 d6 算出，
+  //   与官方模型那条链上的 tcpNode 语义一致 —— 供**残影**挂同一份末端工具用，
+  //   避免在外部硬编码 z 偏移（硬编码会把工具埋进腕部筒身里，看不见）。
+  let flangeNode = null;
 
   for (let i = 0; i < J.length; i++) {
     const j = J[i];
@@ -119,7 +123,8 @@ export function buildRobot(dh, mounting = "floor") {
     const rx = new THREE.Group(); rx.rotation.x = deg2rad(j.alpha); ax.add(rx);
 
     const d = Math.abs(j.d) / SCALE;
-    const a = Math.abs(j.a) / SCALE;
+    // ★ P1-E13：此处原有的 `const a = Math.abs(j.a) / SCALE` 从未被使用（j.a 已在
+    //   上面的 ax 组里用过），删掉以免被当成"下面的造型用了它"。
 
     // -------- J1: 旋转转塔 (位于立柱顶端) --------
     if (i === 0) {
@@ -189,8 +194,16 @@ export function buildRobot(dh, mounting = "floor") {
       );
       tcpDot.position.z = 0.045 + Math.max(d, 0.02);
       jg.add(tcpDot);
+      // 法兰外表面（法兰圆柱长 0.02、中心在 0.02+max(d,0.02) → 前表面再 +0.01）
+      flangeNode = new THREE.Group();
+      flangeNode.name = "Flange";
+      flangeNode.position.z = 0.02 + Math.max(d, 0.02) + 0.01;
+      jg.add(flangeNode);
       joints.push(jg); parent = rx; continue;
     }
+
+    joints.push(jg);
+    parent = rx;
 
     joints.push(jg);
     parent = rx;
@@ -216,5 +229,5 @@ export function buildRobot(dh, mounting = "floor") {
   //   地面碰撞检测会误判成"穿地(碰撞红闪)"。
   applyJoints(new Array(joints.length).fill(0));
 
-  return { root, applyJoints, getTcp, joints };
+  return { root, applyJoints, getTcp, joints, flangeNode };
 }

@@ -563,7 +563,9 @@ onMounted(() => {
 
 <style scoped>
 .about { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 14px;
-  display: flex; flex-direction: column; gap: 14px; }
+  display: flex; flex-direction: column; gap: 14px; align-items: center; }
+/* ★ 需求：关于页内容宽度 1200px 并水平居中 */
+.about > * { width: 100%; max-width: 1200px; }
 
 /* ---- 品牌抬头 ---- */
 .ab-hero { display: flex; align-items: center; gap: 14px; padding: 16px;

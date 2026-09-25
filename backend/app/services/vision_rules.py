@@ -23,10 +23,18 @@ import numpy as np
 
 from app.core.config import get_config, project_root
 from app.core.logger import get_logger
+# ★ 全维度审查：速度常量与点位解析的唯一实现
+from app.core.safety_const import clamp_speed
+from app.utils.joints import parse_joints
 from app.db.crud import get_point, get_program, list_programs
 from app.db.database import SessionLocal
 from app.services.kinematics import fk_matrix, ikine, rpy_to_matrix, tcp_of
-from app.services.motion import motion
+# ★ 审计修复 P1-E1：限位读取与判定的唯一实现在 services/limits.py。
+#   原实现的兜底限位是 ±360（其它三处都是 ±180），且 `_in_limits` 按 range(6)
+#   硬索引、不查长度也不查 NaN —— 自动执行这条路上的校验曾经是四份里最松的。
+from app.services.limits import in_limits, load_limits
+from app.services.motion import motion, real_write_enabled
+from app.services.runmode import runmode
 from app.services.safety_guard import check as guard_check
 
 log = get_logger("vision_rules")
@@ -110,19 +118,17 @@ def auto_execute_enabled() -> bool:
 
 
 def _limits() -> List[dict]:
-    lim = get_config().get("joint_limits", default=[]) or []
-    out = []
-    for i, it in enumerate(lim[:6]):
-        out.append({"name": it.get("name", "J%d" % (i + 1)),
-                    "min": float(it.get("min", -360)), "max": float(it.get("max", 360))})
-    while len(out) < 6:
-        out.append({"name": "J%d" % (len(out) + 1), "min": -360.0, "max": 360.0})
-    return out
+    # ★ 审计修复 P1-E1：统一由 limits.load_limits() 给出（长度恒 6、缺项补默认）。
+    #   原实现的兜底是 ±360、并且用 `.get("min", -360)` 给"缺字段"填了个
+    #   比另外三处宽一倍的值 —— 同一份配置在自动执行和手动控制下会得出不同限位。
+    return load_limits()
 
 
 def _in_limits(q: List[float], limits: List[dict]) -> bool:
-    return all(float(limits[i]["min"]) <= float(q[i]) <= float(limits[i]["max"])
-               for i in range(6))
+    # ★ 审计修复 P1-E1：判据（长度 → 有限性 → 区间）统一在 limits.in_limits()。
+    #   原实现是 `0 <= i < 6` 硬索引：q 不足 6 个直接 IndexError（500），
+    #   而 NaN 会一路判成"在限内"，正好是自动执行最不该放行的那种输入。
+    return in_limits(q, limits)
 
 
 def _steps_from_items(items, db) -> List[dict]:
@@ -142,9 +148,10 @@ def _steps_from_items(items, db) -> List[dict]:
                 out.append({"index": idx, "ok": False, "error": "点位 #%s 不存在" % pid})
                 continue
             try:
-                joints = [float(x) for x in json.loads(row.joints or "[0,0,0,0,0,0]")]
-            except Exception:
-                joints = [0.0] * 6
+                joints = parse_joints(row.joints, where=f"点位「{row.name}」")
+            except ValueError as e:
+                out.append({"index": idx, "ok": False, "error": str(e)})
+                continue
             st = {"index": idx, "name": row.name, "mode": "joint", "joints": joints,
                   "speed_pct": sp, "dwell_ms": dw}
             if row.kind == "cartesian":
@@ -216,7 +223,9 @@ def execute_rule(rule: dict, *, color: str = "", seq: int = 0,
             return res
 
         limits = _limits()
-        speed_pct = int(rule.get("speed_pct") or 100)
+        # ★ 全维度审查 B-05：原缺省 100% —— 视觉链路是"相机事件无人值守触发"，
+        #   缺省跑满速是极其危险的默认值。改为安全下限。
+        speed_pct = clamp_speed(rule.get("speed_pct"))
         run: List[dict] = []
         ok_all = True
         for st in steps:
@@ -234,7 +243,7 @@ def execute_rule(rule: dict, *, color: str = "", seq: int = 0,
                 ok_all = False
                 break
 
-            sp = int(st.get("speed_pct") or speed_pct)
+            sp = clamp_speed(st.get("speed_pct") or speed_pct)
             dw = int(st.get("dwell_ms") or 0)
             target = st.get("joints")
             if target is None:
@@ -258,7 +267,20 @@ def execute_rule(rule: dict, *, color: str = "", seq: int = 0,
                     break
                 target = r["joints"]
 
-            rr = motion.command([float(x) for x in target], sp, dw)
+            # ★ 全维度审查 B-05：补档位检查。原链路完全不查档位，
+            #   T1/T2 下照样写寄存器（"写成功但不动"），运维难以察觉。
+            if real_write_enabled():
+                mok, mwhy, _mst = runmode.check_jog()
+                if not mok:
+                    run.append({"index": st["index"], "ok": False, "blocked": True,
+                                "reason": mwhy})
+                    res["outcome"] = "blocked"
+                    res["note"] = "档位不允许下发：" + mwhy
+                    ok_all = False
+                    break
+            # ★ 运行中关闭 auto_execute 开关也能立即停，不必等这一发走完
+            rr = motion.command([float(x) for x in target], sp, dw,
+                                abort_check=lambda: not auto_execute_enabled())
             run.append({"index": st["index"], "name": st.get("name"),
                         "ok": bool(rr.get("ok")), "mode": rr.get("mode"),
                         "target": [round(float(v), 2) for v in target],

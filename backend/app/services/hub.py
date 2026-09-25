@@ -5,46 +5,70 @@ WebSocket 广播中枢 (线程安全)。
 采集线程 (Collector) 在任意线程调用 broadcast(), 经事件循环安全推送到所有客户端。
 P1-2 背压: 每客户端只保留"最新一帧"; 客户端发送未完成时, 新帧覆盖旧帧(丢弃积压),
           避免慢客户端导致 asyncio task 无限堆积(延迟/内存上涨)。
+
+★ 审计修复 P1-B6：**姿态流与事件流分流**。
+  原实现所有客户端共用一个集合，`type="event"` 的审计帧（含 actor/ip/登录结果）
+  会原样推给匿名连上 `/ws/pose` 的任何浏览器 —— 浏览器 WS 不受 CORS 保护，
+  服务端不校验就等于把审计日志广播出去。现在按客户端登记的 kind 过滤：
+  pose 客户端只收姿态/rc_status，events 客户端只收事件帧。
 """
 from __future__ import annotations
 
 import asyncio
 import json
+from typing import Dict, FrozenSet, Optional
 
 from app.core.logger import get_logger
 
 log = get_logger("hub")
 
+# 每条帧归属哪条流：type 缺省按"非事件即姿态"归类，兜住旧调用点。
+_EVENT_TYPES: FrozenSet[str] = frozenset({"event"})
+_KIND_POSE = "pose"
+_KIND_EVENTS = "events"
+
+
+def _kind_of(payload: dict) -> str:
+    return _KIND_EVENTS if payload.get("type") in _EVENT_TYPES else _KIND_POSE
+
 
 class _Client:
-    __slots__ = ("ws", "loop", "latest", "sending")
+    __slots__ = ("ws", "loop", "latest", "sending", "kinds")
 
-    def __init__(self, ws, loop) -> None:
+    def __init__(self, ws, loop, kinds: FrozenSet[str]) -> None:
         self.ws = ws
         self.loop = loop
         self.latest = None       # 待发的最新帧(字符串), None 表示无积压
         self.sending = False     # 是否已有 drain 任务在跑
+        self.kinds = kinds       # ★ P1-B6：本客户端订阅的流
 
 
 class WsHub:
     def __init__(self) -> None:
-        self._clients: dict = {}      # ws -> _Client
+        self._clients: Dict[object, _Client] = {}      # ws -> _Client
 
-    def register(self, ws, loop) -> None:
-        self._clients[ws] = _Client(ws, loop)
+    def register(self, ws, loop, kind: str = _KIND_POSE) -> None:
+        self._clients[ws] = _Client(ws, loop, frozenset({kind}))
 
     def unregister(self, ws) -> None:
         self._clients.pop(ws, None)
 
-    def count(self) -> int:
-        return len(self._clients)
+    def count(self, kind: Optional[str] = None) -> int:
+        """在线数。默认统计**全部**（/api/health 的 ws_clients 用的是这个口径），
+        传 kind 则只统计订阅了该流的连接（连接上限判定用）。"""
+        if kind is None:
+            return len(self._clients)
+        return sum(1 for c in self._clients.values() if kind in c.kinds)
 
     def broadcast(self, payload: dict) -> None:
         if not self._clients:
             return
+        kind = _kind_of(payload)
         data = json.dumps(payload, ensure_ascii=False)
         for c in list(self._clients.values()):
-            c.latest = data          # 覆盖旧帧 —— 只保留最新
+            if kind not in c.kinds:      # ★ P1-B6：不订阅这条流的客户端直接跳过
+                continue
+            c.latest = data              # 覆盖旧帧 —— 只保留最新
             if c.sending:
                 continue
             c.sending = True

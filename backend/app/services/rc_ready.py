@@ -24,9 +24,13 @@ from typing import Any, Callable, Dict, List, Optional
 from app.core.config import get_config
 from app.core.logger import get_logger
 from app.services.modbus import (
+    ADDR_RO_TRIG,
+    ADDR_SET_PROG,
     CMD_CLEAR,
     CMD_LOAD,
     CMD_RUN,
+    CMD_SERVO,
+    CMD_STOP,
     CMD_ZERO,
     SERVO_REENGAGE_DELAY,
     ModbusRobot,
@@ -35,6 +39,15 @@ from app.services.motion import real_write_enabled
 
 log = get_logger("rc_ready")
 
+# 报警码 → 现场处置提示（只覆盖已现场勘察确认的码，来源 config/robot.yaml:140 与
+# docs/控制器Modbus寄存器勘察报告.md）。未列出的码给通用提示，避免"猜错方向"。
+ALARM_HINTS: Dict[int, str] = {
+    1812: "安全门/安全回路不满足：检查安全门、光栅、外部急停是否复位",
+    5005: ("远程加载程序错误（程序不存在，或示教器停在文件管理/编辑界面）："
+           "先让示教器退出文件界面，确认程序号已保存后再试"),
+    4902: "XPL 文件损坏：重新导出/保存该程序",
+}
+
 
 def jog_service_program() -> int:
     """点动服务程序号（config motion.jog.service_program；0 = 未指定，不瞎猜）。"""
@@ -42,6 +55,39 @@ def jog_service_program() -> int:
         return int(get_config().get("motion", "jog", "service_program", default=0) or 0)
     except Exception:
         return 0
+
+
+def allowed_programs() -> List[int]:
+    """★ 全维度审查 B-01：就绪允许「加载并运行」的程序号白名单。
+
+    原实现 `ReadyIn.prog` 无任何约束 → 持 operator 令牌即可让控制器加载并
+    **运行任意程序号**（仓库里就有 411.XPL 这类产线/测试程序）。这不是点动
+    服务程序，误触发就是真实运动。
+
+    缺省只含点动服务程序；确需运行其它程序，由运维在
+    config/robot.yaml 的 motion.ready.allowed_programs 里显式追加。
+    """
+    s = set()
+    try:
+        p = int(jog_service_program())
+        if p > 0:
+            s.add(p)
+    except Exception:
+        pass
+    try:
+        extra = get_config().get("motion", "ready", "allowed_programs",
+                                 default=[]) or []
+        for x in extra:
+            try:
+                v = int(x)
+                if v > 0:
+                    s.add(v)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    s.discard(0)
+    return sorted(s) or ([200] if jog_service_program() <= 0 else [])
 
 
 class ReadinessService:
@@ -59,11 +105,25 @@ class ReadinessService:
 
     def ready(self, prog: Optional[int] = None,
               on_step: Optional[Callable[[str, str], None]] = None) -> Dict[str, Any]:
-        """执行就绪流程，返回 {ok, steps:[{step,ok,msg}], error, summary}。"""
+        """执行就绪流程，返回 {ok, steps:[{step,ok,msg}], error, summary}。
+
+        ★ 审计修复 P1-A11：就绪流程与下发序列必须共用**同一把**执行互斥。
+          原来只有自己的 _busy_lock（只在"就绪流程之间"互斥），于是
+          全清(0x0000)/加载/运行可以插进飞行中的点动序列 ——
+          触发位置着 1 的同时程序被重载，产生谁也说不清的半截状态。
+        """
         if not self._busy_lock.acquire(blocking=False):
             return {"ok": False, "error": "就绪流程正在执行中，请稍候", "steps": []}
         try:
-            return self._ready(prog, on_step)
+            from app.services.motion import motion   # 延迟导入避免环
+            if not motion._exec_lock.acquire(blocking=False):
+                return {"ok": False,
+                        "error": "有点动/下发正在执行，已推迟一键就绪（避免半截状态）",
+                        "steps": []}
+            try:
+                return self._ready(prog, on_step)
+            finally:
+                motion._exec_lock.release()
         finally:
             self._busy_lock.release()
 
@@ -89,6 +149,47 @@ class ReadinessService:
             return {"ok": False, "error": "真实下发未开启：总闸未打开，拒绝写控制器",
                     "steps": steps}
 
+        # 0.5) 程序号白名单：★ 必须在**任何 Modbus 操作之前**（含读快照）
+        #   理由（安全 + 副作用）：白名单外的程序号意味着这次调用本就不该发生，
+        #   连读都不必读；更关键的是后面的"清报警/上伺服/加载/运行"都是**写**操作，
+        #   把它们排在校验之前，等于"先动控制器、后判断该不该动"。
+        #   （回归 test_safety_redline::test_ready_rejects_unlisted_program 钉死此顺序。）
+        prog_no = int(prog if prog is not None else jog_service_program())
+        allowed = allowed_programs()
+        if prog_no not in allowed:
+            return {"ok": False,
+                    "error": ("程序号 %d 不在就绪白名单 %s 内，拒绝加载运行。"
+                              "如需放行，请在 config/robot.yaml 的 "
+                              "motion.ready.allowed_programs 中显式追加后重启"
+                              % (prog_no, allowed)),
+                    "allowed_programs": allowed, "steps": steps}
+        if prog_no <= 0:
+            self._step(steps, "prog", on_step, False, "未配置点动服务程序号")
+            return {"ok": False,
+                    "error": "未配置点动服务程序号（config motion.jog.service_program，现场=200/JOGSVC）",
+                    "steps": steps}
+
+        # 0.6) ★★ 撤触发位（写 40135.Bit0 = 0）—— 现场铁律："加载前只需清报警 + 撤触发"。
+        #   为什么必须放在这里：触发位为 1 时下面的守卫会拒绝就绪。若某次点动异常退出
+        #   把触发位留在 1，用户就**再也点不了「一键就绪」**（界面按钮被禁用 → 死锁，
+        #   现场报的"现在一键就绪点不了"就是这个）。撤触发只是"撤销执行意图"，
+        #   **不产生任何运动**，所以正确做法是先撤销、再刷新快照，而不是把按钮永久禁用。
+        _trig_before = None
+        try:
+            _snap0, _ = mb.rc_snapshot()
+            _trig_before = bool(_snap0.get("jog_trig")) if _snap0 else None
+        except Exception:
+            _trig_before = None
+        if _trig_before:
+            _ok_t, e_trig = mb.write_reg(ADDR_RO_TRIG, 0x0000)
+            self._step(steps, "trig_clear", on_step, e_trig is None,
+                       ("已撤销点动触发位（原为 1）" if e_trig is None
+                        else "撤销点动触发位失败: %s" % e_trig))
+            if e_trig is not None:
+                return {"ok": False,
+                        "error": "撤销点动触发位失败（40135 写 0）：%s。请检查控制器通讯后重试" % e_trig,
+                        "steps": steps}
+
         # 1) 快照：先看清楚控制器现在什么状态
         snap, err = mb.rc_snapshot()
         if snap is None:
@@ -101,9 +202,18 @@ class ReadinessService:
                       b["prog_loaded"], b["run"]))
 
         # 2) 前置守卫：触发位
-        if snap.get("jog_trig"):
-            self._step(steps, "guard", on_step, False, "点动触发位仍为 1")
-            return {"ok": False, "error": "点动触发位仍为 1（上一发未收尾），请先撤销触发再就绪",
+        #   ★ 审计修复 P1-A3：读不到触发位（jog_trig=None）必须**按"仍在触发"处理**。
+        #   原实现 `if snap.get("jog_trig"):` 把 None 当成 0，fail-open ——
+        #   "触发位为 1 绝不执行"这条铁律在通讯抖动的瞬间会自动失效，
+        #   而抖动恰恰是最容易出现半截点动状态的时候。
+        trig = snap.get("jog_trig")
+        if trig is not False:
+            self._step(steps, "guard", on_step, False,
+                       "点动触发位无法确认（读取失败）" if trig is None else "点动触发位仍为 1")
+            return {"ok": False,
+                    "error": ("无法读取点动触发位，拒绝就绪（fail-safe）：请检查控制器通讯"
+                              if trig is None else
+                              "点动触发位仍为 1（上一发未收尾），请先撤销触发再就绪"),
                     "steps": steps}
 
         # 3) 档位守卫：T1/T2 下控制器忽略上位机指令（实机确认）
@@ -123,7 +233,16 @@ class ReadinessService:
                        ("清报警失败（码 %s/%s 仍在）" % (snap["alarm1"], snap["alarm2"]))
                        if alarm_now else "报警已清（原码 %s/%s）" % (snap["alarm1"], snap["alarm2"]))
             if alarm_now:
-                return {"ok": False, "error": "清报警后仍处于报警状态（如 1812=安全门，请检查安全回路）",
+                a1 = (snap2 or {}).get("alarm1", "?")
+                a2 = (snap2 or {}).get("alarm2", "?")
+                try:
+                    code = int(a1)
+                except (TypeError, ValueError):
+                    code = 0
+                hint = ALARM_HINTS.get(code, "请按示教器报警信息排查，处理后重试")
+                return {"ok": False,
+                        "error": ("清报警后仍处于报警状态（当前码 %s/%s）。%s"
+                                  % (a1, a2, hint)),
                         "steps": steps}
             b = snap2["bits"] if snap2 else b
 
@@ -134,7 +253,7 @@ class ReadinessService:
             except Exception:
                 pass
             time.sleep(SERVO_REENGAGE_DELAY)
-            _, serr = mb.rc_command(0x1001)
+            _, serr = mb.rc_command(CMD_SERVO)
             if serr:
                 self._step(steps, "servo", on_step, False, "上电命令失败: %s" % serr)
                 return {"ok": False, "error": "伺服上电失败: %s" % serr, "steps": steps}
@@ -156,16 +275,11 @@ class ReadinessService:
             self._step(steps, "servo", on_step, True, "伺服已在上电状态")
 
         # 6) 加载点动服务程序
-        prog_no = int(prog if prog is not None else jog_service_program())
-        if prog_no <= 0:
-            self._step(steps, "prog", on_step, False, "未配置点动服务程序号")
-            return {"ok": False,
-                    "error": "未配置点动服务程序号（config motion.jog.service_program，现场=200/JOGSVC）",
-                    "steps": steps}
+        #   ★ prog_no / 白名单已在上面的"0.5) 程序号白名单"里校验并绑定，这里直接用。
         if b["prog_loaded"] and snap["prog"] == prog_no:
             self._step(steps, "prog", on_step, True, "程序 %d 已在加载态（跳过）" % prog_no)
         else:
-            _, e1 = mb.write_reg(103, prog_no)    # 目标程序号
+            _, e1 = mb.write_reg(ADDR_SET_PROG, prog_no)    # 40104 目标程序号
             if e1:
                 return {"ok": False, "error": "写目标程序号失败: %s" % e1, "steps": steps}
             _, e2 = mb.rc_command(CMD_LOAD)       # 0x1011 加载
@@ -221,3 +335,90 @@ class ReadinessService:
                    "一键就绪完成：程序 %d 已挂起于 WAIT" % prog_no,
                    {"steps": steps, "summary": summary})
         return {"ok": True, "steps": steps, "summary": summary}
+
+
+    # ------------------------------------------------------------------
+    def cancel(self, servo_off: bool = False) -> Dict[str, Any]:
+        """取消就绪：停止运行中的程序，可选关闭伺服。
+
+        ★ 与 ready() **共用同一对互斥**（P1-A11 同款理由）：本函数要写
+          CMD_STOP / CMD_ZERO，若不拿 _exec_lock 就能插进飞行中的点动/下发序列，
+          会复现"触发位置 1 的同时指令字被改写"那类谁也说不清的半截状态。
+          _busy_lock 则保证两个"取消就绪"不会并发写同一指令字。
+        :param servo_off: 是否顺带伺服下电（默认 False —— 停程序 ≠ 断伺服）
+        """
+        if not self._busy_lock.acquire(blocking=False):
+            return {"ok": False, "error": "就绪/取消流程正在执行中，请稍候", "steps": []}
+        try:
+            from app.services.motion import motion
+            if not motion._exec_lock.acquire(blocking=False):
+                return {"ok": False,
+                        "error": "有点动/下发正在执行，已推迟取消就绪（避免半截状态）",
+                        "steps": []}
+            try:
+                return self._cancel(servo_off)
+            finally:
+                motion._exec_lock.release()
+        finally:
+            self._busy_lock.release()
+
+    # ------------------------------------------------------------------
+    def _cancel(self, servo_off: bool) -> Dict[str, Any]:
+        if not real_write_enabled():
+            return {"ok": False, "error": "真实下发未开启：总闸未打开，拒绝写控制器",
+                    "steps": []}
+
+        steps: List[dict] = []
+        mb = self._client()
+
+        def _step(name: str, ok: bool, msg: str) -> None:
+            self._step(steps, name, None, ok, msg)
+
+        # 1) 读快照
+        snap, err = mb.rc_snapshot()
+        if snap is None:
+            _step("snapshot", False, "读快照失败: %s" % err)
+            return {"ok": False, "error": "无法读取控制器状态: %s" % err, "steps": steps}
+
+        # 1.5) ★ 撤触发位：取消就绪应把控制器留在"干净"状态（不残留执行意图）。
+        #   与 _ready 的同类步骤一致：写 0 只是撤销意图，不产生运动。
+        if snap.get("jog_trig"):
+            _, e_trig = mb.write_reg(ADDR_RO_TRIG, 0x0000)
+            _step("trig_clear", e_trig is None,
+                  "已撤销点动触发位" if e_trig is None else "撤销触发位失败: %s" % e_trig)
+
+        # 2) 停止程序 (CMD_STOP = 0x1005，与 /control/estop 停止沿同一条通道)
+        _, serr = mb.rc_command(CMD_STOP)
+        if serr:
+            _step("stop", False, "停止命令失败: %s" % serr)
+            return {"ok": False, "error": "停止程序失败: %s" % serr, "steps": steps}
+        time.sleep(0.3)
+        snap2, err2 = mb.rc_snapshot()
+        if snap2 is None:
+            # 命令已写进去了，只是回读不到 —— 不能谎报成功，也不武断判失败：
+            #   交给下一次 rc_status 轮询确认（前端就绪卡 4s 后自己会变）。
+            _step("stop", True, "停止命令已下发（回读失败: %s）" % err2)
+        else:
+            running = bool(snap2["bits"]["run"])
+            _step("stop", not running,
+                  "程序已停止" if not running else "运行位仍为 1（停止未生效）")
+            if running:
+                # ★ 步骤已经 ok=False，整体就不能再回 ok=True ——
+                #   否则前端拿到 ok:true 却显示步骤红叉，用户无从判断该不该重试。
+                return {"ok": False,
+                        "error": "停止命令已下发但运行位仍为 1，请检查控制器档位/程序状态",
+                        "steps": steps}
+
+        # 3) 可选：伺服下电（CMD_ZERO=0x0000 清指令字 → Bit0/Bit12 复位即掉电。
+        #    与 _ready() 第 5 步"全清→重上电"是同一条已实测的通道；
+        #    库里的 CMD_DISABLE=0x2000 全无调用方、语义未经实机确认，不用它。）
+        if servo_off:
+            _, serr2 = mb.rc_command(CMD_ZERO)
+            if serr2:
+                _step("servo_off", False, "伺服下电失败: %s" % serr2)
+                return {"ok": False, "error": "伺服下电失败: %s" % serr2, "steps": steps}
+            _step("servo_off", True,
+                  "伺服已下电（吸合延迟实测 ≈0.55s，约 1s 后状态位才落）")
+
+        return {"ok": True, "steps": steps}
+

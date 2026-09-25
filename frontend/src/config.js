@@ -4,6 +4,13 @@ export function wsUrl() {
   return `${proto}://${location.host}/ws/pose`;
 }
 
+// ★ P1-B6：审计事件流是**独立**通道，需持控制令牌。
+//   令牌不放查询串（会进后端访问日志），改为连接后首条消息带内鉴权。
+export function wsEventsUrl() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${location.host}/ws/events`;
+}
+
 export function apiUrl(path) {
   return `${location.origin}/api${path}`;
 }

@@ -188,11 +188,14 @@ for (const [label, p] of Object.entries(ALL_VIEWS)) {
 
 // ---------- G. 只读守卫 ----------
 console.log("\n[G] 只读守卫：卡片里不许出现任何「改机器人」的写操作");
+// ★ 判据更新（审计 P1-B2）：/reconnect 后端已补 require_control，卡片必须改走
+//   带令牌的 apiControl()，否则按钮会静默 401。所以 apiControl 不能再一概算
+//   违规 —— 真正要防的是「改姿态/点动/执行」这一类调用。
 const FORBIDDEN = ["applyRobotPose", "setSimQ", "solveTcp", "execPoint", "execProgram",
-                   "jogPress", "jogStart", "applyTeach", "apiControl"];
+                   "jogPress", "jogStart", "applyTeach"];
 const hits = FORBIDDEN.filter((f) => cardJs.includes(f) || cardTpl.includes(f));
 ok("没有姿态/点动/执行类写操作", hits.length === 0, "发现：" + hits.join(", "));
-const urls = [...cardJs.matchAll(/apiUrl\(\s*["']([^"']+)["']/g)].map((m) => m[1]);
+const urls = [...cardJs.matchAll(/(?:apiUrl|apiControl)\(\s*["']([^"']+)["']/g)].map((m) => m[1]);
 ok("卡片里只有一个后端写请求，且就是 /reconnect", urls.length === 1 && urls[0] === "/reconnect",
   "找到：" + JSON.stringify(urls));
 ok("重连按钮仅在 reconnect prop 为真时渲染", /v-if="reconnect"/.test(cardTpl));

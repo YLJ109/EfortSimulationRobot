@@ -17,11 +17,14 @@ EFORT 视觉检测服务 — 海康机器人 GigE 工业相机 + YOLO 目标检�
     POST /unload          卸载 YOLO 模型释放内存 (torch 加载后常驻, 可达数 GB)
 
 颜色分拣 (纯 OpenCV, 不依赖 torch; 算法在 camera/vision_color.py):
-    GET  /vision/status         颜色线程状态 + 色卡 + 标定概览
-    GET  /vision/last?since=N   最近一次触发(带序号, 前端轮询去重)
+    GET  /vision/status         颜色线程状态 + 色卡 + 标定概览 + 生效阈值(thr)
+    GET  /vision/last?since=N   最近一次触发(前端/后端轮询去重)
+                                 ★ P0-cam-1: 返回的 seq 恒等于已发布事件的 event.seq，
+                                   没有已发布事件时为 0 —— 消费方只能按 event 推进游标。
     GET  /vision/records?limit= 历史记录列表(含缩略图路径)
     POST /vision/records/clear  清空记录
-    POST /vision/config         {enabled,roi,use_mog2,min_interval,save_on_detect}
+    POST /vision/config         {enabled,roi,use_mog2,min_interval,save_on_detect,
+                                 min_conf,debug,thr}   thr=检测阈值部分覆盖(P0-cam-3)
     POST /vision/background     把当前画面设为静态背景 (reset=true 清除)
     POST /vision/calibrate/gray {target} 中心灰卡一键白平衡
     POST /vision/calibrate/sample {name} 用最近一次判定结果标定该色(现场实物标定)
@@ -334,11 +337,20 @@ class CameraService:
         self._det_thread = None
         self._enc_thread = None
         self.opencv_idx = None           # 当前持有/正在打开的 USB 摄像头索引
+        # ★ 记住"上一次成功打开的设备"，供 /open、/reconnect 复用：
+        #   USB 相机用完关闭后再次点开，若仍按默认走 MVS 枚举，就会枚举不到海康网口相机
+        #   而弹出"未找到相机(检查网线/网卡 192.168.1.x)" —— 这是误报（USB 相机根本不走网线）。
+        #   记住后，重开就是"原设备原路重开"，USB 走 USB、MVS 走 MVS，两条路彻底分开。
+        self.last_open = None            # {"idx": int|None, "cam_type": "mvs"|"opencv"}
         self._enum_lock = threading.Lock()  # USB 探测串行化(探测=独占打开, 并发会互相打架)
 
         # ---------- 颜色分拣 (纯 OpenCV, 与 YOLO 互不影响) ----------
-        self.color_enabled = False
+        # ★ 需求：**检测默认开启**（以前默认关，现场每次都要手动打开）。
+        #   打开相机时再按"是否彩色相机"校正：灰度相机没有颜色信息，会被关掉并提示。
+        self.color_enabled = True
         self.color_engine = None        # vision_color.VisionEngine(配置变更时重建)
+        # ★ 实时链路只用颜色阈值做前景（对齐 visual_object_detector.py）：见 _ensure_engine
+        self.color_only = True
         self.color_calib = vc.load_calib(CALIB_PATH) if _VC_OK else {}
         self.background = None          # 静态背景 BGR(设了就优先于 MOG2)
         self.use_mog2 = True
@@ -346,6 +358,9 @@ class CameraService:
         self.color_min_interval = 0.8   # 同色重复触发节流(秒)
         self.save_on_detect = True      # 触发时是否落盘三件套
         self.color_conf = 0.28          # 三色置信度阈值: conf<此值的目标不画框/不记录
+        # ★ 审计修复 P0-cam-3: 检测阈值表(面积/短边/HSV/色相)，可由
+        #   POST /vision/config {"thr": {...}} 覆盖子集；默认 = vision_color.DEFAULT_THR。
+        self.vision_thr = (dict(vc.DEFAULT_THR) if _VC_OK else {})
         self.color_capable = False      # 当前相机是否彩色(灰度相机无法做颜色识别)
         self.vision_debug = False       # 诊断开关: 逐帧打印 mask 连通域(默认关)
         self.latest_color = []          # 当前帧颜色候选(与 latest_frame 同尺寸)
@@ -382,6 +397,16 @@ class CameraService:
                 "det_count": self.det_count,
                 "det_ms": round(self.det_ms * 1000, 1),
                 "clients": self.stream_clients,
+                # ★ 诊断用：三个工作线程是否存活。现场"检测不工作/画面不动"时，
+                #   看一眼这里就能区分是"抓帧挂了 / 编码挂了 / 颜色线程挂了"。
+                "threads": {
+                    "grab": bool(self._grab_thread and self._grab_thread.is_alive()),
+                    "encode": bool(self._enc_thread and self._enc_thread.is_alive()),
+                    "color": bool(self._color_thread and self._color_thread.is_alive()),
+                },
+                # 审计修复 P0-ui-4：连续疑似全黑帧计数（超过 MAX_BAD_STREAK=12 表示
+                # 画面持续全黑 —— 此时服务端保持最后一帧有效帧、不再透传真黑帧）
+                "black_streak": self._black_streak,
                 "models": self.list_models(),
                 "port": PORT,
                 "vision": self.vision_status_locked(),
@@ -396,14 +421,22 @@ class CameraService:
             "error": "",
             "enabled": self.color_enabled,
             "engine": self.color_engine is not None,
-            "seg": ("静态背景" if self.background is not None
-                    else ("MOG2" if self.use_mog2 else "Otsu")),
+            # ★ 诊断：颜色检测线程是否存活（开着却死了 = 检测"不工作"）
+            "thread_alive": bool(self._color_thread and self._color_thread.is_alive()),
+            "mode": "color_only" if self.color_only else "segmentation",
+            # ★ 实时链路口径改为"只用颜色阈值"（参考实现），这里如实上报，
+            #   避免界面还写着 MOG2/静态背景、与实际用的判据不符。
+            "seg": "颜色阈值(仅HSV)" if self.color_only else (
+                "静态背景" if self.background is not None
+                else ("MOG2" if self.use_mog2 else "Otsu")),
             "roi": list(self.roi) if self.roi else None,
             "count": self.color_count,
             "seq": self.color_seq,
             "ms": round(self.color_ms * 1000, 1),
             "min_interval": self.color_min_interval,
             "min_conf": self.color_conf,
+            # ★ 审计修复 P0-cam-3: 阈值回显，前端/运维可据此核对现场生效值
+            "thr": dict(self.vision_thr),
             "color_capable": self.color_capable,
             "targets": list(vc.RGB_NAMES) if _VC_OK else [],
             "save": self.save_on_detect,
@@ -503,12 +536,30 @@ class CameraService:
         return self.open_async(idx=idx, cam_type=cam_type)
 
     # ---------- 相机 (异步) ----------
-    def open_async(self, idx=None, cam_type="mvs"):
+    def open_async(self, idx=None, cam_type=None):
+        """打开相机。cam_type=None 表示"自动"：复用上一次成功打开的设备类型/索引。
+
+        ★ 两路相机（海康 GigE / 普通 USB）打开逻辑完全分开：
+          - 指定 opencv → 只走 cv2.VideoCapture，绝不会报"检查网线"；
+          - 指定 mvs    → 只走 MVS 枚举，才可能报"检查网线/网卡"。
+          - 不指定      → 沿用 last_open（首次回落 mvs），从而"USB 关了再开还是 USB"。
+        """
         with self.lock:
-            if self.cam is not None:
+            # 如果相机已打开且运行正常，直接返回成功
+            if self.cam is not None and self.running and not self.opening and not self.closing:
                 return True, "已打开"
+            # 如果正在打开中，返回进行中状态（避免重复启动线程）
             if self.opening:
                 return True, "正在打开..."
+            # 如果正在关闭中，等待关闭完成后再打开
+            if self.closing:
+                return False, "正在关闭中，请稍候再试"
+            # ---- 解析"自动"目标：复用上次设备，避免 USB 相机被误走 MVS 网口逻辑 ----
+            if cam_type is None:
+                last = self.last_open or {}
+                cam_type = last.get("cam_type") or "mvs"
+                if idx is None:
+                    idx = last.get("idx")
             self.opening = True
             self.error = ""
             # ★ 同步占位: 响应返回前就登记, 让随后的 /devices 探测跳过这台相机
@@ -517,14 +568,24 @@ class CameraService:
         threading.Thread(target=self._do_open, args=(idx, cam_type), name="open", daemon=True).start()
         return True, "正在打开..."
 
-    def _do_open(self, idx=None, cam_type="mvs"):
+    def _do_open(self, idx=None, cam_type=None):
+        if cam_type is None:
+            last = self.last_open or {}
+            cam_type = last.get("cam_type") or "mvs"
+            if idx is None:
+                idx = last.get("idx")
         try:
             if cam_type == "opencv":
-                # 普通 USB 摄像头（OpenCV）
+                # 普通 USB 摄像头（OpenCV）—— 与 MVS/网线无关，失败信息不提网线
                 import cv2
                 cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
                 if not cap.isOpened():
-                    raise RuntimeError(f"无法打开 USB 摄像头 {idx}")
+                    # 极少数设备首次打开会失败（驱动/DShow 未就绪）：释放后重试一次
+                    cap.release()
+                    time.sleep(0.6)
+                    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    raise RuntimeError("无法打开 USB 摄像头 %s（请确认未被其它程序占用，或换 USB 口）" % idx)
                 # 设置分辨率（可选）
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -537,22 +598,30 @@ class CameraService:
                     self.error = ""
                     self.color_capable = True       # USB/彩色网口相机: 支持颜色识别
                     self.opened_at = time.time()
+                    self.last_open = {"idx": idx, "cam_type": "opencv"}
                 self._start_threads()
             else:
-                # 海康工业相机（MVS SDK）
+                # 海康工业相机（MVS SDK）—— 只有这一路才与网线/网卡有关
                 if not _SDK_OK:
                     raise RuntimeError("SDK 不可用: " + _SDK_ERR)
                 if not self.sdk_ready:
                     MvCamera.MV_CC_Initialize()
                     self.sdk_ready = True
+                # ★ 枚举偶发为空（网口刚上电/交换机未就绪）：重试 2 次再报"检查网线"
                 device_list, found = _enum_devices()
+                tries = 0
+                while not found and tries < 2:
+                    tries += 1
+                    time.sleep(0.8)
+                    device_list, found = _enum_devices()
                 if not found:
-                    raise RuntimeError("未找到相机(检查网线/网卡 192.168.1.x)")
+                    raise RuntimeError("未找到海康网口相机（请检查网线/网卡 192.168.1.x；"
+                                       "若用的是 USB 摄像头请在设备列表里选择 USB）")
                 # 如果指定了 idx，使用指定的设备；否则使用第一个
                 if idx is not None:
                     target = next((f for f in found if f[0] == idx), None)
                     if target is None:
-                        raise RuntimeError(f"指定的相机索引 {idx} 不存在")
+                        target = found[0]     # 指定索引已消失（换了口）→ 退回第一个可用
                 else:
                     target = found[0]
                 cam = _open_camera(device_list, target[0])
@@ -573,6 +642,7 @@ class CameraService:
                     self.running = True
                     self.error = ""
                     self.opened_at = time.time()
+                    self.last_open = {"idx": target[0], "cam_type": "mvs"}
                 self._start_threads()
         except Exception as e:
             with self.lock:
@@ -591,7 +661,11 @@ class CameraService:
         if self._enc_thread is None or not self._enc_thread.is_alive():
             self._enc_thread = threading.Thread(target=self._encode_loop, name="encode", daemon=True)
             self._enc_thread.start()
-        # 相机重新打开后, 若颜色分拣是开着的, 颜色线程也要跟着回来
+        # ★ 需求：颜色检测**默认开启** —— 相机一打开就把颜色线程拉起来（灰度相机会被关掉）。
+        #   灰度相机没有颜色信息，强开会每帧全判"未知"，所以这里按 color_capable 校正。
+        with self.lock:
+            if not self.color_capable:
+                self.color_enabled = False
         if self.color_enabled and _VC_OK:
             self._start_color_thread()
 
@@ -676,7 +750,9 @@ class CameraService:
 
     # ---------- 抓帧线程 ----------
     def _grab_loop(self):
-        MAX_BAD_STREAK = 12          # 连续疑似坏帧上限(~0.4s @30fps): 超过判真黑/断流, 透传
+        MAX_BAD_STREAK = 12          # 连续疑似坏帧上限(~0.4s @30fps): 超过判"持续全黑"
+                                     # 审计修复 P0-ui-4: 魔数语义保留(仍是非偶发坏帧的判据),
+                                     # 但超过后不再透传真黑帧, 改为保持最后一帧有效帧
         last = time.time()
         counter = 0
         n = 0
@@ -712,8 +788,13 @@ class CameraService:
             # ★ 坏帧平滑：工业相机/网络偶发会吐出一帧"整帧全黑或近乎单色"的坏帧，
             #   旧代码只过滤 frame is None/ret != 0，坏帧会被直接编码上屏 → "偶尔黑屏一下"。
             #   这里用下采样估算亮度均值/方差：<4 全黑 或 <3.5 近单色 → 判坏帧，
-            #   直接跳过、保持上一有效帧（画面不闪）；但连续坏帧超限说明真黑/断流，
-            #   则透传让前端看门狗感知，避免把"相机被完全遮挡"误当偶发而无限覆盖。
+            #   直接跳过、保持上一有效帧（画面不闪）。
+            # 审计修复 P0-ui-4：连续坏帧**超过** MAX_BAD_STREAK 时，原逻辑会掉下去把这帧
+            #   真黑帧写进 latest_frame 透传上屏 —— 前端看到的就是"黑屏闪一下"。
+            #   看门狗魔数语义原样保留（12 帧仍是"非偶发坏帧"的判据，计数继续往上走），
+            #   只是处置从"透传真黑帧"改为"保持最后一帧有效帧"：画面停在最后一帧好帧上，
+            #   /status 的 black_streak 照实上报持续全黑，由运维/前端判断真黑，
+            #   而不是拿黑帧去闪用户的眼睛。
             rs = rgb[::4, ::4]
             fmean = float(rs.mean())
             if fmean < 4.0 or float(rs.std()) < 3.5:
@@ -721,8 +802,12 @@ class CameraService:
                 if self._black_streak <= MAX_BAD_STREAK:
                     time.sleep(0.002)
                     continue
-            else:
-                self._black_streak = 0
+                if self._black_streak == MAX_BAD_STREAK + 1:
+                    print(f"[抓帧] 连续坏帧超过 {MAX_BAD_STREAK} 帧，判定画面持续全黑 → "
+                          f"保持最后一帧有效帧，不再透传真黑帧", flush=True)
+                time.sleep(0.002)
+                continue
+            self._black_streak = 0
             try:
                 img = Image.fromarray(rgb, "RGB")
                 if img.width > STREAM_MAX_W:      # 立即降分辨率, 后续都用小图
@@ -752,15 +837,37 @@ class CameraService:
     def _encode_loop(self):
         target_dt = 1.0 / STREAM_FPS
         n = 0
+        err_streak = 0
         while self.running:
             t0 = time.time()
-            with self.lock:
-                has_clients = self.stream_clients > 0
-            if has_clients:
-                jpg = self.render_jpeg()
-                if jpg is not None:
-                    with self.lock:
-                        self.latest_jpeg = jpg
+            try:
+                with self.lock:
+                    has_clients = self.stream_clients > 0
+                if has_clients:
+                    jpg = self.render_jpeg()
+                    if jpg is not None:
+                        with self.lock:
+                            self.latest_jpeg = jpg
+                err_streak = 0
+            except Exception as e:
+                # ★★ 关键健壮性修复：原实现这里**没有 try/except** —— 只要 render_jpeg 里
+                #    任何一次意外（画框坐标越界、PIL 版本差异、临时内存不足…）抛异常，
+                #    整个编码线程就直接死掉：/stream 再也不出新帧，画面冻在最后一帧，
+                #    现场表现就是"检测突然不工作了/画面不动了"。现在吞掉并限频打印，
+                #    线程永不退出，最多丢一帧。
+                err_streak += 1
+                if err_streak == 1 or err_streak % 50 == 0:
+                    self.error = "编码异常(已跳过该帧): %s" % str(e)[:120]
+                    print("[编码] 异常，跳过该帧(连续 %d): %r" % (err_streak, e), flush=True)
+                time.sleep(0.05)
+            # ★ 自愈看门狗：颜色检测开着、相机在跑，但颜色线程死了 → 自动拉起来。
+            #   （颜色线程一旦异常退出就不再恢复，表现同样是"检测不工作了"。）
+            if self.color_enabled and _VC_OK and self.running:
+                ct = self._color_thread
+                if ct is not None and not ct.is_alive():
+                    print("[颜色] 检测线程已退出，自动重启", flush=True)
+                    self._color_thread = None
+                    self._start_color_thread()
             dt = time.time() - t0
             time.sleep(max(0.005, target_dt - dt))
             n += 1
@@ -932,15 +1039,21 @@ class CameraService:
 
     def _ensure_engine(self):
         if self.color_engine is None:
+            # ★ 实时链路对齐参考实现（visual_object_detector.py）：**只用颜色阈值**做前景，
+            #   不做 MOG2/背景差分（背景差分对"物体色≈背景色"和静止目标都会漏检，
+            #   是现场"偶尔才检测到"的主因之一）。只认红/绿/蓝三色矩形时这条最稳。
             self.color_engine = vc.VisionEngine(
-                background=self.background, use_mog2=self.use_mog2,
+                background=self.background, use_mog2=False,
                 roi=self.roi, calib=self.color_calib,
-                debug=self.vision_debug)
+                debug=self.vision_debug,
+                color_only=self.color_only,
+                thr=self.vision_thr)   # ★ 审计修复 P0-cam-3: 阈值随引擎重建生效
         return self.color_engine
 
     def set_vision_config(self, enabled=None, roi=None, use_mog2=None,
                           min_interval=None, save_on_detect=None,
-                          min_conf=None, debug=None, reset_background=False):
+                          min_conf=None, debug=None, reset_background=False,
+                          thr=None):
         """更新颜色分拣配置。任何会改变输入/判据的项都重建引擎(清空稳定器状态)。"""
         if not _VC_OK:
             return self.status()
@@ -950,6 +1063,13 @@ class CameraService:
                 self.vision_debug = bool(debug)
                 if self.color_engine is not None:
                     self.color_engine.debug = bool(debug)
+            # ★ 审计修复 P0-cam-3: 只接受部分覆盖(未知键/坏值由 norm_thr 丢弃限幅)，
+            #   与旧阈值合并后整体比较 —— 值没变就不重建引擎，避免稳定器状态被白清。
+            if thr:
+                merged = vc.norm_thr({**self.vision_thr, **thr})
+                if merged != self.vision_thr:
+                    self.vision_thr = merged
+                    rebuild = True
             if enabled is not None and bool(enabled) != self.color_enabled:
                 if bool(enabled) and self.cam is not None and not self.color_capable:
                     # 灰度相机没有颜色信息, 强行开只会每帧全判"未知"; 直接拒并提示
@@ -1004,18 +1124,13 @@ class CameraService:
                 with self.lock:
                     self.color_ms = time.time() - t0
                     conf_thr = self.color_conf
-                    # ★ 三色 + 阈值过滤: 只画框/送记录置信度达标的红绿蓝目标,
-                    #   低置信(含"未知"/非三色)不进 latest_color。
-                    filt = [r for r in res["results"]
-                            if float((r.get("color") or {}).get("conf") or 0.0) >= conf_thr]
-                    # ★ 只保留置信度最高的一个目标：较小的目标不进 latest_color，
-                    #   因此只画一框、只记录一个（与 _on_detect 主记录一致）。
-                    if filt:
-                        best = max(filt, key=lambda r: float((r.get("color") or {}).get("conf") or 0.0))
-                        filt = [best]
+                    # ★ 需求（对齐参考实现"只报最大的一个"）：实时只显示**唯一**目标 ——
+                    #   先过置信度阈值，再取面积最大的（并列取置信度高者）。
+                    #   ⚠ 之前是"每色各留一个（≤3）"，会同时画多个框；现按用户口径收敛成一个。
+                    best = vc.pick_best(res["results"], conf_thr)
                     self.latest_color = [
                         {"box": r["box"], "color": r["color"], "center": r["center"]}
-                        for r in filt
+                        for r in best
                     ]
                 if res.get("fire"):
                     self._on_detect(frame, bgr, res)
@@ -1034,11 +1149,8 @@ class CameraService:
         r0 = None
         with self.lock:
             conf_thr = self.color_conf
-        qualified = [r for r in res["results"]
-                     if float((r.get("color") or {}).get("conf") or 0.0) >= conf_thr]
-        if qualified:
-            # 取置信度最高的一框作主记录（多物体同帧时取最可信的红绿蓝目标）
-            r0 = max(qualified, key=lambda r: float((r.get("color") or {}).get("conf") or 0.0))
+        qualified = vc.pick_best(res["results"], conf_thr)   # ★ 与实时画框同一判据：唯一、最大
+        r0 = qualified[0] if qualified else None
         if r0 is None:
             return None
         col = r0["color"]
@@ -1056,9 +1168,6 @@ class CameraService:
         adir = os.path.join(VISION_DIR, "%s_%03d_%s" % (stamp, ms, _safe_name(name)))
 
         with self.lock:
-            self.color_seq += 1
-            seq = self.color_seq
-            self.color_count += 1
             save = self.save_on_detect
         paths = {}
         if save:
@@ -1068,8 +1177,7 @@ class CameraService:
                 with self.lock:
                     self.error = "视觉存档失败: %s" % str(e)[:120]
 
-        ev = {
-            "seq": seq,
+        ev_body = {
             "ts": round(now, 3),
             "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
             "color": name,
@@ -1090,6 +1198,17 @@ class CameraService:
             "images": paths,
         }
         with self.lock:
+            # ★ 审计修复 P0-cam-1: 序号自增 + 事件发布 + 记录入列必须在**同一个临界区**
+            #   内一次性完成，且全部放在落盘(_archive)之后。
+            #   旧版在落盘前就 `self.color_seq += 1`，而 `last_event` 要等三张图写完才更新，
+            #   于是中间存在一个可观测窗口：GET /vision/last 返回 {seq: N, event: 旧/None}。
+            #   消费方(backend vision_ingest)只要拿到 seq 就会推进游标 → 游标越过 N 之后，
+            #   事件 N 永远不再满足 `event.seq > since` → 这次检测被**永久丢弃**，
+            #   表现就是"偶尔才检测到"(丢不丢取决于轮询是否恰好落进落盘窗口)。
+            #   现在 seq 与事件同生共死：没有事件就没有序号，游标永远追不上"还没发布的东西"。
+            self.color_seq += 1
+            ev = {"seq": self.color_seq, **ev_body}
+            self.color_count += 1
             self.last_event = ev
             self.records.insert(0, ev)
             if len(self.records) > MAX_RECORDS:
@@ -1144,6 +1263,9 @@ class CameraService:
             if self.latest_frame is None:
                 return False, "无画面(相机未开启)"
             self.background = self._pil_to_bgr(self.latest_frame)
+            # ★ 显式设了静态背景 = 明确要"背景差分"语义 → 关掉"只用颜色阈值"，
+            #   否则设了背景却不生效（界面写着静态背景、实际仍在跑 HSV 阈值）。
+            self.color_only = False
             self.color_engine = None
             self.latest_color = []
         return True, "已把当前画面设为静态背景"
@@ -1152,7 +1274,9 @@ class CameraService:
         with self.lock:
             self.background = None
             self.color_engine = None
-        return True, "已切回 MOG2 自适应背景"
+            # 清掉背景后回到默认的"只用颜色阈值"（参考实现口径）
+            self.color_only = True
+        return True, "已清除静态背景（回到颜色阈值模式）"
 
     def calibrate_gray(self, target=118.0):
         """中心区域一键灰卡白平衡(现场把 18% 灰卡放画面中心, 点一下即可)。"""
@@ -1249,17 +1373,31 @@ class CameraService:
         return {"total": len(recs), "by_color": cnt}
 
     def _draw_color(self, img, items):
-        """画颜色框 + 中文标签(含置信度/疑似色)。"""
-        draw = ImageDraw.Draw(img)
-        fsize = max(16, int(min(img.width, img.height) * 0.024))
+        """画颜色框 + 中文标签(含置信度/疑似色)。
+
+        ★ 画风（回退到 2026-09-25 现场确认"检测可以"的那版）：
+          贴合目标的旋转多边形整圈外框 + 外扩加深描边 + 四角加强 + 半透明圆角标签条。
+          （曾试过"只画四个角 + 标签上移"，现场反馈不如这一版，故回退。）
+          ★ 标签文字按现场要求**再放大**：0.032 → 0.040（最小 26px）。
+        """
+        draw = ImageDraw.Draw(img, "RGBA")
+        fsize = max(26, int(min(img.width, img.height) * 0.040))   # ★ 文字放大
         font = _font(fsize)
-        lw = max(2, int(fsize / 9))
+        lw = max(5, int(fsize / 5))
         for it in items:
             col = it.get("color") or {}
             rgb = _hex_rgb(col.get("hex"))
             pts = [(int(p[0]), int(p[1])) for p in it.get("box") or []]
             if len(pts) >= 3:
+                # 1) 外扩加深描边（半透明）→ 视觉上更像"框"，远处也看得见
+                draw.line(pts + [pts[0]], fill=rgb + (95,), width=lw * 2, joint="curve")
+                # 2) 主框
                 draw.line(pts + [pts[0]], fill=rgb, width=lw, joint="curve")
+                # 3) 四角加强（在四个顶点画小方块）
+                cl = max(9, fsize // 2)
+                for (px, py) in pts:
+                    draw.rectangle((px - cl, py - cl, px + cl, py + cl),
+                                   outline=rgb, width=lw)
             name = str(col.get("name") or "?")
             conf = col.get("conf")
             label = name if conf is None else "%s %.0f%%" % (name, float(conf) * 100.0)
@@ -1267,11 +1405,15 @@ class CameraService:
                 label += " (疑似%s)" % col["alt"]
             if col.get("reason"):
                 label += " ·%s" % col["reason"]
-            th = fsize + 8
+            th = fsize + 10
             tw = int(draw.textlength(label, font=font))
             px, py = pts[0] if pts else (0, 0)
-            draw.rectangle([px, max(0, py - th), px + tw + 8, py], fill=rgb)
-            draw.text((px + 4, max(0, py - th) + 4), label, fill=(0, 0, 0), font=font)
+            # 标签条贴着框的上边；贴到顶就压在框内，绝不让它跑出画面
+            ty = py - th if py - th >= 0 else py
+            bx2 = min(img.width - 1, px + tw + 12)
+            draw.rounded_rectangle([px, ty, bx2, ty + th], radius=8,
+                                   fill=(0, 0, 0, 165), outline=rgb + (220,), width=2)
+            draw.text((px + 6, ty + 5), label, fill=(255, 255, 255, 255), font=font)
         return img
 
     def _draw(self, img, dets):
@@ -1392,9 +1534,15 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         since = 0
             with SERVICE.lock:
-                seq = SERVICE.color_seq
                 ev = SERVICE.last_event
-            if ev is not None and ev.get("seq", 0) > since:
+                # ★ 审计修复 P0-cam-1: 对消费方可见的 seq 必须等于"已发布事件"的序号。
+                #   seq 是**消费游标**，一旦大于 event.seq，消费方就会把"序号已自增、
+                #   事件还没发布"的窗口读成"这条我已经收过了" → 永久漏检。
+                #   保守取 min(当前序号, 事件序号)；事件为 None 时返回 0 —— 消费方
+                #   用 max() 推进，返回 0 只会让它原地等待，不会回退，也不会跳号。
+                ev_seq = int(ev.get("seq") or 0) if ev else 0
+                seq = min(SERVICE.color_seq, ev_seq) if ev else 0
+            if ev is not None and ev_seq > since:
                 return self._json({"ok": True, "seq": seq, "event": ev})
             return self._json({"ok": True, "seq": seq, "event": None})
         if path == "/vision/records":
@@ -1486,6 +1634,7 @@ class Handler(BaseHTTPRequestHandler):
                 save_on_detect=body.get("save_on_detect"),
                 min_conf=body.get("min_conf"),
                 debug=body.get("debug"),
+                thr=body.get("thr") if "thr" in body else None,   # ★ P0-cam-3 阈值覆盖
                 reset_background=bool(body.get("reset_background")))
             return self._json({"ok": True, "status": st})
         if path == "/vision/background":

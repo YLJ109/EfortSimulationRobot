@@ -50,6 +50,14 @@ export const DEFAULT_LIMITS = [
 export const zeroQ = () => [0, 0, 0, 0, 0, 0];
 export const zeroTcp = () => ({ x: 0, y: 0, z: 0 });
 
+/**
+ * ★ P1-D8：多久没收到新遥测就算"冻住"。
+ *   后端 `ws_push_hz` 默认 20Hz（config/robot.yaml），正常每 50ms 一帧；
+ *   取 3s 是 60 帧的余量 —— 只有后端真的卡死 / 采集线程挂了才会触发，
+ *   网络抖动、切页、标签页后台都不会误报（后台页 RAF 停帧不影响收帧）。
+ */
+export const TELEM_STALE_MS = 3000;
+
 export const useRobotStore = defineStore("robot", {
   state: () => ({
     meta: null,
@@ -75,6 +83,12 @@ export const useRobotStore = defineStore("robot", {
     // ---- 连接与元数据 ----
     simulated: false,          // 兼容字段：与 telemetry.simulated 同步
     connected: false,
+    // ★ 审计修复 P1-D8：遥测是否已"冻住"（WS 还连着，但后端不再推新帧）。
+    //   telemetry.at 以前**只写不读** —— 后端卡死 / 采集线程崩溃 / WS 半死时
+    //   画面定格，界面却还挂着"已连接(真实)"。因为 Date.now() 不是响应式依赖，
+    //   不能只写个 `stale` getter 就完事（它不会自己重新求值）：由 App 的 1 秒
+    //   时钟调 sweepTelemetry() 翻转本标记，applyPose 收到新帧时立即复位。
+    telemetryStale: false,
     simQ: zeroQ(),             // 模拟仿真页的本地教学模型（与遥测无关）
     selIdx: 0,
     activeView: "live",        // live | sim | point | program | ops | settings | about
@@ -136,6 +150,17 @@ export const useRobotStore = defineStore("robot", {
     },
 
     /**
+     * ★ P1-D8：由 App 的 1 秒时钟驱动，翻转"遥测冻住"标记。
+     *   必须做成 action 而不是 getter —— getter 里的 Date.now() 不是响应式依赖，
+     *   帧一停就不会有人重新求值，标记永远停在 false（这正是原审计问题的形态）。
+     */
+    sweepTelemetry() {
+      const at = this.telemetry.at;
+      const stale = !!at && (Date.now() - at) > TELEM_STALE_MS;
+      if (stale !== this.telemetryStale) this.telemetryStale = stale;
+    },
+
+    /**
      * ★ 接收一帧遥测。**绝不在这里做任何抑制** ——
      * 改造前这里有一句 `if (this.localDemo) return;`，是"读数冻结"的直接成因。
      */
@@ -143,6 +168,7 @@ export const useRobotStore = defineStore("robot", {
       if (!p) return;
       this.simulated = !!p.simulated;
       this.connected = true;
+      this.telemetryStale = false;   // ★ P1-D8：来新帧即复位"冻住"标记
       this.telemetry.q = [p.j1, p.j2, p.j3, p.j4, p.j5, p.j6].map((v) => Number(v) || 0);
       if (p.tcp) this.telemetry.tcp = { x: +p.tcp.x || 0, y: +p.tcp.y || 0, z: +p.tcp.z || 0 };
       this.telemetry.simulated = !!p.simulated;

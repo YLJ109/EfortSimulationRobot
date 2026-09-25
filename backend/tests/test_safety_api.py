@@ -108,23 +108,35 @@ def test_reset(client):
 
 
 def test_events_crud(client):
+    # ★ P2：POST /safety/events 已要求控制令牌（原匿名可刷库/伪造碰撞报警）
     r = client.post("/api/safety/events", json={
         "zone_id": "z1", "zone_name": "主工作区", "state": "hit",
         "clearance": -0.031, "ratio": 0.0,
-    })
+    }, headers=_admin(client))
     assert r.status_code == 200
     lst = client.get("/api/safety/events").json()
     assert len(lst) >= 1
     assert lst[0]["state"] == "hit"
     assert lst[0]["zone_name"] == "主工作区"
+    # ★ P2-E：时间戳必须是可解析的 ISO+Z（原重复 _iso 导致拼出 …ZZ）
+    from datetime import datetime as _dt
+    _dt.fromisoformat(lst[0]["timestamp"].replace("Z", "+00:00"))
 
     d = client.delete("/api/safety/events", headers=_admin(client))
     assert d.json()["ok"] is True
     assert client.get("/api/safety/events").json() == []
 
 
+def test_events_requires_token(client):
+    """★ P2 回归钉：匿名写报警事件必须 401。"""
+    r = client.post("/api/safety/events", json={"state": "hit"})
+    assert r.status_code == 401
+    assert client.get("/api/safety/events").status_code == 200   # 读仍是公开
+
+
 def test_events_rejects_bad_state(client):
-    r = client.post("/api/safety/events", json={"state": "boom"})
+    r = client.post("/api/safety/events", json={"state": "boom"},
+                    headers=_admin(client))
     assert r.status_code == 400
     assert r.json()["code"] == "BAD_SAFETY_STATE"
 

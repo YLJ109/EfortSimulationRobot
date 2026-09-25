@@ -15,11 +15,32 @@ _SessionLocal = None
 
 
 def _engine_url() -> str:
-    """数据库连接串：环境变量 EFORT_DB_URL 优先（测试/部署可覆盖），
-    否则用默认 SQLite 文件绝对路径。"""
+    """数据库连接串。优先级（★ 审计修复 P1-C4）：
+
+      1. 环境变量 ``EFORT_DB_URL`` —— 测试/部署硬覆盖，永远最高；
+      2. 配置文件 ``database.url`` —— 设置页/robot.yaml 里改的**真生效**；
+         （原实现只读环境变量，配置项标着 apply="restart" 却是死配置，
+          改完重启仍在写旧库，现场会误判"数据丢了"）
+      3. 默认 ``data/robot.db`` 绝对路径。
+
+    配置里的相对路径按项目根目录解析，与 robot.yaml 的写法一致。
+    """
     override = os.environ.get("EFORT_DB_URL")
     if override:
         return override
+    cfg_url = ""
+    try:
+        from app.core.config import get_config, project_root
+        cfg_url = str(get_config().get("database", "url", default="") or "").strip()
+    except Exception:
+        cfg_url = ""
+    if cfg_url:
+        if cfg_url.startswith("sqlite:///"):
+            path = cfg_url[len("sqlite:///"):]
+            if not os.path.isabs(path):
+                path = os.path.join(project_root(), path)
+            return "sqlite:///" + path.replace("\\", "/")
+        return cfg_url          # 其它方言（postgresql:// 等）原样交给 SQLAlchemy
     return f"sqlite:///{db_path()}"
 
 

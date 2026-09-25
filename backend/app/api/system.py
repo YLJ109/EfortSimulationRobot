@@ -22,11 +22,12 @@ from __future__ import annotations
 import json
 import os
 import platform
+import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -34,7 +35,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import require_admin, require_control, token_role
 from app.core.config import db_path, get_config
 from app.core.deps import get_db
-from app.core.safety_config import load_safety, save_safety, validate_safety
+from app.core.safety_config import load_safety, save_safety
 from app.db import crud
 from app.db.database import SessionLocal
 from app.services.collector import collector
@@ -43,6 +44,7 @@ from app.services.hub import hub
 from app.services.motion import motion
 from app.services.runmode import runmode
 from app.services.safety_guard import snapshot as safety_snapshot
+from app.core.safety_const import joint_lock_state
 from app.core.brand import (
     EXPORT_FORMAT as _EXPORT_FORMAT,
     SERVICE_NAME,
@@ -127,31 +129,64 @@ def api_health():
         "ws_clients": hub.count(),
         "motion": motion.state(),
         "safety_interlock": safety_snapshot(),
+        # ★ 全维度审查 F-03：把轴锁模式暴露给前端，让执行页/顶栏徽标能显示当前
+        #   是「J1–J6 全轴可动」还是「轴锁模式：仅 J6」。默认 enabled=false（全轴可动）。
+        "joint_lock": joint_lock_state(),
     }
 
 
 # ---------------------------------------------------------------- 连接自检 / 操作引导
-def _tcp_probe(host: str, port: int, timeout: float = 0.6):
-    """探控制器网口是否可达（只握手不读数据，超时很短，不卡接口）。"""
+# ★ 审计修复 P1-B8/P1-C7：机器人网口探测的结果缓存。
+#   原实现无缓存，而 `/api/system/guide` 被前端每 5s 轮询（每个标签页各一次）、
+#   `/api/settings/live` 也在拉 —— 断网时每次都要等满 0.6s 超时，
+#   多开几个标签页就能把 40 线程的线程池占满，整站 DoS（还会持续骚扰控制器）。
+_PROBE_TTL = 3.0
+_PROBE_CACHE: Dict[str, Tuple[float, bool, str]] = {}   # (host,port) -> (ts, ok, err)
+_PROBE_LOCK = threading.Lock()
+
+
+def _tcp_probe(host: str, port: int, timeout: float = 0.6,
+               use_cache: bool = True):
+    """探控制器网口是否可达（只握手不读数据，超时很短，不卡接口）。
+
+    ``use_cache=False`` 供「测试连接」这类**用户主动触发**的探测绕过缓存 ——
+    否则改完地址点测试，返回的还是 3 秒前旧地址的结论（"改了没生效"）。
+    """
     import socket
     if not host:
         return False, "未配置控制器地址"
+    key = "%s:%s" % (host, port)
+    now = time.time()
+    if use_cache:
+        with _PROBE_LOCK:
+            hit = _PROBE_CACHE.get(key)
+        if hit and (now - hit[0]) < _PROBE_TTL:
+            return hit[1], hit[2]
     try:
         with socket.create_connection((host, int(port)), timeout=timeout):
-            return True, ""
+            ok, err = True, ""
     except Exception as e:
-        return False, str(e)[:80]
+        ok, err = False, str(e)[:80]
+    with _PROBE_LOCK:
+        # 缓存条目数封顶：配置里改来改去的 host 不至于无限堆积
+        if len(_PROBE_CACHE) > 64:
+            _PROBE_CACHE.clear()
+        _PROBE_CACHE[key] = (now, ok, err)
+    return ok, err
 
 
 # ---------------------------------------------------------------- 链路状态（底栏常驻）
 def invalidate_link_cache() -> None:
-    """丢弃相机链路探测缓存。
+    """丢弃链路探测缓存（相机 + 控制器网口）。
 
-    ★ 改了 `camera.host` / `camera.port` 之后必须调用：`_camera_link()` 有 4 秒缓存，
+    ★ 改了 `camera.host` / `camera.port` / `connection.host` 之后必须调用：
+      `_camera_link()` 有 4 秒缓存、`_tcp_probe()` 有 3 秒缓存，
       不清的话设置页保存成功后底栏可能还挂着旧地址的探测结论（"保存了没生效"）。
     """
     _LINK_CAM["data"] = None
     _LINK_CAM["ts"] = 0.0
+    with _PROBE_LOCK:
+        _PROBE_CACHE.clear()
 
 
 def _camera_link() -> Dict[str, Any]:

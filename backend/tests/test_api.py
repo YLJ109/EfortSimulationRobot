@@ -63,6 +63,8 @@ def test_control_limits(client):
 
 
 def test_recordings_crud(client):
+    # ★ P1-B3：写接口已补鉴权，这里必须带令牌（原来不带也能成功是漏洞）
+    h = _ctrl_headers(client)
     # 创建
     r = client.post("/api/recordings", json={
         "name": "测试录制", "source": "sim", "duration_ms": 100,
@@ -70,7 +72,7 @@ def test_recordings_crud(client):
             {"t": 0, "j1": 0, "j2": 0, "j3": 0, "j4": 0, "j5": 0, "j6": 0},
             {"t": 100, "j1": 1, "j2": 0, "j3": 0, "j4": 0, "j5": 0, "j6": 0},
         ],
-    })
+    }, headers=h)
     assert r.status_code == 200
     rid = r.json()["id"]
 
@@ -84,7 +86,7 @@ def test_recordings_crud(client):
     assert len(r.json()["frames"]) == 2
 
     # 重命名
-    r = client.put(f"/api/recordings/{rid}", json={"name": "改名"})
+    r = client.put(f"/api/recordings/{rid}", json={"name": "改名"}, headers=h)
     assert r.json()["name"] == "改名"
 
     # 导出
@@ -93,7 +95,7 @@ def test_recordings_crud(client):
     assert r.json()["format"] == "efort-recording/v1"
 
     # 删除
-    r = client.delete(f"/api/recordings/{rid}")
+    r = client.delete(f"/api/recordings/{rid}", headers=h)
     assert r.json()["ok"] is True
 
     # 删除后 404
@@ -169,7 +171,9 @@ def test_write_endpoints_still_require_token(client):
 
 
 def test_reconnect(client):
-    r = client.post("/api/reconnect")
+    # ★ P1-B2：重连会探测控制器并切换真实/模拟链路，必须持令牌
+    assert client.post("/api/reconnect").status_code == 401
+    r = client.post("/api/reconnect", headers=_ctrl_headers(client))
     assert r.status_code == 200
     data = r.json()
     assert "connected" in data

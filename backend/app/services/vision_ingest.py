@@ -7,6 +7,14 @@
   引入"谁先起来"的耦合。轮询 `/vision/last?since=seq` 是无状态幂等的，
   两端可以任意顺序启动/重启，最多晚 poll_ms 拿到结果 —— 对 1 秒停留的场景完全够。
 
+★ 游标契约（★ 审计修复 P0-cam-2 / P0-cam-1，两端必须同时满足，改一端就会漏检）：
+  1. 相机侧：`seq` 只在**事件发布时**自增，`/vision/last` 返回的 seq 恒等于
+     已发布 event.seq（无事件则为 0）—— 见 camera_service._on_detect / vision/last；
+  2. 本侧：**只在拿到 event 之后**按 event.seq 推进 last_seq，且先落库再推进；
+     响应里没有 event 就原地等待，绝不按裸 seq 推进。
+  违反任何一条，都会出现"序号已推进、事件还没发布"的窗口，该事件被当成已消费
+  而永久丢弃 —— 现场表现就是间歇性漏检（"偶尔才检测到"）。
+
 ★ 必须幂等：后端重启后会拿 since=0 重放，靠 DB 里 seq 的唯一索引兜底，
   否则每次重启都会给最近一次分拣多记一条。
 """
@@ -21,7 +29,7 @@ from app.db.crud import insert_vision_record, prune_vision_records
 from app.db.database import SessionLocal
 from app.services import camera_client
 from app.services.events import emit as emit_event
-from app.services.vision_rules import execute_rule, load_rules, rule_for
+from app.services.vision_rules import execute_rule, rule_for
 
 log = get_logger("vision_ingest")
 
@@ -114,10 +122,50 @@ class VisionIngest:
         self.connected = True
         self.last_error = ""
         ev = (j or {}).get("event")
-        if ev:
-            # ★ 先落库再推进 seq：落库失败时下一轮会重试，不会丢事件
-            self._ingest(ev)
-        self.last_seq = max(self.last_seq, int((j or {}).get("seq") or 0))
+        # ★ 审计修复 P0-cam-2: 只有"拿到与游标衔接的完整事件"才推进游标。
+        #   旧逻辑是无条件 `last_seq = max(last_seq, 响应里的 seq)`，而相机侧曾经
+        #   **先自增 seq、落盘三张图之后才发布 event**（camera_service._on_detect），
+        #   两者之间的窗口里响应形如 {seq: N, event: 旧事件或 None} ——
+        #   一旦按 seq 把游标推到 N，事件 N 之后永远不满足 `event.seq > since`，
+        #   该次检测就被当成"已消费"永久丢弃，现场表现为"偶尔才检测到"
+        #   （丢不丢取决于这 800ms 轮询有没有恰好落进落盘窗口）。
+        #   现在：event 没到就原地等；event 到了就按 event.seq 推进，且**先落库再推进**。
+        if not ev or not isinstance(ev, dict):
+            return
+        ev_seq = int(ev.get("seq") or 0)
+        if ev_seq <= self.last_seq:
+            return                      # 重复/更旧的事件：DB 里已有(唯一键 seq)，游标不回退
+        # ★ 审计修复 P0-cam-2b: /vision/last 是**单槽**，两次轮询之间若发布了多条，
+        #   中间那条会被最新一条覆盖。出现跳号(last_seq → ev_seq 之间有空洞)时，
+        #   先用 /vision/records 把空洞补齐，再落最新这条 —— 记录列表取不到时只告警、
+        #   不阻塞最新事件入库（见 _backfill_gap），绝不"看见大序号就把游标跳过去"。
+        if ev_seq - self.last_seq > 1:
+            self._backfill_gap(self.last_seq, ev_seq)
+        self._ingest(ev)
+        self.last_seq = ev_seq
+
+    def _backfill_gap(self, lo: int, hi: int) -> None:
+        """补齐 (lo, hi) 区间内被单槽 /vision/last 覆盖掉的事件（按 seq 升序落库）。
+
+        ★ 审计修复 P0-cam-2b。取不到记录列表时**不抛**：至少保证最新事件(ev_seq)能落，
+          少数中间事件靠 DB 唯一键在下次重放时仍可幂等补入。
+        """
+        st, j, err = camera_client.get_json("/vision/records?limit=50")
+        if st != 200 or err:
+            log.warning("视觉摄入补洞失败(%s~%s): %s", lo, hi, err or "相机服务未就绪")
+            return
+        recs = (j or {}).get("records") or []
+        gap = []
+        for r in recs:
+            try:
+                s = int(r.get("seq") or 0)
+            except (TypeError, ValueError):
+                continue
+            if lo < s < hi:
+                gap.append((s, r))
+        for _, r in sorted(gap, key=lambda x: x[0]):
+            self._ingest(r)
+            log.info("视觉摄入补洞: seq=%s 已补入", r.get("seq"))
 
     # ---------- 单条摄入 ----------
     def _ingest(self, ev: dict) -> None:

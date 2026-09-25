@@ -26,15 +26,34 @@ export const useLinkStore = defineStore("link", {
     guide: null,        // /system/guide 原始快照
     error: "",          // 自检接口本身不可用时的原因
     at: 0,              // 最近一次成功的时间戳
+    tick: 0,            // ★ P1-D7：最近一次 load 的时刻（成功/失败都更新）
     busy: false,        // 声明档位中
     actionMsg: "",      // 详情面板里的一行反馈
     claimError: "",
   }),
   getters: {
     links: (s) => (s.guide && s.guide.links) || null,
+    /**
+     * ★ 审计修复 P1-D7：自检数据是否过期。
+     *   原实现是 `Date.now() - s.at > LINK_POLL_MS * 3` —— Date.now() 不是响应式
+     *   依赖，这个 getter 只会在 `at` 变化时重算一次；而 `at` **恰恰在轮询失败时
+     *   不再更新** → 标记永远停在 false，界面一直显示上一次的绿灯（"旧绿"）。
+     *   改成比 `tick`（每次 load 必更新，响应式），并且由组件侧的定时轮询
+     *   驱动重算（tick 每 5 秒变一次就够了，因为判断阈值是 15 秒）。
+     */
+    stale() {
+      if (!this.at) return false;
+      return (this.tick - this.at) > LINK_POLL_MS * 3;
+    },
     /** 三盏灯（机器人 / 摄像头 / 示教器档位）。★ 任何情况下都返回三个元素。 */
     pills() {
-      return allPills(this.links);
+      const raw = allPills(this.links);
+      // ★ P1-D7 消费方之一：自检过期 → 仍为绿的灯一律压成黄。
+      //   "数据早就没更新了还挂着绿灯"是现场最危险的假正常。
+      if (!this.stale) return raw;
+      return raw.map((p) => (p && p.tone === "ok"
+        ? { ...p, tone: "warn", title: (p.title || "") + "（自检数据已过期）" }
+        : p));
     },
     robot: (s) => (s.guide && s.guide.links && s.guide.links.robot) || null,
     camera: (s) => (s.guide && s.guide.links && s.guide.links.camera) || null,
@@ -43,12 +62,25 @@ export const useLinkStore = defineStore("link", {
     tone() { return stripTone(this.pills); },
     /** 第一个非 ok 的灯（没有就返回 null = 全部正常）。 */
     attention() { return worstPill(this.pills); },
-    /** 引导条主提示（有未通过项才有）。 */
-    primary: (s) => (s.guide && s.guide.primary) || null,
+    /**
+     * 引导条主提示（有未通过项才有）。
+     * ★ P1-D7 消费方之二：数据过期/接口挂了时**必须顶掉旧结论**，否则
+     *   引导条还在教人"接下来该干什么"，而那已经是十几秒前的状态了。
+     */
+    primary() {
+      if (this.stale || this.error) {
+        return {
+          key: "net",
+          level: "error",
+          title: this.at ? "自检数据已过期" : "自检接口不可用",
+          hint: this.error
+            || `后端 /system/guide 已超过 ${LINK_POLL_MS * 3 / 1000} 秒没有新数据，下方状态灯可能不是最新状态`,
+        };
+      }
+      return (this.guide && this.guide.primary) || null;
+    },
     hasToken: (s) => !!(s.guide && s.guide.has_token),
     ready: (s) => !!s.guide && !s.guide.primary,
-    /** 自检是否过期（后端挂了也别一直显示旧绿）。 */
-    stale: (s) => !!s.at && Date.now() - s.at > LINK_POLL_MS * 3,
   },
   actions: {
     async load() {
@@ -63,6 +95,9 @@ export const useLinkStore = defineStore("link", {
         this.at = Date.now();
       } catch (e) {
         this.error = "后端不可用（" + (e && e.message ? e.message : "网络错误") + "）";
+      } finally {
+        // ★ P1-D7：失败也必须推进 tick —— "多久没更新"只能靠它计时。
+        this.tick = Date.now();
       }
     },
     start() {

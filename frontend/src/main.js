@@ -21,3 +21,33 @@ const auth = useAuthStore(pinia);
 const verified = auth.fetchStatus().catch(() => {});
 const budget = new Promise((resolve) => setTimeout(resolve, 1500));
 Promise.race([verified, budget]).then(() => app.mount("#app"));
+
+// ★ 审计修复 P1-D5：全站此前没有任何全局错误处理。
+//   未捕获异常 / 未处理的 Promise 拒绝只在控制台留一行红字 —— 现场的人不会开
+//   开发者工具，只会看到"页面点了没反应"。这里统一兜底：
+//     ① console.error 原样打出（保留堆栈，排障还是要靠它）；
+//     ② 落一份内存环形缓冲（最近 50 条），控制台里随时可取：
+//          window.__efortErrors
+//   刻意不做 toast 弹窗：轮询类失败可能每几秒重复一次，弹窗会把界面刷没；
+//   真正影响操作的错误（下发失败、权限失效）都由各自的 store 走日志行/结果区。
+const _uncaught = [];
+function noteUncaught(kind, err) {
+  try {
+    _uncaught.push({
+      kind,
+      msg: (err && err.stack) || (err && err.message) || String(err),
+      at: new Date().toISOString(),
+    });
+    if (_uncaught.length > 50) _uncaught.shift();
+    console.error("[EFORT 未捕获" + (kind === "rejection" ? "的 Promise 拒绝" : "异常") + "]", err);
+  } catch (e) { /* 兜底处理自身绝不能抛 */ }
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("error", (ev) => noteUncaught("error", ev && (ev.error || ev.message)));
+  window.addEventListener("unhandledrejection", (ev) => noteUncaught("rejection", ev && ev.reason));
+  // 排障入口：控制台执行 window.__efortErrors() 看最近 50 条
+  Object.defineProperty(window, "__efortErrors", {
+    value: () => _uncaught.slice(),
+    writable: false,
+  });
+}

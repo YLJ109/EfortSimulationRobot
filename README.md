@@ -2,7 +2,10 @@
 
 埃夫特 **ER8-700H** 六轴工业机器人 · **全栈网页端三维实时监控与仿真系统**。
 
-后端通过 Modbus TCP 只读机器人关节角 (J1–J6) → 正运动学计算 TCP → WebSocket 实时推送；
+后端通过 Modbus TCP 读取机器人关节角 (J1–J6) → 正运动学计算 TCP → WebSocket 实时推送；
+前端用 Three.js 按 DH 参数驱动 **官方 STEP 数模导出的 GLB**，真实还原机器人形态并实时跟随。
+> ⚠️ **不是纯只读系统**：默认（双闸关闭）只读不写；双闸打开后 `/api/control/*` 会真机下发。
+> 完整的写入权限与安全约束见 [§8.2 写入权限与双闸](#82-控制--运动学-apicontrol)。
 前端用 Three.js 按 DH 参数驱动 **官方 STEP 数模导出的 GLB**，真实还原机器人形态并实时跟随。
 内置工业安全围栏（区域越界 + 地面碰撞四级报警）、实验室场景、离线模拟演示、录制回放与视觉检测。
 
@@ -14,7 +17,7 @@
 |---|---|
 | **真实监控** | Modbus TCP 20Hz 推送，关节角 + TCP + 速度实时显示；机器人离线时自动切换为前端本地演示（不中断画面） |
 | **模拟仿真** | 6 轴滑条 + 键盘精确操控；关节/机器人两种操控模式（关节角 ↔ 世界坐标 XYZ/姿态）；正逆运动学预演 |
-| **录制回放** | 从真机或仿真录制轨迹入库，时间轴拖动/变速播放，支持导出/导入 JSON |
+| **录制回放** | 后端 `/api/recordings` 提供轨迹序列入库 / 改名 / 导出 / 导入 JSON；**前端回放视图已于阶段 7 下线**（`RecordingView` 已删除），当前 UI 未接入 |
 | **视觉检测** | 海康 MV-CU120-10GM GigE 工业相机 MJPEG 实时流 + YOLO 目标检测，可截图存档；检测模型按需加载、可一键释放内存；以**悬浮小面板**内嵌于「真实监控」右上角，可展开/收起 |
 | **安全围栏** | 矩形 / 任意四边形 / 圆形多区域，各自四级阈值（安全/接近/危险/碰撞）；围栏越界 + 机器人最低点离台面高度双维度检测；玻璃墙、角柱、黄色警示带的完整工业化视觉；配置持久化 + 报警事件时间线 |
 | **实验室场景** | 14m × 14m 车间房间（四面墙 / 天花板 / 灯带 / 点光 / 10 组贴墙设备道具）+ 3.6m 环氧自流平工作区 + 拉丝不锈钢设备站台 |
@@ -26,8 +29,8 @@
 ## 二、系统架构
 
 ```
-┌──────────────────────┐  Modbus TCP (FC3, reg10-21, IEEE754 字序交换)
-│  Robox 控制器         │◄──────────────── 只读，不写入任何寄存器
+┌──────────────────────┐  Modbus TCP (FC3 reg10-21 读位姿 / FC6 写指令 —— 见 §8.2 双闸)
+│  Robox 控制器         │◄──────────────── 读位姿为常态；写入需双闸 + 控制令牌
 │  192.168.1.12:502    │
 └──────────────────────┘
             │ J1..J6 (deg)
@@ -145,14 +148,18 @@ EFORT_Web_Monitoring/
 │   └─ safety.json           安全围栏配置（运行时可改，原子写落盘）
 ├─ backend/                  FastAPI 后端（独立 venv）
 │   ├─ app/
-│   │   ├─ main.py           入口：路由挂载 + 静态托管 + 生命周期
-│   │   ├─ api/              薄路由层 robot / control / recordings / safety / ws
-│   │   ├─ core/             config(含 .env 加载) / deps / exceptions / logger / middleware / safety_config
-│   │   ├─ db/                models / database(引擎+WAL) / crud
+│   │   ├─ main.py           入口：路由挂载 + 静态托管 + 生命周期 + CORS 白名单 / 体积上限 / 日志轮转
+│   │   ├─ api/              薄路由层（13 个）：robot · control · recordings · safety · ws ·
+│   │   │                    auth · points · programs · events · system · vision · frames · settings
+│   │   ├─ core/             config(.env 加载) / app_settings(界面可改的配置表) / deps / exceptions /
+│   │   │                    logger(轮转) / middleware / safety_config / brand / frames_config
+│   │   ├─ db/                models / database(引擎+WAL+连接串解析) / crud
 │   │   ├─ schemas/          Pydantic 出入参
-│   │   └─ services/         modbus / kinematics / collector / hub
+│   │   └─ services/         （15 个）modbus · motion · jog · jog_frames · kinematics · collector ·
+│   │                        hub · events · safety_guard · sim_robot · rc_ready · runmode ·
+│   │                        camera_client · vision_ingest · vision_rules
 │   ├─ scripts/init_db.py    手工建库
-│   ├─ tests/                pytest（API / 运动学 / 安全围栏）
+│   ├─ tests/                pytest 185 例（13 个文件；见「十、测试与回归」）
 │   ├─ requirements.txt      运行依赖
 │   └─ requirements-dev.txt  附加 pytest / httpx
 ├─ camera/                   视觉检测服务（独立进程 + 独立解释器）
@@ -165,19 +172,30 @@ EFORT_Web_Monitoring/
 │   ├─ vite.config.js        base "./" + dev proxy
 │   ├─ public/models/        robot_full.glb ← 官方 STEP 数模导出件
 │   ├─ src/
-│   │   ├─ main.js           Vue 应用装配
-│   │   ├─ config.js         WS/API 地址推断 + 兜底 DH + 相机地址
-│   │   ├─ App.vue           3 Tab 切换 + 报警条 + 状态片
+│   │   ├─ main.js           Vue 应用装配 + 全局未捕获错误收集（P1-D5）
+│   │   ├─ config.js         WS/API 地址推断（姿态流 / 事件流分开）+ 兜底 DH + 相机地址
+│   │   ├─ App.vue           页面框架 / 报警条 / 语音播报 / 快捷键 / 事件流订阅
+│   │   ├─ tabs.js · shortcuts.js · linkview.js · guide.js · brand.js
+│   │   │                    ↑ 纯函数（导航与快捷键解析 / 状态灯取色 / 指引文案 / 品牌名）
 │   │   ├─ three/
-│   │   │   ├─ manager.js    ★ 单场景管理器：模型装配 / 姿态平滑 / 视角
+│   │   │   ├─ manager.js    ★ 单场景管理器：模型装配 / 姿态平滑 / 视角 / 上下文丢失恢复
 │   │   │   ├─ safety.js     ★ 围栏引擎：多边形间距 / 四级分级 / 报警垫
 │   │   │   ├─ lab.js        ★ 实验室房间 + 智能剖切
-│   │   │   └─ cell.js       ★ 工作区地坪 + 设备站台（黄黑警示带）
-│   │   ├─ components/       MonitorLayout / RealMonitor / SimMonitor /
-│   │   │                    RecordingView / CameraPanel / SafetyPanel / JointHud
-│   │   ├─ stores/           robot / recording / camera / safety
-│   │   └─ utils/            dance(离线演示轨迹) / alarm(Web Audio 蜂鸣) / safetyConfig(归一化)
-│   └─ tools/                ★ 无头回归测试（见「测试」）
+│   │   │   ├─ cell.js       ★ 工作区地坪 + 设备站台（黄黑警示带）
+│   │   │   └─ ghost.js · jointOwner.js · simObjects.js   残影预演 / 关节归属 / 沙盘道具
+│   │   ├─ net/              control.js（带令牌的 API 封装）· ws.js（姿态流客户端）
+│   │   ├─ components/       （20 个）MonitorLayout · RealMonitor · SimMonitor ·
+│   │   │                    PointExecView · ProgramExecView · SettingsView · EventsView · AboutView ·
+│   │   │                    RobotParamsCard · ExecControlCard · RcReadyCard · CameraPanel ·
+│   │   │                    SafetyPanel · SafetyChip · StatusStrip · GuideBar · AnnouncePanel ·
+│   │   │                    RobotProgramPanel · SimObjectsPanel · Icon
+│   │   │                    （阶段 7 已删除 RecordingView / JointHud：回放 UI 下线，见 §一）
+│   │   ├─ stores/           （9 个 store + 1 个纯函数模块）robot · safety · camera · exec(执行域) ·
+│   │   │                    auth(令牌) · link(自检轮询) · rcReady · settings · ui
+│   │   │                    + poseAuthority.js（姿态权威优先级，纯函数）
+│   │   │                    （阶段 7 已删除 recording store）
+│   │   └─ utils/            alarm(Web Audio 蜂鸣) / dance / jointScale(限位条宽) / safetyConfig / safetyLabels
+│   └─ tools/                ★ 无头回归测试 22 个 .mjs（npm run verify）
 ├─ docs/                     方案与设计文档
 ├─ assets/cad/               官方手册 / 运动范围图 / 数模原件
 ├─ data/                     robot.db（运行时生成）+ STEP 数模原件
@@ -272,55 +290,139 @@ EFORT_Web_Monitoring/
 
 ## 八、API 一览
 
-### 8.1 机器人 / 姿态（`/api`）
+### 8.1 系统 / 姿态（`/api`、`/healthz`）
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/healthz` | 存活探针（不依赖 DB / 机器人） |
-| GET | `/api/version` | 服务版本信息 |
-| GET | `/api/health` | 机器人连接状态、模拟标志、采样信息 |
-| POST | `/api/reconnect` | 手动触发 Modbus 重连 |
-| GET | `/api/pose` | 当前姿态（关节角 + TCP + 时间戳） |
-| GET | `/api/history?limit=500` | 历史姿态 |
-| GET | `/api/export/csv?limit=2000` | 导出 CSV |
-| GET | `/api/meta` | 机型 / DH / 标定状态 / 关节限位 |
-| **WS** | `/ws/pose` | 实时姿态推送 |
-| GET | `/docs` | Swagger 交互文档 |
+**门控图例**：`公开` = 无需令牌；`控制` = 限时控制令牌（`X-Control-Token`，`POST /api/auth/login` 取得）；
+`管理员` = 控制令牌且角色为 admin；`+双闸` = 还需 `EFORT_REAL_MOTION=1` 且 `motion.real_write=true`（见 8.2）。
+
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| GET | `/healthz` | 公开 | 存活探针（不依赖 DB / 机器人） |
+| GET | `/api/version` | 公开 | 服务版本信息 |
+| GET | `/api/health` | 公开 | 机器人连接状态、模拟标志、采样信息、WS 客户端数 |
+| GET | `/api/meta` | 公开 | 机型 / DH / 标定状态 / 关节限位 |
+| GET | `/api/pose` | 公开 | 当前姿态（关节角 + TCP + 时间戳） |
+| GET | `/api/history?limit=500` | 公开 | 历史姿态 |
+| GET | `/api/export/csv?limit=2000` | 公开 | 导出 CSV |
+| GET | `/api/rc-status` | 公开 | 控制器寄存器快照（状态字 / 报警 / 程序号） |
+| POST | `/api/ready` | 控制 +双闸 | 一键就绪：写 40101 指令字（伺服上电 / 加载 / 运行） |
+| POST | `/api/reconnect` | 控制 | 探测并重连 Modbus（真实 ↔ 模拟切换） |
 
 ### 8.2 控制 / 运动学（`/api/control`）
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/control/limits` | 关节限位 + 可达半径 |
-| POST | `/api/control/preview` | **指令预演**：只算不下发，返回末端位姿与逐段校验 |
-| POST | `/api/control/ik` | 逆运动学求解（轻量端点，不记请求日志） |
+除 `/preview`、`/ik` 外，**本组全部要求控制令牌**（router 级 `require_control`）：
 
-> 本系统对机器人**只读**。`/preview` 与 `/ik` 都是纯计算，不会写入控制器。
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| GET | `/api/control/limits` | 控制 | 关节限位 + 可达半径 |
+| POST | `/api/control/preview` | **公开** | **指令预演**：只算不下发，返回末端位姿与逐段校验 |
+| POST | `/api/control/ik` | **公开** | 逆运动学求解（纯计算，不记请求日志） |
+| GET | `/api/control/state` `/tcp` `/frames` | 控制 | 引擎状态 / TCP / 坐标帧 |
+| POST | `/api/control/move` | 控制 +双闸 | 插值下发到目标位姿（或点位） |
+| POST | `/api/control/run-file` | 控制 +双闸 | 执行本地程序 / XPL 文件 |
+| POST | `/api/control/run-cancel` | 控制 | 中止正在执行的任务（P0-7） |
+| GET | `/api/control/files` | 控制 | 可执行文件清单 |
+| POST | `/api/control/jog/step` | 控制 +双闸 | 增量点动（限位夹紧 + 回报 `limit_clamped`） |
+| POST | `/api/control/jog/start` `/keepalive` `/stop` | 控制 +双闸 | 连续点动 + 死人开关（1.5s 无保活自动停） |
+| GET | `/api/control/jog` | 控制 | 点动状态 |
+| POST | `/api/control/estop` `/estop/reset` | 控制 | 软件急停与复位（急停不看连接态，只看令牌） |
+| GET / POST / DELETE | `/api/control/run-mode` | 控制 | 示教器档位查询 / 声明 / 撤销 |
 
-### 8.3 录制（`/api/recordings`）
+> #### ⚠️ 写入权限与「双闸」（审计修复 P1-E9，原表述"本系统对机器人**只读**"已作废）
+>
+> `/preview` 与 `/ik` 是**纯计算**，不写控制器；但本系统**并非整体只读** —— 上表标 `+双闸` 的接口
+> 会写寄存器（Modbus FC6：`40101` 指令字、`40103` 速度、`40104` 程序号、
+> `40135` 点动触发位、`40139~44` 目标角），另有 `POST /api/ready`、
+> `POST /api/system/reconnect`、`POST /api/reconnect` 也是真机寄存器操作。
+>
+> **双闸**（`real_write_enabled()`，`services/motion.py`）—— 两者必须**同时**打开才写真机，
+> 缺一即退回"只校验 + 记录"的安全模拟：
+> 1. 环境变量 `EFORT_REAL_MOTION=1`；
+> 2. `config/robot.yaml` → `motion.real_write: true`（或「设置 → 启用真实下发」，需重启后端）。
+>
+> 另外：所有写接口还要求**限时控制令牌**，匿名请求一律 401/403；
+> 围栏 / 坐标帧 / 视觉 / 设置里的高危项需要**管理员**令牌。
+> 现场上线前请先确认这两道闸的实际取值（`.env` + `robot.yaml`），详见
+> `docs/审计-项目代码审计与优化改进方案.md`。
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `` | 列表 |
-| POST | `` | 新建（带 `source`: `real` / `sim`） |
-| GET | `/{id}` | 详情（含完整帧序列） |
-| PUT | `/{id}` | 改名 / 更新 |
-| DELETE | `/{id}` | 删除 |
-| GET | `/{id}/export` | 导出 JSON |
-| POST | `/import` | 导入 JSON |
+### 8.3 鉴权（`/api/auth`）
 
-### 8.4 安全围栏（`/api`）
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| POST | `/api/auth/login` | 公开 | 校验管理员口令换限时控制令牌；**按 IP 限速**（60s 内 20 次失败 → 429） |
+| GET | `/api/auth/status` | 公开 | 当前令牌 / 角色 / 剩余 TTL |
+| POST | `/api/auth/logout` | 控制 | 释放令牌 |
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/safety` | 读取当前配置 |
-| PUT | `/api/safety` | 保存（原子写 + 强校验，非法返回 `SAFETY_CONFIG_INVALID`） |
-| POST | `/api/safety/reset` | 恢复出厂 |
-| GET | `/api/safety/default` | 取默认配置 |
-| POST | `/api/safety/validate` | 只校验不落盘 |
-| GET / POST / DELETE | `/api/safety/events` | 报警事件时间线 |
+### 8.4 点位 / 程序（`/api/points`、`/api/programs`）
 
-### 8.5 视觉检测服务（`:8100`）
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| GET | `/api/points`、`/api/points/{id}`、`/{id}/export` | 公开 | 列表 / 详情 / 导出 |
+| POST | `/api/points`、`/{id}`(PUT)、`/{id}`(DELETE)、`/import` | 控制 | 增改删与导入 |
+| GET | `/api/programs`、`/api/programs/{id}`、`/{id}/export` | 公开 | 列表 / 详情 / 导出 |
+| POST / PUT / DELETE | `/api/programs`、`/{id}` | 控制 | 增改删 |
+
+### 8.5 录制（`/api/recordings`）
+
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| GET | `` / `/{id}` / `/{id}/export` | 公开 | 列表 / 详情（含完整帧序列）/ 导出 JSON |
+| POST | `` | 控制 | 新建（带 `source`: `real` / `sim`） |
+| PUT | `/{id}` | 控制 | 改名 / 更新 |
+| DELETE | `/{id}` | 控制 | 删除 |
+| POST | `/import` | 控制 | 导入 JSON（受 8 MB 请求体上限约束） |
+
+### 8.6 安全围栏（`/api/safety`）
+
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| GET | `/api/safety`、`/default`、`/validate` | 公开 | 读配置 / 出厂默认 / 只校验不落盘 |
+| PUT | `/api/safety` | 管理员 | 保存（原子写 + 强校验，非法返回 `SAFETY_CONFIG_INVALID`） |
+| POST | `/api/safety/reset` | 管理员 | 恢复出厂（前自动归档） |
+| GET | `/api/safety/events` | 公开 | 报警事件时间线 |
+| POST / DELETE | `/api/safety/events` | 控制 / 管理员 | 追加 / 清空报警事件 |
+| GET / POST | `/api/safety/live` | 控制 / 公开 | 围栏余量实时上报与读取 |
+| GET | `/api/safety/versions`、`/{vid}` | 控制 | 配置版本历史 |
+| POST | `/api/safety/versions/{vid}/rollback` | 管理员 | 回滚到某个版本 |
+
+### 8.7 审计事件（`/api/events`）
+
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| GET | `/api/events`、`/stats`、`/export` | 公开 | 时间线 / 统计（SQL 聚合，P1-C1）/ 导出 |
+| DELETE | `/api/events` | 管理员 | 清空审计事件 |
+
+### 8.8 系统与设置（`/api/system`、`/api/settings`、`/api/frames`）
+
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| GET | `/api/system/health` `/guide` `/info` | 公开 | 健康 / 链路自检（TCP 探测带 3s TTL 缓存，P1-B8）/ 环境信息 |
+| POST | `/api/system/reconnect` | 控制 | 重连控制器 |
+| GET | `/api/system/export` | 控制 | 导出配置/数据包 |
+| POST | `/api/system/import` | 管理员 | 导入配置包 |
+| GET | `/api/settings` `/live` `/summary` | 公开 | 配置描述 / 实时值 / 摘要 |
+| PUT | `/api/settings` | 控制 | 改配置（高危项标 `admin=true`） |
+| POST | `/api/settings/apply` `/test` | 控制 | 应用（部分需重启）/ 试连接（绕过探测缓存） |
+| POST | `/api/settings/reset` `/password` `/control-ttl` | 管理员 | 恢复默认 / 改口令 / 改令牌 TTL |
+| GET | `/api/frames` | 公开 | 坐标帧读取 |
+| PUT / POST | `/api/frames`、`/teach`、`/reset` | 管理员 | 坐标帧写入 / 示教 / 复位 |
+
+### 8.9 视觉（`/api/vision`）
+
+| 方法 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| GET | `/card` `/image` `/last` `/records` `/rules` `/stats` `/export` | 公开 | 画面 / 最新结果 / 记录 / 规则 / 统计 / 导出 |
+| DELETE / POST | `/records`、`/records/{rid}/review` | 管理员 | 清空记录 / 人工复核 |
+| POST / PUT | `/config` `/background` `/calibrate/*` `/rules` | 管理员 | 配置、白标定、标定采样、规则写入 |
+
+### 8.10 WebSocket
+
+| 协议 | 路径 | 门控 | 说明 |
+|---|---|---|---|
+| WS | `/ws/pose` | 公开 | 姿态 / 寄存器快照推送（校验 `Origin`、单流上限 64，P1-B6） |
+| WS | `/ws/events` | 控制 | **审计事件流**：连接后首条消息发 `{"type":"auth","token":"..."}`；令牌不进查询串（避免落访问日志），失败以关闭码 `4401` 断开 |
+
+### 8.11 视觉检测服务（独立进程 `:8100`）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -338,13 +440,22 @@ EFORT_Web_Monitoring/
 
 ## 九、界面操作
 
-### 9.1 三个 Tab
+### 9.1 七个模块（顶部导航）
 
-| Tab | 内容 |
-|---|---|
-| **真实监控** | 实时关节 HUD、TCP 位姿、连接状态；离线时自动播放本地演示轨迹；右上角内嵌**摄像头悬浮面板**（小画面 + 可展开/收起） |
-| **模拟仿真** | 关节滑条 / 世界坐标操控、指令预演、🕺 跳舞演示 |
-| **录制回放** | 录制列表、时间轴播放/暂停/变速、导入导出 |
+「没拿到权限就藏起来」由 `src/tabs.js` 纯函数决定，`tools/verify_tabs.mjs` 逐组合钉死；
+**入口显隐只是体验，权限边界仍在后端**（`require_control` 401 / `require_admin` 403）。
+
+| # | 模块 | 门控 | 内容 |
+|---|---|---|---|
+| 1 | **真实监控** | 公开 | 关节读数 + TCP 位姿 + 3D 实时姿态；离线时本地演示轨迹；右上角**摄像头悬浮面板**；左下参数卡（连接状态含**遥测冻结**提示） |
+| 2 | **模拟仿真** | 公开 | 6 轴滑条 / 世界坐标操控、指令预演、🕺 跳舞演示、沙盘道具 |
+| 3 | **点位执行** | 控制令牌 | 点位列表 / 示教滑块 / 逐点执行 / 连续点动 |
+| 4 | **程序执行** | 控制令牌 | 程序分步执行、本地文件执行、执行日志、**中止**、残影预演 |
+| 5 | **运维审计** | 管理员 | 审计事件时间线 / 统计 / 导出、围栏配置与版本回滚 |
+| 6 | **系统设置** | 控制令牌 | 机器人、连接、采样、数据库、安全、日志等配置（逐字段标注谁能改、是否要重启） |
+| 7 | **关于** | 公开 | 实验指导（检查清单 / 流程 / 注意事项 / 异常查表）、快捷键、版本信息 |
+
+底部常驻：**三盏状态灯**（机器人链路 / 摄像头 / 示教器档位）+ 自检引导条 + 控制权限与语音播报开关。
 
 #### 摄像头悬浮面板（真实监控右上角）
 
@@ -354,14 +465,26 @@ EFORT_Web_Monitoring/
 - 相机画面统一按比例缩放（`object-fit: contain`），不放大不裁切；
 - 相机服务（`:8100`）由 `run.bat` 或 `run.bat camera` 启动，服务未运行时会提示。
 
-### 9.2 快捷键（仅「模拟仿真」Tab 生效）
+### 9.2 快捷键
 
-| 按键 | 作用 |
-|---|---|
-| `1`–`6` | 选中关节 J1–J6（机器人模式下 `1`–`3` 选 XYZ） |
-| `↑` / `↓` | 步进调整选中轴（关节 ±1° / XYZ ±10mm） |
-| `Shift` + `↑`/`↓` | 微调（关节 ±0.1° / XYZ ±1mm） |
-| `0` | 归零 |
+唯一事实来源是 `src/shortcuts.js`（`SHORTCUTS`），界面提示与「关于」页都读它；
+解析规则由 `tools/verify_shortcuts.mjs` 逐上下文钉死。**任何页面生效，除非另有说明**。
+
+| 按键 | 分组 | 作用 | 需令牌 |
+|---|---|---|---|
+| `1` ~ `7` | 导航 | 从左到右切到第 N 个**可见**模块（无权限的模块不显示，序号顺延） | 否 |
+| `E` | 视图 | 展开 / 收起侧面板 | 否 |
+| `Q` | 视图 | 显示 / 隐藏摄像头画面 | 否 |
+| `空格` | 执行 | 运行 / 停止程序（**仅「程序执行」页**；空闲时重复运行已选中的那一个） | 是 |
+| `Esc` | 安全 | **急停**：立即停止一切运动并锁定（有弹层时先关弹层；不弹二次确认） | 是 |
+| `Enter` | 安全 | 复位急停（需**先处于**急停锁定，避免误触） | 是 |
+
+> 两条硬规则：① 焦点在输入控件里时，字母键与空格**一律不劫持**；
+> ② 带 `Ctrl` / `Alt` / `Meta` 的组合键一概不抢（那是浏览器与系统的）。
+> 模拟仿真页另有滑块微调键（`1`~`6` 选轴、`↑`/`↓` 步进、`Shift` 微调、`0` 归零），
+> 由 `SimMonitor` 自己接管；由于 `1`~`7` 同时是全局切模块键，在该页按 `1`~`6`
+> 目前会**两者同时生效**（已知的按键冲突，`tools/verify_shortcuts.mjs` 的 D1 仍钉着"数字键恒切模块"，
+> 修正需连同该守卫一起改，见审计文档 P2 前端批次）。
 
 ### 9.3 安全围栏面板
 
@@ -377,25 +500,49 @@ EFORT_Web_Monitoring/
 
 ```
 cd frontend
-npm run check     只跑跨模块常量导入检查
-npm run verify    导入检查 + 全部回归套件
+npm run check     只跑两项静态检查（导入守卫 + 中文引号守卫）
+npm run verify    静态检查 + 全部 20 个回归套件
+npm run build     静态检查 + vite 生产构建
 ```
 
-| 套件 | 覆盖 | 用例数 |
-|---|---|---|
-| `check_imports.mjs` | **静态导入守卫**：用了别的文件 `export` 的常量却没 import | 23 文件 |
-| `verify_lab.mjs` | 房间尺寸 / 贴墙道具不穿墙不沉地 / 照明 / 智能剖切 | 44 |
-| `verify_cell.mjs` | 站台七层几何 / 台面顶面高度 / 报警垫必须铺在台面上 | 52 |
-| `verify_ground.mjs` | 四级分级边界 / 缺 colors 时的**按状态兜底取色** / 报警垫形状 | 67 |
-| `verify_safety.mjs` | 多边形间距 / 圆形间距 / 阈值迁移 / 逐面墙着色 | 49 |
-| `verify_official_model.mjs` | **官方数模装配自检**窗口 + `attach()` 提升顺序双路对照 + 零件归类 | — |
-| `verify_kinematics.mjs` | 前端 three 链 vs 后端 FK 逐点对拍；`attach()` 保持世界变换 | — |
+**静态检查（`check_*`）**
 
-> `npm run build` **已内置** 导入检查：缺 import 会在构建阶段就失败，
+| 套件 | 覆盖 |
+|---|---|
+| `check_imports.mjs` | **静态导入守卫**：用了别的文件 `export` 的常量却没 import（vite build 不会报错，只在浏览器炸） |
+| `check_cjk_bare.mjs` | **引号守卫**：中文文案串里混入 ASCII 引号导致的 SyntaxError（整页白屏），用最小词法状态机剥掉字符串/注释后扫 CJK |
+
+**回归套件（`verify_*`，均已在 `npm run verify` 中）**
+
+| 套件 | 覆盖 |
+|---|---|
+| `verify_simobjects.mjs` | 沙盘道具 AABB 判定 / 推出（纯函数） |
+| `verify_pose_authority.mjs` | **姿态权威模型**：优先级数学、`applyRobotPose` 唯一写者、`setLocalDemo` 灭绝、死组件清理 |
+| `verify_lab.mjs` | 房间尺寸 / 贴墙道具不穿墙不沉地 / 照明 / 智能剖切 |
+| `verify_cell.mjs` | 站台七层几何 / 台面顶面高度 / 立足面零点（离地检测基准） |
+| `verify_ground.mjs` | 四级分级边界 / 缺 `colors` 时的**按状态兜底取色** / 报警垫形状 |
+| `verify_safety.mjs` | 多边形间距 / 圆形间距 / 阈值迁移 / 逐面墙着色 |
+| `verify_safety_text.mjs` | 报警条与状态片**共用同一份文案判据**、缺配置的安全回退 |
+| `verify_official_model.mjs` | **官方数模装配自检**窗口 + `attach()` 提升顺序双路对照 + 零件归类 |
+| `verify_kinematics.mjs` | 前端 three 链 vs 后端 FK 逐点对拍；`attach()` 保持世界变换 |
+| `verify_ghost.mjs` | 残影预演：包围盒量级、材质、不可拾取、逐帧收敛 |
+| `verify_highlight.mjs` | 关节高亮零件集合互不相交（杜绝"悬停 J1 全身亮"） |
+| `verify_tabs.mjs` | 导航权限门控 + `isKnownView`（手改 localStorage 塞垃圾值不崩） |
+| `verify_ui.mjs` | 右侧栏宽度持久化迁移（损坏的 localStorage 不崩、回落默认） |
+| `verify_robot_params.mjs` | 参数读数卡：位姿来源顺序、限位条宽只有一份、**只读守卫**（不许写机器人） |
+| `verify_link.mjs` | 底栏三盏灯 `state → tone/label` 逐档钉死 + 项目名三处一致 |
+| `verify_rc_ready.mjs` | 就绪卡：`rc-status` 走公开通道、`/ready` 带令牌、按钮禁用判据、图标名存在 |
+| `verify_shortcuts.mjs` | 快捷键解析矩阵（输入框不劫持、有弹层先关层、Esc/Enter 的上下文） |
+| `verify_about.mjs` | 「关于」页：guide.js 的四份实验数据**确实被渲染** |
+
+> 另有两个**量测工具**（不进 `verify` 链，人工跑）：`measure_clearance.mjs`（离地间隙分布，
+> 用来挑地面阈值）、`measure_layout.mjs`（房间/站台/机器人/报警垫的几何体检）。
+
+> `npm run build` **已内置** 静态检查：缺 import / 引号不配对会在构建阶段就失败，
 > 不会再出现「构建通过、浏览器运行时报 `ReferenceError`」的情况
 > （rollup 把未声明标识符当全局变量，vite build 本身不会报错）。
 
-### 10.2 后端
+### 10.2 后端（`pytest`，185 例 / 12 个文件）
 
 ```
 cd backend
@@ -403,7 +550,25 @@ cd backend
 pytest                     # 需要 requirements-dev.txt
 ```
 
-覆盖：API 形状与错误格式、正逆运动学一致性、安全围栏配置校验与事件接口。
+> ★ 测试在 `conftest.py` 导入 app **之前**强制 `EFORT_SIMULATE=always` + `EFORT_REAL_MOTION=0` +
+> 临时 `EFORT_DB_URL` —— 无论本机 `.env` 怎么写，测试都**不会连真机、不会污染运行库**。
+
+| 文件 | 例数 | 覆盖 |
+|---|---:|---|
+| `test_api.py` | 15 | 路由形状 / 错误格式 / 只读端点公开性 / 鉴权头 |
+| `test_audit_p0.py` | 26 | **审计回归钉**：P0 与 P1-A/B/C/D 各项修复的行为（NaN 限位、prune、限流、中止、WS 分流…） |
+| `test_auth_ttl.py` | 11 | 登录、令牌 TTL、角色、登出 |
+| `test_jog.py` | 13 | 点动门 / 增量 / 限位夹紧 / 看门狗 / 急停与围栏拦截 |
+| `test_kinematics.py` | 6 | 正逆运动学一致性 |
+| `test_ops.py` | 19 | 运维接口（健康、导出、配置读写） |
+| `test_points_exec.py` | 7 | 点位 / 程序 / 执行链路 |
+| `test_runmode.py` | 23 | 示教器档位声明与自动确认 |
+| `test_safety_api.py` | 13 | 围栏配置校验、版本归档与事件接口 |
+| `test_settings.py` | 25 | 界面配置表：合并语义、只读项原因、重启项 |
+| `test_sim_robot.py` | 6 | 有状态仿真 |
+| `test_vision.py` | 21 | 视觉服务接口与规则 |
+
+> 基线数会随代码增长；**改完必须重跑并同步本表**（文档与实际不符正是审计 P1-E6 记的问题）。
 
 ---
 

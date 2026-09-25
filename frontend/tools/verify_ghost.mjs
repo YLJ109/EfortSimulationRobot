@@ -50,6 +50,28 @@ ok("尺寸与实体机同量级（非 1000× 放大）",
   ratios.every((r) => r > 0.5 && r < 2),
   "ghost=" + gs.toArray().map((v) => v.toFixed(3)) + " ref=" + rs.toArray().map((v) => v.toFixed(3)));
 
+// ---------- A2. J6 末端工具必须真的挂在残影上 ----------
+// ★ 现场事故：残影自己手写了一份简化版末端工具，写着写着就和官方不一致 →
+//   "残影跟随看不到 J6 上的工具"。现在官方与残影**共用 endEffector.buildEndEffector()**，
+//   这里把它钉死：节点要在、尺寸要对（不能 1000×）、而且要露在法兰**前方**（不能被埋进腕筒）。
+const ee = ghost.root.getObjectByName("end-effector");
+ok("残影包含 J6 末端工具（end-effector 节点）", !!ee);
+if (ee) {
+  const es = sizeOf(ee);
+  const emax = Math.max(es.x, es.y, es.z);
+  ok("末端工具尺寸合理（0.05~0.8 m，未 1000× 放大）", emax > 0.05 && emax < 0.8,
+    "ee=" + es.toArray().map((v) => v.toFixed(3)));
+  const flange = ghost.root.getObjectByName("Flange");
+  ok("残影存在 J6 法兰节点（工具挂载点）", !!flange);
+  if (flange) {
+    ghost.root.updateMatrixWorld(true);
+    const inv = new THREE.Matrix4().copy(flange.matrixWorld).invert();
+    const lb = new THREE.Box3().setFromObject(ee).applyMatrix4(inv);
+    ok("末端工具整体在法兰前方（z >= -0.005 m，未被埋进腕部）", lb.min.z >= -0.005,
+      "min.z=" + lb.min.z.toFixed(4));
+  }
+}
+
 // ---------- B. 造型：半透明 / 不写深度 / 不可拾取 / 初始不可见 ----------
 let meshes = 0, badMat = 0, badDepth = 0, pickable = 0;
 ghost.root.traverse((o) => {

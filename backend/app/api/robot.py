@@ -9,9 +9,8 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from typing import Optional
 
 from app.api.auth import require_control
 from app.core.config import get_config
@@ -38,8 +37,13 @@ def health():
 
 
 @router.post("/reconnect")
-def reconnect():
-    """手动重连机器人（网线在摄像头/机器人间切换后触发，无需重启服务）。"""
+def reconnect(tok: str = Depends(require_control)):
+    """手动重连机器人（网线在摄像头/机器人间切换后触发，无需重启服务）。
+
+    ★ 审计修复 P1-B2：本接口原来**无鉴权** —— 匿名可反复触发重连，
+      每次都会做 TCP 探测并强制切换真实/模拟模式（把演示环境拽回真机链路）。
+      属于会影响产线链路状态的写操作，必须持控制令牌。
+    """
     return collector.reconnect()
 
 
@@ -75,7 +79,14 @@ def rc_status():
 
 
 class ReadyIn(BaseModel):
-    prog: Optional[int] = None   # 缺省用 config motion.jog.service_program
+    # ★ 全维度审查 B-01：范围约束 + 服务端白名单（见 rc_ready.allowed_programs）
+    prog: Optional[int] = Field(default=None, ge=1, le=9999)
+
+
+class ReadyCancelIn(BaseModel):
+    """取消就绪入参。★ servo_off 默认 False：停程序 ≠ 断伺服，
+    默认只做"最轻的那一步"，要下电必须由操作者显式勾选。"""
+    servo_off: bool = False
 
 
 @router.post("/ready")
@@ -86,13 +97,40 @@ def ready(body: Optional[ReadyIn] = None, request: Request = None,
     ★ 本身就是真机寄存器写操作：需控制令牌 + 双确认总闸（EFORT_REAL_MOTION=1
       且 motion.real_write=true）。总闸没开时明确拒绝并解释怎么开。
     """
-    ip = request.client.host if (request and request.client) else ""
+    # ★ 全维度审查 B-24：审计事件带真实操作人与真实 IP（原 actor 硬编码 "web"）
+    from app.api.auth import _client_ip, token_role
+    ip = _client_ip(request)
+    actor = token_role(tok) or "web"
     from app.services.events import emit as emit_event
     r = _ready.ready(prog=(body.prog if body else None),
                      on_step=lambda s, m: None)
     emit_event("control", "info" if r.get("ok") else "warn", "control.ready_request",
                "一键就绪：%s" % ("成功" if r.get("ok") else (r.get("error") or "失败")),
-               {"steps": r.get("steps", [])}, actor="web", ip=ip)
+               {"steps": r.get("steps", []), "prog": (body.prog if body else None)},
+               actor=actor, ip=ip)
+    return r
+
+
+@router.post("/ready/cancel")
+def ready_cancel(body: Optional[ReadyCancelIn] = None, request: Request = None,
+                 tok: str = Depends(require_control)):
+    """取消就绪：停止点动服务程序，可选关闭伺服。
+
+    用于"一键就绪"后想恢复到非就绪状态（如切换档位、调整参数）。
+    不做急停，只是让控制器程序停止运行，伺服可选是否下电。
+    ★ 与 /ready 同级的真机写操作：同样要控制令牌 + 双确认总闸。
+    """
+    # ★ 全维度审查 B-24：审计事件带真实操作人与真实 IP
+    from app.api.auth import _client_ip, token_role
+    ip = _client_ip(request)
+    actor = token_role(tok) or "web"
+    from app.services.events import emit as emit_event
+    # ★ 走 _ready.cancel()（与 /ready 同一个实例）：它内部拿 _busy_lock + motion._exec_lock，
+    #   保证取消就绪不会插进飞行中的点动/下发序列 —— 裸函数版没有这层互斥。
+    r = _ready.cancel(servo_off=bool(body.servo_off) if body else False)
+    emit_event("control", "info" if r.get("ok") else "warn", "control.ready_cancel",
+               "取消就绪：%s" % ("成功" if r.get("ok") else (r.get("error") or "失败")),
+               {"steps": r.get("steps", [])}, actor=actor, ip=ip)
     return r
 
 

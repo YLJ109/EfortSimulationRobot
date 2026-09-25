@@ -86,7 +86,7 @@ def _row(r) -> dict:
 @router.get("/status")
 def api_status():
     """相机服务状态 + 摄入状态（前端一个接口拿全）。"""
-    st, cam, err = camera_client.get_json("/vision/status", timeout=2.0)
+    st, cam, err = camera_client.get_json("/vision/status", timeout=5.0)
     return {
         "camera": cam if (st == 200 and not err) else None,
         "camera_ok": st == 200 and not err,
@@ -118,7 +118,7 @@ def api_image(p: str = Query(..., description="相对 VISION_DIR 的路径（来
 @router.get("/card")
 def api_card():
     """色卡 + 当前标定（前端标定面板用）。"""
-    st, cam, err = camera_client.get_json("/vision/status", timeout=2.0)
+    st, cam, err = camera_client.get_json("/vision/status", timeout=5.0)
     if st != 200 or err or not cam:
         return {"ok": False, "error": err or "相机服务不可用", "card": {}, "calib": {}}
     return {"ok": True, "card": cam.get("card") or {},
@@ -266,6 +266,12 @@ class VisionConfigIn(BaseModel):
     min_interval: Optional[float] = None
     save_on_detect: Optional[bool] = None
     reset_background: Optional[bool] = None
+    # ★ 审计修复 P0-cam-3: 三色置信度阈值 + 检测阈值表(部分覆盖)，
+    #   以前后端这条路是断的 —— 只能在相机服务上手改/手发，现场没法从界面调。
+    #   透传给相机服务，未知键由相机侧 norm_thr() 丢弃并限幅，不会因为脏值停摆。
+    min_conf: Optional[float] = Field(None, ge=0.0, le=1.0,
+                                      description="三色置信度阈值(0~1)")
+    thr: Optional[dict] = Field(None, description="检测阈值部分覆盖，如 {min_area_ratio:0.003}")
 
 
 @router.post("/config")

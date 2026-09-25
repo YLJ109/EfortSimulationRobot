@@ -14,7 +14,7 @@
 // =====================================================================
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from "vue";
 import Icon from "./Icon.vue";
-import { apiUrl, wsUrl } from "../config.js";
+import { apiUrl, wsEventsUrl } from "../config.js";
 import { apiControl } from "../net/control.js";
 import { useAuthStore } from "../stores/auth.js";
 
@@ -79,18 +79,23 @@ function qs() {
 }
 
 async function loadEvents() {
+  // ★ 修 401：/api/events 后端已挂 require_control（安全改动），裸 fetch 不带令牌 →
+  //   开机即挂载时每个未登录访客都会带出一条 401（浏览器对非 2xx 会自己打日志，JS 屏蔽不掉）。
+  //   与同文件 loadVersions 一致：未持有效令牌就不发请求；持令牌时用 apiControl 自动带 X-Control-Token。
+  if (!auth.controlActive) { items.value = []; return; }
   loading.value = true;
   try {
-    const r = await fetch(apiUrl("/events?" + qs()));
+    const r = await apiControl("/events?" + qs());
     if (r.ok) items.value = (await r.json()).items || [];
   } catch (e) { /* 静默 */ }
   finally { loading.value = false; }
 }
 
 async function loadStats() {
+  if (!auth.controlActive) { stats.value = { total: 0, by_category: {}, by_level: {} }; return; }
   try {
     const h = filt.hours !== "" ? `?hours=${filt.hours}` : "";
-    const r = await fetch(apiUrl("/events/stats" + h));
+    const r = await apiControl("/events/stats" + h);
     if (r.ok) stats.value = await r.json();
   } catch (e) { /* 静默 */ }
 }
@@ -194,16 +199,39 @@ async function doClear() {
   refreshAll();
 }
 
-function exportEvents(fmt) {
-  window.open(apiUrl(`/events/export?format=${fmt}&` + qs()), "_blank");
+async function exportEvents(fmt) {
+  // ★ /events/export 也是 require_control：window.open 带不了请求头 → 必然 401。
+  //   改为带令牌 fetch 后转 blob 下载。
+  if (!auth.controlActive) { auth.requestLogin(); return; }
+  try {
+    const r = await apiControl(`/events/export?format=${fmt}&` + qs());
+    if (!r.ok) return;
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `events.${fmt === "csv" ? "csv" : "json"}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) { /* 静默 */ }
 }
 
 // ---------------- WebSocket 实时追加 ----------------
+// ★ P1-B6：事件帧已从 /ws/pose 拆到 /ws/events，**必须持控制令牌**（带内握手）。
+//   未登录时不建立连接（连了也会被后端 4401 拒），避免每 2s 一次的无谓重连。
 let ws = null;
 let wsTimer = null;
 function connectEvents() {
+  disconnectEvents();
+  if (!auth.controlActive) return;
   try {
-    ws = new WebSocket(wsUrl());
+    ws = new WebSocket(wsEventsUrl());
+    ws.onopen = () => {
+      try { ws.send(JSON.stringify({ type: "auth", token: auth.token })); }
+      catch (e) { /* 发不出去等后端超时关闭即可 */ }
+    };
     ws.onmessage = (ev) => {
       try {
         const m = JSON.parse(ev.data);
@@ -212,16 +240,26 @@ function connectEvents() {
         stats.value.total = (stats.value.total || 0) + 1;
       } catch (e) { /* 忽略坏帧 */ }
     };
-    ws.onclose = () => { if (live.value) wsTimer = setTimeout(connectEvents, 2000); };
-    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+    // 4401 = 令牌缺失/失效：不重试，等 controlActive 变化时由 watch 重建
+    ws.onclose = (ev) => {
+      if (ev && ev.code === 4401) return;
+      if (live.value) wsTimer = setTimeout(connectEvents, 2000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch (e) { /* 关旧连接失败无影响 */ } };
   } catch (e) { /* 后端不可用时静默降级为轮询 */ }
 }
 function disconnectEvents() {
   if (wsTimer) clearTimeout(wsTimer);
-  if (ws) { try { ws.close(); } catch (e) {} }
+  wsTimer = null;
+  if (ws) { try { ws.close(); } catch (e) { /* 关旧连接失败无影响 */ } }
   ws = null;
 }
 watch(live, (v) => { if (v) connectEvents(); else disconnectEvents(); });
+// ★ 拿到/失去控制权限都要重建：先连后登录的场景下，否则时间线永远不实时
+watch(() => auth.controlActive, (v) => {
+  if (v && live.value) connectEvents();
+  else if (!v) disconnectEvents();
+});
 
 // ---------------- 工具 ----------------
 function fmtTime(iso) {
@@ -419,7 +457,9 @@ watch(() => filt.q, () => {
 
 <style scoped>
 .ops { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 14px;
-  display: flex; flex-direction: column; gap: 12px; background: var(--bg); }
+  display: flex; flex-direction: column; gap: 12px; background: var(--bg); align-items: center; }
+/* ★ 需求：运维审计页内容宽度 1200px 并水平居中 */
+.ops > * { width: 100%; max-width: 1200px; }
 .ops-sec { display: flex; flex-direction: column; gap: 10px; }
 .ops-fill { flex: 1; min-height: 260px; }
 .ops-head { display: flex; align-items: center; gap: 8px; color: var(--txt); font-size: 13px; }

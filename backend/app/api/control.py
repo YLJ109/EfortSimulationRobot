@@ -10,13 +10,14 @@ from __future__ import annotations
 import math
 import json
 import os
+import threading
 import time
 import xml.etree.ElementTree as ET
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field, model_validator
 
 from app.api.auth import require_control, token_role
 from app.core import frames_config as fc
@@ -28,12 +29,26 @@ from app.services.collector import collector
 from app.services.events import emit as emit_event
 from app.services.jog import jog
 from app.services.kinematics import (
-    fk_matrix, ikine, invert, matrix_to_rpy, rpy_to_matrix, tcp_of,
+    fk_matrix, ikine, invert, matrix_to_rpy, pose_of, rpy_to_matrix, tcp_of,
 )
-from app.services.motion import motion
+# ★ 审计修复 P1-E1：限位的**读取与判定**只有一个实现在 services/limits.py。
+#   本文件原先那份 `zip` 版 _in_limits 有两个问题：q 比限位短时后面的轴会被静默
+#   漏查；NaN 的比较恒为 False，配合不同的写法会被判成"在限内"。
+#   这里只留同名薄封装，调用点一个都不用改 —— 批量改名反而容易漏。
+from app.services.limits import in_limits as _check_in_limits
+from app.services.limits import load_limits as _load_limits
+from app.services.limits import violations as _violations_of
+from app.services.motion import motion, real_write_enabled
 from app.services.runmode import MODES as RUN_MODES
 from app.services.runmode import runmode
 from app.services.safety_guard import check as guard_check
+# ★ 全维度审查 B-12：点位关节角解析的唯一 fail-safe 实现
+from app.utils.joints import parse_joints
+# ★ 全维度审查：速度/轴锁常量唯一来源
+from app.core.safety_const import SPEED_MIN, SPEED_MAX, clamp_speed
+from app.core.logger import get_logger
+
+log = get_logger("control")
 
 # ★ 所有控制类接口需持管理员控制令牌（阶段 1 鉴权门）
 router = APIRouter(prefix="/api/control", tags=["control"], dependencies=[Depends(require_control)])
@@ -57,17 +72,15 @@ def _actor(tok: str) -> str:
 
 # ---------- 工具 ----------
 def _limits() -> List[dict]:
-    lim = get_config().get("joint_limits", default=[])
-    if lim:
-        return lim
-    return [{"name": f"J{i + 1}", "min": -180, "max": 180} for i in range(6)]
+    # ★ 审计修复 P1-E1：统一由 limits.load_limits() 给出 —— 长度恒为 6、缺项补默认、
+    #   单条写坏只影响该条。原实现直接把 config 的原始 list 丢出去，
+    #   配置少写一条时 `zip` 会漏查后面的轴。
+    return _load_limits()
 
 
 def _in_limits(q: List[float], limits: List[dict], tol: float = 1e-6) -> bool:
-    for v, lim in zip(q, limits):
-        if v < float(lim["min"]) - tol or v > float(lim["max"]) + tol:
-            return False
-    return True
+    # ★ 审计修复 P1-E1：判据（长度 → 有限性 → 区间）统一在 limits.in_limits()。
+    return _check_in_limits(q, limits, tol)
 
 
 def _start_joints(current: Optional[List[float]]) -> List[float]:
@@ -112,12 +125,11 @@ def _solve_tcp(tcp: dict, current: Optional[List[float]] = None,
 
     r = _ik_best(target, q0, limits, rw)
     q = r["joints"]
-    violations = []
-    for i, (v, lim) in enumerate(zip(q, limits)):
-        lo, hi = float(lim["min"]), float(lim["max"])
-        if v < lo or v > hi:
-            violations.append({"joint": lim.get("name", f"J{i + 1}"),
-                               "value": round(v, 2), "min": lo, "max": hi})
+    # ★ 审计修复 P1-E1：这里原本是第二份手写循环，与 _in_limits 各查各的 ——
+    #   两边判据不同（这份没有 NaN 检查、也没有容差），于是同一个 IK 结果可以
+    #   同时给出 `solver.in_limits=True` 和一条非空 violations。
+    #   现在与 _in_limits 共用同一份代码，两者恒一致。
+    violations = _violations_of(q, limits)
     solver = {
         "type": "ik", "ok": r["ok"], "iters": r["iters"],
         "pos_err_mm": r["pos_err"], "rot_err_deg": r["rot_err_deg"],
@@ -208,12 +220,9 @@ def _compute_preview(mode: str = "joint", joints: Optional[List[float]] = None,
         return {**result, "error": "未知模式: " + mode}
 
     # ---- 限位校验 ----
-    violations = []
-    for i, (v, lim) in enumerate(zip(q_target, limits)):
-        lo, hi = float(lim["min"]), float(lim["max"])
-        if v < lo or v > hi:
-            violations.append({"joint": lim.get("name", f"J{i + 1}"),
-                               "value": round(v, 2), "min": lo, "max": hi})
+    # ★ 审计修复 P1-E1：与 _in_limits 共用同一份判据 —— 结果里的 `ok`（用 violations
+    #   算）和 warnings（用 _in_limits 算）不再可能互相矛盾。
+    violations = _violations_of(q_target, limits)
     result["violations"] = violations
     result["target"] = [round(v, 3) for v in q_target]
 
@@ -258,9 +267,27 @@ class IkIn(BaseModel):
     keep_orientation: bool = True          # True 保持当前姿态; False 仅约束位置
 
 
+class FkIn(BaseModel):
+    """正运动学：给定 6 关节角，返回末端位姿(x,y,z mm + rx,ry,rz deg)。
+
+    ★ 与 /ik 是**同一套约定**（kinematics.pose_of ↔ _solve_tcp/rpy_to_matrix），
+      前端"机器人坐标系"六个滑动条(位置 X/Y/Z + 姿态 A/B/C)的当前值就取自这里 ——
+      避免前端自己算一套欧拉角，两边约定不一致会导致"拖动方向莫名其妙"。
+    """
+    joints: List[float] = Field(..., min_length=6, max_length=6)
+
+
+@router_ro.post("/fk")
+def api_fk(body: FkIn):
+    """只算不发：关节角 → 末端位姿。供"机器人坐标系"六维滑块的当前值。"""
+    p = pose_of([float(v) for v in body.joints])
+    return {"ok": True, **p, "readonly": True}
+
+
 @router_ro.post("/ik")
 def api_ik(body: IkIn):
-    """机器人模式操控：末端沿 X/Y/Z 平移，反解 6 关节角。只算不发，零风险（无控制令牌亦可调用）。"""
+    """机器人模式操控：末端沿 X/Y/Z 平移（或给定姿态绕 X/Y/Z 转），反解 6 关节角。
+    只算不发，零风险（无控制令牌亦可调用）。"""
     q, solver, violations = _solve_tcp(body.tcp.model_dump(), body.current,
                                        body.keep_orientation)
     return {
@@ -274,6 +301,43 @@ def api_ik(body: IkIn):
     }
 
 
+@router_ro.get("/programs")
+def api_programs_ro():
+    """只读：programs 目录下的可执行程序文件名（模拟仿真页用来选 XPL）。
+
+    ★ 只回**文件名**，不回内容也不回绝对路径以外的信息；公开只读是刻意的 ——
+      模拟仿真页是公开页，读一份程序清单本身不产生任何运动。
+    """
+    base = _program_dir()
+    try:
+        names = sorted(
+            n for n in os.listdir(base)
+            if n.lower().endswith((".xpl", ".json")) and os.path.isfile(os.path.join(base, n))
+        )
+    except Exception:
+        names = []
+    return {"dir": base, "items": names, "readonly": True}
+
+
+@router_ro.get("/file-source")
+def api_file_source(name: str = Query(..., min_length=1, max_length=200)):
+    """只读：读 programs 目录下某个程序文件的**文本内容**（供仿真页预览/解析）。
+
+    ★ 路径穿越防护复用 `_safe_file`（只认文件名、commonpath 必须落在 programs 内），
+      不另写一份 —— 两份判据必然漂移，那是目录穿越漏洞的标准成因。
+    ★ 只读：本接口不解析、不校验、更不下发；真正执行仍走 /run-file（需控制令牌）。
+    """
+    p = _safe_file(name)
+    if not p:
+        raise HTTPException(404, "文件不存在或不在程序目录内")
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(512 * 1024)   # 512KB 上限，防止把超大文件整个拖进浏览器
+    except OSError as e:
+        raise HTTPException(500, "读取失败：%s" % e)
+    return {"ok": True, "name": os.path.basename(p), "text": text, "readonly": True}
+
+
 # =====================================================================
 # 执行引擎 (阶段 2): 真实下发受 require_control 鉴权门保护
 # =====================================================================
@@ -283,8 +347,19 @@ class MoveIn(BaseModel):
     point_id: Optional[int] = None
     # ★ 速度硬下限 5%（SPEED_MIN）：无论前端/调用方传什么，都拒绝低于 5% 的请求，
     #   杜绝"很快"的误发。默认也取 5，没传 speed 时就按最慢执行。
-    speed_pct: int = Field(default=5, ge=5, le=100)
+    speed_pct: int = Field(default=SPEED_MIN, ge=SPEED_MIN, le=SPEED_MAX)
     dwell_ms: int = Field(default=0, ge=0, le=60000)
+
+    @model_validator(mode="after")
+    def _must_have_target(self):
+        """★ 全维度审查 B-11：空 body（既不传 joints 也不传 point_id）原本会走到
+        `[float(x) for x in target]` 对 None 迭代 → 500 INTERNAL_ERROR，
+        且审计事件也没写。这里在入参层就明确报 422。"""
+        if not self.joints and self.point_id is None:
+            raise ValueError("必须提供 joints 或 point_id 之一")
+        if self.joints is not None and len(self.joints) != 6:
+            raise ValueError("joints 必须为 6 个关节角")
+        return self
 
 
 @router.post("/move")
@@ -298,10 +373,12 @@ def api_move(body: MoveIn, tok: str = Depends(require_control)):
             s.close()
         if not p:
             raise HTTPException(404, "点位不存在")
+        # ★ 全维度审查 B-12：点位 joints 解析失败一律**拒绝下发**。
+        #   原实现 `except: target = [0,0,0,0,0,0]` 会把机器人送向全零位。
         try:
-            target = json.loads(p.joints or "[0,0,0,0,0,0]")
-        except Exception:
-            target = [0, 0, 0, 0, 0, 0]
+            target = parse_joints(p.joints, where=f"点位「{p.name}」")
+        except ValueError as e:
+            raise HTTPException(400, str(e) + "，已拒绝下发")
     # ---------- 围栏互锁（阶段 4）----------
     # 前端会在 SafetyPanel 里实时算余量并上报；这里做"服务端兜底"，
     # 就算有人绕过界面直接调 API，危险状态下也发不下去。
@@ -318,7 +395,19 @@ def api_move(body: MoveIn, tok: str = Depends(require_control)):
                    f"围栏互锁未生效仍下发：{reason}",
                    {"target": target}, actor=_actor(tok))
 
-    res = motion.command([float(x) for x in target], body.speed_pct, body.dwell_ms)
+    # ★ 全维度审查 B-13：真机下发前补档位检查。
+    #   原实现只在点动（jog._block_reason）里有档位判据，/move 与 /run-file 没有
+    #   → T1/T2 档下寄存器写得进去但机器人不动，接口仍返回 ok:true（假成功）。
+    if real_write_enabled():
+        mok, mwhy, _mst = runmode.check_jog()
+        if not mok:
+            emit_event("control", "warn", "control.move_blocked",
+                       f"档位不允许下发：{mwhy}",
+                       {"target": target}, actor=_actor(tok))
+            raise HTTPException(409, detail=f"档位不允许下发：{mwhy}")
+
+    res = motion.command([float(x) for x in target], clamp_speed(body.speed_pct),
+                         body.dwell_ms)
     emit_event("control", "info" if res.get("ok") else "warn",
                "control.move",
                f"下发目标到位（{res.get('mode', '?')}）" if res.get("ok")
@@ -433,9 +522,14 @@ def _parse_xpl(path: str):
         toks = s.split()
         cmd = toks[0].upper()
 
-        def _f(i):
+        # ★ 审计修复 P1-E13（ruff B023）：`_f` 是在 for 循环体内定义的函数，
+        #   按 Python 的闭包语义它捕获的是**循环变量 `toks` 本身**，不是这一刻的值。
+        #   目前 `_f` 都在同一次迭代里被同步调用，所以现在没有 bug —— 但只要有人
+        #   将来把它存进 items 再延后调用，读到的就是下一行的 toks（串行）。
+        #   用默认参数把"这一拍的 toks"钉死，彻底断掉这类隐患。
+        def _f(i, _toks=toks):
             try:
-                return float(toks[i])
+                return float(_toks[i])
             except Exception:
                 return None
 
@@ -556,7 +650,10 @@ def _steps_from(items, db) -> List[dict]:
         if not isinstance(it, dict):
             out.append({"index": idx, "ok": False, "error": "步骤格式非法"})
             continue
-        sp = int(it.get("speed_pct") or 100)
+        # ★ P1-B1：步骤未显式指定速度时用 None（= 由调用方/请求决定）。
+        #   原实现缺省写死 100，导致 run-file 请求的 speed_pct=5 被完全覆盖，
+        #   真实执行恒 100% —— 这与"速度硬下限 5%"的安全承诺直接冲突。
+        sp = int(it["speed_pct"]) if it.get("speed_pct") else None
         dw = int(it.get("dwell_ms") or 0)
         pid = it.get("point_id", it.get("point"))
         if pid is not None and str(pid).strip() != "":
@@ -567,9 +664,11 @@ def _steps_from(items, db) -> List[dict]:
                 out.append({"index": idx, "ok": False, "error": f"点位 #{pid} 不存在"})
                 continue
             try:
-                joints = [float(x) for x in json.loads(row.joints or "[0,0,0,0,0,0]")]
-            except Exception:
-                joints = [0.0] * 6
+                joints = parse_joints(row.joints, where=f"点位「{row.name}」")
+            except ValueError as e:
+                out.append({"index": idx, "name": row.name, "point_id": row.id,
+                            "ok": False, "error": str(e)})
+                continue
             st = {"index": idx, "name": row.name, "point_id": row.id,
                   "mode": "joint", "joints": joints, "speed_pct": sp, "dwell_ms": dw}
             if row.kind == "cartesian":
@@ -606,11 +705,16 @@ def _steps_from(items, db) -> List[dict]:
 def _point_steps(row) -> List[dict]:
     """数据库点位 → 单步列表。"""
     try:
-        joints = [float(x) for x in json.loads(row.joints or "[0,0,0,0,0,0]")]
-    except Exception:
-        joints = [0.0] * 6
+        joints = parse_joints(row.joints, where=f"点位「{getattr(row, 'name', '')}」")
+    except ValueError as e:
+        # ★ B-12：不返回全零位姿；让上层看到明确失败
+        return [{"index": 1, "name": getattr(row, "name", ""),
+                 "point_id": getattr(row, "id", None),
+                 "ok": False, "error": str(e)}]
+    # ★ P1-B1：速度留空（None）→ 由 run-file 请求的 speed_pct 决定并夹取，
+    #   不再硬写 100（原实现让"请求 5%"永远无效）。
     st = {"index": 1, "name": row.name, "point_id": row.id,
-          "mode": "joint", "joints": joints, "speed_pct": 100, "dwell_ms": 0}
+          "mode": "joint", "joints": joints, "speed_pct": None, "dwell_ms": 0}
     if row.kind == "cartesian":
         try:
             t = json.loads(row.tcp or "null")
@@ -719,6 +823,97 @@ class RunFileIn(BaseModel):
     # ★ 速度硬下限 5%：同 MoveIn，杜绝"很快"的误发。
     speed_pct: int = Field(default=5, ge=5, le=100)
     steps: int = Field(default=40, ge=2, le=600)
+    # ★ 审计修复 P0-7：客户端可指定本次执行的 run_id，用于"中止"接口精确匹配。
+    #   不传则由后端生成（此时前端仍可用 /control/run-cancel 按文件名中止，
+    #   见 api_run_cancel 的 fallback）。
+    run_id: Optional[str] = Field(default=None, max_length=64)
+
+
+# =====================================================================
+# ★ 审计修复 P0-7：程序执行的"中止"机制。
+#   原实现前端 abortRun() 只把 runAbort 标志置 true，**后端根本不知道** ——
+#   界面显示"已中止"，机器人却把整份文件跑完。这在真机上是严重安全事故。
+#   现在：前端调 POST /control/run-cancel → 后端在**每一步之前**检查取消表 →
+#   命中就 break 并回传 cancelled=true。
+#   说明：取消表是进程级内存表（重启即清）。单机部署足够；将来若做多实例，
+#   应换成 Redis/pub-sub，接口语义保持不变。
+# =====================================================================
+_RUN_CANCEL: Dict[str, float] = {}      # run_id -> 请求取消的时间戳
+_RUN_CANCEL_LOCK = threading.Lock()
+_RUN_CANCEL_TTL = 3600.0                # 中止标记保留 1h，防止孤儿条目堆积
+_RUN_ACTIVE: Dict[str, Dict] = {}       # run_id -> {"filename":..., "started_at":...}
+
+
+def _cancel_expired() -> None:
+    now = time.time()
+    with _RUN_CANCEL_LOCK:
+        for k in [k for k, t0 in _RUN_CANCEL.items() if now - t0 > _RUN_CANCEL_TTL]:
+            _RUN_CANCEL.pop(k, None)
+
+
+def _is_cancelled(run_id: Optional[str]) -> bool:
+    if not run_id:
+        return False
+    with _RUN_CANCEL_LOCK:
+        return run_id in _RUN_CANCEL
+
+
+class RunCancelIn(BaseModel):
+    run_id: Optional[str] = Field(default=None, max_length=64)
+    filename: Optional[str] = Field(default=None, max_length=200)
+
+
+def _interruptible_sleep(seconds: float, run_id: Optional[str]) -> bool:
+    """可打断的等待：每 100ms 查一次取消表。返回 True 表示被中止。"""
+    end = time.time() + max(0.0, seconds)
+    while time.time() < end:
+        if _is_cancelled(run_id):
+            return True
+        time.sleep(min(0.1, max(0.0, end - time.time())))
+    return _is_cancelled(run_id)
+
+
+@router.post("/run-cancel")
+def api_run_cancel(body: RunCancelIn, tok: str = Depends(require_control)):
+    """中止正在执行的文件/程序。
+
+    ★ P0-7：这是"中止"按钮唯一有效的后端实现。支持按 run_id 精确中止，
+      未给 run_id 时按 filename 匹配当前在跑的目标（兼容旧前端）。
+    """
+    _cancel_expired()
+    matched: List[str] = []
+    with _RUN_CANCEL_LOCK:
+        if body.run_id:
+            _RUN_CANCEL[body.run_id] = time.time()
+            matched.append(body.run_id)
+        elif body.filename:
+            for rid, info in list(_RUN_ACTIVE.items()):
+                if info.get("filename") == body.filename:
+                    _RUN_CANCEL[rid] = time.time()
+                    matched.append(rid)
+        else:
+            # 既没 run_id 也没 filename → 中止**当前所有**在跑的目标（兜底，
+            # 保证"中止"按钮按下一定有效，不会出现点了没反应）
+            for rid in list(_RUN_ACTIVE.keys()):
+                _RUN_CANCEL[rid] = time.time()
+                matched.append(rid)
+            for rid in list(_RUN_CANCEL.keys()):
+                matched.append(rid)
+    # ★ 全维度审查 B-04：打标记只作用于"步骤之间"。飞行中的那一发需要显式下发
+    #   CMD_STOP(0x1005) 才能让常驻点动服务程序回到 WAIT。
+    #   这里只发"停止程序"，**不发急停**（不切断伺服），是可逆的最小动作。
+    stop_sent = False
+    if matched:
+        try:
+            ok, err = motion.modbus.rc_command(0x1005)   # CMD_STOP
+            stop_sent = bool(ok) and err is None
+        except Exception as e:  # noqa
+            log.warning("中止时下发停止命令失败: %s", e)
+    emit_event("control", "warn", "control.run_cancel",
+               f"用户请求中止执行（{body.filename or body.run_id or '全部'}）",
+               {"run_id": body.run_id, "filename": body.filename,
+                "matched": matched, "stop_sent": stop_sent}, actor=_actor(tok))
+    return {"ok": True, "matched": sorted(set(matched)), "stop_sent": stop_sent}
 
 
 @router.get("/files")
@@ -734,6 +929,14 @@ def api_files(tok: str = Depends(require_control)):
 @router.post("/run-file")
 def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
     """按文件名执行：dry_run=True 试运行测试（只校验不下发），False 真实下发。"""
+    # ★ P0-7：为本次执行分配 run_id 并登记，供 /control/run-cancel 精确中止。
+    run_id = (body.run_id or "").strip() or ("run-%d" % time.time_ns())
+    _cancel_expired()
+    with _RUN_CANCEL_LOCK:
+        _RUN_CANCEL.pop(run_id, None)     # 同一 run_id 复用时先清掉旧的中止标记
+    _RUN_ACTIVE[run_id] = {"filename": body.filename,
+                           "started_at": time.time()}
+    cancelled = False
     db = SessionLocal()
     try:
         res = _resolve_file(body.filename, db)
@@ -755,11 +958,21 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
         total_ms = 0
 
         for st in res["steps"]:
+            # ★ P0-7：每一步开始前先查中止表 —— 这是"中止"真正生效的位置。
+            if _is_cancelled(run_id):
+                cancelled = True
+                break
             if st.get("ok") is False:
                 results.append(st)
                 ok_all = False
                 continue
+            # ★ P1-B1：速度必须夹到 [5,100]。
+            #   原实现 `int(st.get("speed_pct") or body.speed_pct)`：步骤里只要
+            #   带了 speed_pct（_steps_from 缺省写 100），请求里的 5% 就被完全
+            #   覆盖 → 真实执行恒 100%。现在：步骤未显式指定时继承请求值，
+            #   最后统一夹取，杜绝"请求 5% 却按 100% 跑"。
             sp = int(st.get("speed_pct") or body.speed_pct)
+            sp = max(5, min(100, sp))
             dw = int(st.get("dwell_ms") or 0)
 
             # ---------- io 步（XPL 吸气/放气/等待）：无移动目标 ----------
@@ -769,8 +982,9 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
                 if st.get("op") == "wait":
                     if body.dry_run:
                         total_ms += dw
-                    else:
-                        time.sleep(max(0.05, dw / 1000.0))
+                    elif _interruptible_sleep(max(0.05, dw / 1000.0), run_id):
+                        cancelled = True
+                        break
                 results.append({
                     "index": st["index"], "name": st.get("name") or st.get("op"),
                     "ok": st.get("ok") is not False, "op": st.get("op"),
@@ -827,29 +1041,51 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
                     break
                 target = [float(v) for v in q]
 
-            r = motion.command([float(x) for x in target], sp, dw)
+            # ★ P0-7：真实下发前再查一次（guard_check 本身可能耗时）
+            if _is_cancelled(run_id):
+                cancelled = True
+                break
+            # ★ 全维度审查 B-04：把中止判据接进**飞行中的这一发**。
+            #   原实现只打 _RUN_CANCEL 标记 → 下一步循环开头才生效，而当前这一步
+            #   已经进 motion.command()，rc_jog_execute 同步阻塞最长 30s 且无
+            #   abort_check → 界面显示"已中止"、机器人还走完这一发。
+            r = motion.command([float(x) for x in target], sp, dw,
+                               abort_check=lambda: _is_cancelled(run_id))
             total_ms += dw + 300
             results.append({
                 "index": st["index"], "name": st.get("name"),
                 "ok": bool(r.get("ok")), "mode": r.get("mode"),
                 "target": [round(float(v), 2) for v in target],
+                "speed_pct": sp,
                 "error": r.get("error"), "readonly": False,
             })
             if not r.get("ok"):
                 ok_all = False
                 break
-            time.sleep(max(0.15, dw / 1000.0 + 0.2))
+            if _interruptible_sleep(max(0.15, dw / 1000.0 + 0.2), run_id):
+                cancelled = True
+                break
 
         payload = {
-            "ok": ok_all, "dry_run": body.dry_run,
+            "ok": ok_all and not cancelled, "dry_run": body.dry_run,
             "kind": res["kind"], "name": res["name"], "source": res.get("source"),
             "path": res.get("path"), "id": res.get("id"),
             "count": len(results),
             "passed": sum(1 for r in results if r.get("ok")),
             "duration_ms": total_ms,
             "readonly": bool(body.dry_run),
+            # ★ P0-7：明确告诉前端"是被中止的"，不是跑失败
+            "cancelled": cancelled,
+            "run_id": run_id,
             "steps": results,
         }
+        if cancelled:
+            emit_event("control", "warn", "control.run_cancelled",
+                       f"执行已被用户中止（第 {len(results) + 1} 步前）：{res['name']}",
+                       {"filename": body.filename, "run_id": run_id,
+                        "done": len(results), "speed_pct": body.speed_pct},
+                       actor=_actor(tok))
+            return payload
         if body.dry_run:
             emit_event("control", "info" if ok_all else "warn", "control.dry_run",
                        ("试运行通过：" if ok_all else "试运行发现问题：") + str(res["name"]),
@@ -865,6 +1101,10 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
                        actor=_actor(tok))
         return payload
     finally:
+        # ★ P0-7：无论正常结束/异常/中止，都要注销在跑登记并清掉中止标记
+        with _RUN_CANCEL_LOCK:
+            _RUN_ACTIVE.pop(run_id, None)
+            _RUN_CANCEL.pop(run_id, None)
         db.close()
 
 
@@ -877,9 +1117,25 @@ def api_estop(tok: str = Depends(require_control)):
     #   command() 会立刻拒绝点动线程后续的任何下发，无追加运动。
     st = motion.estop()
     jog.stop("estop")
+    # ★ P0-7：急停必须同时中止在跑的文件执行 —— 否则急停复位后程序会继续往下跑。
+    with _RUN_CANCEL_LOCK:
+        for rid in list(_RUN_ACTIVE.keys()):
+            _RUN_CANCEL[rid] = time.time()
+    # ★ 全维度审查 B-06：急停**未送达**必须显式报错，不能显示"已停"。
+    if not st.get("estop_sent"):
+        emit_event("safety", "critical", "control.estop_failed",
+                   "急停命令未送达控制器：%s" % (st.get("estop_error") or "未知原因"),
+                   {"mode": st.get("mode"), "error": st.get("estop_error")},
+                   actor=_actor(tok))
+        raise HTTPException(
+            status_code=503,
+            detail=("急停命令未送达控制器（%s）。请检查链路后重试，"
+                    "必要时立即使用示教器硬件急停按钮。"
+                    % (st.get("estop_error") or "未知原因")))
     emit_event("control", "critical", "control.estop",
                "紧急停止已触发，执行引擎已锁定",
-               {"mode": st.get("mode"), "stopped": st.get("stopped")},
+               {"mode": st.get("mode"), "stopped": st.get("stopped"),
+                "estop_sent": True},
                actor=_actor(tok))
     return st
 

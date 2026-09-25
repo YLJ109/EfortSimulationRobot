@@ -55,8 +55,89 @@ RGB_CARD: Dict[str, str] = {"红": "#E02020", "绿": "#1FA74A", "蓝": "#1F4FD8"
 HUE_S_MIN = 70.0
 HUE_V_MIN = 60.0
 
+# =====================================================================
+# ★ 审计修复 P0-cam-3：检测阈值集中成"一张可覆盖的默认表"。
+#   以前这些数字散落在 hsv_color_mask / find_rectangles / _hue_vote 的函数签名里，
+#   现场想按光照、物料大小微调只能改源码重部署；现在：
+#     - 默认值只在这里定义一次，下面各函数的默认参数一律取自本表（不改算法结构）；
+#     - 相机服务 `POST /vision/config {"thr": {...}}` 可覆盖任意子集（见 camera_service）；
+#     - norm_thr() 丢弃未知键 + 逐键限幅，配置写错也拆不掉这道门。
+#   ★ 本次唯一放宽的一项：min_area_ratio 0.005 → 0.003。
+#     理由（纯代码事实，非猜测）：检测统一跑在缩放后的小图 STREAM_MAX_W=960 上
+#     （camera_service.py:100/728-730），960x540 下 0.005 ≈ 2592px² ≈ 51x51；
+#     而同一张表里的 min_side=30 只要求 30x30=900px² —— 两个下限互相打架，
+#     真正生效的是随分辨率缩放的面积比：小件/远一点的物料必须长到 ~51px 宽才可能
+#     被检出，表现为"偶尔才检测到"。改成 0.003 ≈ 1555px² ≈ 39x39 后，
+#     与 min_side=30 基本对齐（短边判据重新成为主约束），且仍然：
+#       远高于 200px 的绝对噪声底，fill/solidity/长宽比/锐角/色相一致性一条没松。
+#     面积**上限**与其它阈值本次只做成可配置、默认值一律不动【证据不足，未放宽默认值】。
+DEFAULT_THR: Dict[str, float] = {
+    "min_area_ratio": 0.003,   # 面积下限(占整帧比例)；0.005 → 0.003，理由见上
+    "max_area_ratio": 0.60,    # 面积上限(整屏大块挡掉)。默认不变，可配置
+    "min_side": 30,            # 短边像素下限。默认不变
+    "mask_sat_min": 60,        # HSV 彩色前景掩膜 S 下限。80 → 60（现场光照偏暗时，
+                               #   红/绿/蓝实物饱和度常落到 60~80，旧值会让目标整体漏检）
+    "mask_val_min": 35,        # HSV 彩色前景掩膜 V 下限。40 → 35（略放宽暗部，勿过低以免引噪）
+    "hue_s_min": 60,           # 色相投票最低饱和度。70 → 60，与掩膜门槛对齐
+    "hue_v_min": 50,           # 色相投票最低亮度。60 → 50，兼顾偏暗光照
+    # ★ 参考实现（visual_object_detector.py 的 ColorPatchDetector.MIN_AREA=3000）：
+    #   在"只报一个最大目标"的口径下，加一道**绝对面积下限**比只按比例更稳 ——
+    #   远处的小噪点/反光碎块不会被当成"最大目标"顶上来。
+    #   默认 2500px：介于参考的 3000（640×480 帧）与本项目 960 宽帧的 0.003 比例之间，
+    #   两者取 max，小物料仍能被检出，纯噪点被挡掉。可按现场用 /vision/config 覆盖。
+    "min_area_abs": 2500,
+    # ★★ 2026-09-25 二次优化（用户现场反馈"物体移动时检测不到 / 只出现矩形的一部分"）：
+    #   把"必须是标准矩形"的三道门槛**放宽**，因为现场物料常常被遮挡、只露出一部分，
+    #   或被机械手/夹具压住边角 —— 过严的填充率/实心度会把整块拒掉（"只出现矩形的一部分"）。
+    #   放宽后仍保留"排除细长条 + 排除圆形"两个必要判据（圆形靠"是否存在锐角"剔除）。
+    "min_fill": 0.45,          # 最小外接矩形填充率下限（原写死 0.55）
+    "solidity_min": 0.75,      # 实心度下限（面积/凸包面积；原写死 0.90）
+    "aspect_max": 6.0,         # 长宽比上限（原写死 4.0；部分遮挡的长条仍可能是同一个物料）
+}
 
-def _hue_vote(bgr_roi):
+# 每个键的合法区间：越界一律夹回，不做"拒绝整包"，避免现场配置一个错值就全不检测。
+_THR_RANGE: Dict[str, Tuple[float, float]] = {
+    "min_area_ratio": (0.0001, 1.0),
+    "max_area_ratio": (0.01, 1.0),
+    "min_side": (4.0, 2000.0),
+    "mask_sat_min": (0.0, 255.0),
+    "mask_val_min": (0.0, 255.0),
+    "hue_s_min": (0.0, 255.0),
+    "hue_v_min": (0.0, 255.0),
+    "min_area_abs": (0.0, 5_000_000.0),
+    "min_fill": (0.05, 1.0),
+    "solidity_min": (0.05, 1.0),
+    "aspect_max": (1.0, 50.0),
+}
+
+
+def norm_thr(thr) -> Dict[str, float]:
+    """把外部阈值覆盖合并到 DEFAULT_THR（未知键丢弃、坏值忽略、越界夹紧）。
+
+    ★ 只接受"部分覆盖"：`norm_thr({"min_side": 40})` 返回完整表、只改 min_side，
+      这样调用方无需先拿到默认值，也不会因为漏传一个键把其它阈值清零。
+    """
+    out = dict(DEFAULT_THR)
+    if not isinstance(thr, dict):
+        return out
+    for k, v in thr.items():
+        if k not in _THR_RANGE or v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f != f:                      # NaN 会让所有比较变 False → 整条产线静默停摆
+            continue
+        lo, hi = _THR_RANGE[k]
+        out[k] = float(min(hi, max(lo, f)))
+    # 兜底：下限不能大于上限（否则一条候选都进不来，画面看着正常却永远不触发）
+    if out["min_area_ratio"] > out["max_area_ratio"]:
+        out["min_area_ratio"] = out["max_area_ratio"]
+    return out
+
+
+def _hue_vote(bgr_roi, s_min=None, v_min=None):
     """逐像素色相分箱投票判红/绿/蓝。返回 (name, ratio)。
 
     ratio = 多数色带像素数 / 彩色像素数（该候选色相的一致性）。
@@ -66,8 +147,11 @@ def _hue_vote(bgr_roi):
     """
     if bgr_roi is None or bgr_roi.size == 0:
         return ("", 0.0)
+    # ★ 审计修复 P0-cam-3: 饱和度/亮度门槛可由 DEFAULT_THR 覆盖（缺省=原值）
+    s_lim = HUE_S_MIN if s_min is None else float(s_min)
+    v_lim = HUE_V_MIN if v_min is None else float(v_min)
     hsv = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
-    sel = (hsv[..., 1] >= HUE_S_MIN) & (hsv[..., 2] >= HUE_V_MIN)
+    sel = (hsv[..., 1] >= s_lim) & (hsv[..., 2] >= v_lim)
     n = int(sel.sum())
     if n < 40:
         return ("", 0.0)
@@ -125,14 +209,19 @@ def classify_rgb(lab: Sequence[float], card: Optional[Dict[str, np.ndarray]] = N
             "alt": alt, "alt_de": alt_de, "chroma": round(chroma, 1)}
 
 
-def hsv_color_mask(bgr: np.ndarray, sat_min: int = 80, val_min: int = 40,
+def hsv_color_mask(bgr: np.ndarray, sat_min=None, val_min=None,
                    morph: int = 5) -> np.ndarray:
     """HSV 彩色前景掩膜（参照实时"彩色矩形目标"检测思路）。
 
     ★ 背景差分对"物体色≈背景色"的情形会漏检；而鲜艳物体的 HSV 高饱和特征
       与背景无关，OR 到分割掩膜上是对背景差分 / MOG2 的可靠兜底增强。
       只取高饱和度 + 非过暗区域（排除近黑/近白/灰），形态学闭合联通同色碎块。
+    ★ 审计修复 P0-cam-3: sat_min/val_min 缺省取自 DEFAULT_THR（可由 /vision/config 覆盖）。
     """
+    if sat_min is None:
+        sat_min = int(DEFAULT_THR["mask_sat_min"])
+    if val_min is None:
+        val_min = int(DEFAULT_THR["mask_val_min"])
     h, w = bgr.shape[:2]
     if h * w == 0:
         return np.zeros((h, w), np.uint8)
@@ -331,28 +420,41 @@ def diff_mask(frame_bgr: np.ndarray, background_bgr: np.ndarray,
     return m
 
 
-def find_rectangles(mask: np.ndarray, min_area_ratio: float = 0.005,
-                    max_area_ratio: float = 0.60, min_side: int = 30,
-                    aspect: Tuple[float, float] = (1.0, 4.0),
-                    rect_fill: float = 0.55, solidity: float = 0.90,
-                    max_items: int = 8) -> List[Dict[str, object]]:
+def find_rectangles(mask: np.ndarray, min_area_ratio=None,
+                    max_area_ratio=None, min_side=None,
+                    aspect=None,
+                    rect_fill=None, solidity=None,
+                    max_items: int = 8,
+                    min_area_abs=None) -> List[Dict[str, object]]:
     """从掩膜里挑"长方形物体"。返回 [{box, rect, area, fill, solidity}]。
 
-    ★ 筛选门槛对齐到实时"彩色矩形目标"检测算法（COLOR 参考实现）：
-      - 长宽比上限 4.0（ASPECT_MAX=4），下界 1.0 —— 正方形(等腰矩形)也认，
-        旧值 (1.2, 8.0) 会把正方形整块拒掉（正方形 ar=1.0 < 1.2 → 漏检）；
-      - 矩形填充率下限 0.55（MIN_RATIO=0.55），比旧 0.72 宽松，
-        实物边缘不平整/略倾斜时不再被误杀；
-      - solidity / 四顶点校验仍保留 —— 上传算法不校验这两项（圆形也会蒙混过关），
-        但"只认长方形"需要它们把圆形/异形剔除（离线回归 D 覆盖）。
+    ★ 现场口径（2026-09-25 二次放宽）：**不要求"标准矩形"** —— 物料常被遮挡/只露出一部分，
+      过严的填充率/实心度会把整块拒掉（表现为"只出现矩形的一部分"）。现在：
+      - 长宽比上限 6.0、填充率下限 0.45、实心度下限 0.75（都可由 /vision/config 覆盖）；
+      - 仍保留两道必要判据：① 排除细长条；② 排除圆形/正多边形（靠"是否存在锐角"）。
+    ★ 审计修复 P0-cam-3: 尺寸门槛缺省取自 DEFAULT_THR（可由 /vision/config 覆盖），
+      传 None = 用默认表，显式传值 = 完全沿用旧调用方式（离线脚本不受影响）。
     """
+    min_area_ratio = (DEFAULT_THR["min_area_ratio"] if min_area_ratio is None
+                      else float(min_area_ratio))
+    max_area_ratio = (DEFAULT_THR["max_area_ratio"] if max_area_ratio is None
+                      else float(max_area_ratio))
+    min_side = int(DEFAULT_THR["min_side"] if min_side is None else min_side)
+    min_area_abs = float(DEFAULT_THR["min_area_abs"] if min_area_abs is None else min_area_abs)
+    # ★ 2026-09-25：三道"矩形度"门槛也走阈值表（原写死在签名里），
+    #   现场可按物料被遮挡的程度用 /vision/config 调松紧，无需改代码重部署。
+    rect_fill = float(DEFAULT_THR["min_fill"] if rect_fill is None else rect_fill)
+    solidity = float(DEFAULT_THR["solidity_min"] if solidity is None else solidity)
+    aspect = tuple(aspect) if aspect is not None else (1.0, float(DEFAULT_THR["aspect_max"]))
     h, w = mask.shape[:2]
     total = float(h * w)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out: List[Dict[str, object]] = []
     for c in contours:
         area = float(cv2.contourArea(c))
-        if area < max(200.0, min_area_ratio * total) or area > max_area_ratio * total:
+        # ★ 面积下限 = max(绝对下限, 比例下限)：绝对下限挡远处小噪点（参考实现 MIN_AREA），
+        #   比例下限负责随分辨率自适应。
+        if area < max(min_area_abs, min_area_ratio * total) or area > max_area_ratio * total:
             continue
         (cx, cy), (rw, rh), ang = cv2.minAreaRect(c)
         if rw < 1 or rh < 1:
@@ -406,10 +508,40 @@ def find_rectangles(mask: np.ndarray, min_area_ratio: float = 0.005,
     return _nms(out, max_items)
 
 
-def debug_mask_contours(work: np.ndarray, mask: np.ndarray) -> str:
+def pick_best(results, conf_thr: float = 0.0) -> List[Dict[str, object]]:
+    """**只保留唯一目标**：先按置信度阈值过滤，再取面积最大者（面积并列取置信度高者）。
+
+    ★ 需求（对齐参考实现 visual_object_detector.py 的"只报最大的一个"）：
+      实时检测只报一个目标，判据是"最大的 + 置信度最高的"：
+        1) 先丢掉置信度不达标的候选（含"未知"色，其 conf 恒为 0）；
+        2) 在剩下的里取**面积最大**的；
+        3) 面积相同（几乎不可能，但保证确定性）时取置信度高的。
+      返回长度 0 或 1 的列表，调用方无需再判重。
+
+    ⚠ 注意：面积是"画框时的实际像素面积"，不是填充率；这样"大物料"优先，
+      而"小而实"的碎块（如反光斑）不会再顶掉真正的主体。
+    """
+    cand = []
+    for r in (results or []):
+        try:
+            conf = float((r.get("color") or {}).get("conf") or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf >= conf_thr:
+            cand.append((float(r.get("area") or 0.0), conf, r))
+    if not cand:
+        return []
+    cand.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return [cand[0][2]]
+
+
+def debug_mask_contours(work: np.ndarray, mask: np.ndarray, thr=None) -> str:
     """排查用：列出每个连通域的尺寸/填充率/长宽比/颜色/被滤原因。
     ★ 仅在引擎 debug=True 时调用（默认关），逐行打印到服务日志，不参与判色。
+    ★ 审计修复 P0-cam-3: 判据与 find_rectangles 用同一张阈值表，否则诊断会"说谎"
+      （阈值改了，日志还按旧值报"area超限"，排查会被带偏）。
     """
+    t = norm_thr(thr)
     total = float(mask.shape[0] * mask.shape[1]) or 1.0
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     lines = ["[mask 诊断] 连通域数=%d, 有效像素=%d (%.1f%%)"
@@ -427,15 +559,16 @@ def debug_mask_contours(work: np.ndarray, mask: np.ndarray) -> str:
         hull = cv2.contourArea(cv2.convexHull(c))
         sol = (area / hull) if hull > 0 else 0.0
         reasons = []
-        if area < max(200.0, 0.005 * total) or area > 0.60 * total:
+        if (area < max(200.0, t["min_area_ratio"] * total)
+                or area > t["max_area_ratio"] * total):
             reasons.append("area超限")
-        if w < 30 or h < 30:
-            reasons.append("边<30")
-        if ar < 1.0 or ar > 4.0:
+        if w < t["min_side"] or h < t["min_side"]:
+            reasons.append("边<%d" % int(t["min_side"]))
+        if ar < 1.0 or ar > t["aspect_max"]:
             reasons.append("长宽比%.2f超界" % ar)
-        if fill < 0.55:
+        if fill < t["min_fill"]:
             reasons.append("填充率%.2f" % fill)
-        if sol < 0.90:
+        if sol < t["solidity_min"]:
             reasons.append("实心度%.2f" % sol)
         # 颜色
         cs = ""
@@ -646,11 +779,25 @@ class VisionEngine:
                  roi: Optional[Tuple[int, int, int, int]] = None,
                  calib: Optional[Dict[str, object]] = None,
                  use_hsv_mask: bool = True,
-                 debug: bool = False):
+                 debug: bool = False,
+                 thr: Optional[Dict[str, object]] = None,
+                 color_only: bool = True):
         self.background = None if background is None else background.copy()
         self.use_mog2 = use_mog2 and background is None
         self.use_hsv = use_hsv_mask          # HSV 彩色前景增强(对鲜艳物体可靠兜底)
+        # ★ 参考实现（visual_object_detector.py）的核心简化：**只用颜色阈值**做前景，
+        #   不做背景差分/MOG2。原因：我们只认红/绿/蓝三色矩形，而"高饱和"这一条
+        #   本身就与背景无关，直接用 HSV 掩膜既稳又快；背景差分反而会因
+        #   "物体色≈背景色"或静止不出前景而漏检（现场"偶尔才检测到"的根因之一）。
+        #   ★ 默认 True（2026-09-25 起）= **实测路径与生产路径一致**：以前默认走背景差分，
+        #     而相机服务显式传 color_only=True 走颜色阈值 → "测的"和"跑的"不是同一条，
+        #     现场问题在离线回归里复现不出来。现在两边同源。
+        #     显式设了静态背景时相机服务会传 False（那才需要差分）。
+        self.color_only = bool(color_only)
         self.debug = debug                   # 诊断模式: 逐帧打印 mask 连通域, 默认关
+        # ★ 审计修复 P0-cam-3: 检测阈值随引擎携带（相机服务改配置时重建引擎即生效）。
+        #   缺省 = DEFAULT_THR 原值；传入的部分覆盖由 norm_thr 合并+限幅。
+        self.thr = norm_thr(thr)
         self.mog2 = (cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16,
                                                         detectShadows=True) if self.use_mog2 else None)
         self.roi = roi
@@ -686,12 +833,28 @@ class VisionEngine:
             work = frame[y:y + h, x:x + w]
         else:
             work = frame
-        mask = self._mask(work)
-        # ★ HSV 彩色前景增强：背景差分对"物体色≈背景色"会漏检，
-        #   鲜艳物体的高饱和特征与背景无关，OR 上去做可靠兜底。
-        if self.use_hsv:
-            mask = cv2.bitwise_or(mask, hsv_color_mask(work))
-        rects = find_rectangles(mask)
+        # ★ color_only（参考实现口径）：前景**只用颜色阈值**，不做背景差分/MOG2。
+        #   只认红/绿/蓝三色矩形时，高饱和与背景无关，这条最稳、最快。
+        if self.color_only:
+            mask = hsv_color_mask(work, sat_min=int(self.thr["mask_sat_min"]),
+                                  val_min=int(self.thr["mask_val_min"]))
+        else:
+            mask = self._mask(work)
+            # ★ HSV 彩色前景增强：背景差分对"物体色≈背景色"会漏检，
+            #   鲜艳物体的高饱和特征与背景无关，OR 上去做可靠兜底。
+            if self.use_hsv:
+                mask = cv2.bitwise_or(mask, hsv_color_mask(
+                    work, sat_min=int(self.thr["mask_sat_min"]),
+                    val_min=int(self.thr["mask_val_min"])))
+        # ★ 审计修复 P0-cam-3: 面积/短边门槛走可配置阈值表（算法结构未变）
+        rects = find_rectangles(mask,
+                                min_area_ratio=self.thr["min_area_ratio"],
+                                max_area_ratio=self.thr["max_area_ratio"],
+                                min_side=int(self.thr["min_side"]),
+                                min_area_abs=self.thr["min_area_abs"],
+                                rect_fill=self.thr["min_fill"],
+                                solidity=self.thr["solidity_min"],
+                                aspect=(1.0, self.thr["aspect_max"]))
         results = []
         for r in rects:
             col = self._color(work, mask, r)
@@ -703,7 +866,8 @@ class VisionEngine:
         st = self.tracker.update(rects)
         if self.debug:
             import sys
-            print(debug_mask_contours(work, mask), flush=True, file=sys.stderr)
+            print(debug_mask_contours(work, mask, thr=self.thr),
+                  flush=True, file=sys.stderr)
         payload = {"ok": True, "results": results, "tracker": st, "mask": mask}
         if record_boxes and st["fire"] and results:
             payload["fire"] = True
@@ -742,7 +906,9 @@ class VisionEngine:
         # 取该候选 bounding 矩形内的 BGR，用 HSV 色相分箱直判红/绿/蓝
         x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
         roi = work[y0:y1 + 1, x0:x1 + 1]
-        name, ratio_color = _hue_vote(roi)
+        # ★ 审计修复 P0-cam-3: 色相投票的 S/V 门槛走可配置阈值表
+        name, ratio_color = _hue_vote(roi, s_min=self.thr["hue_s_min"],
+                                      v_min=self.thr["hue_v_min"])
         lab = [round(float(v), 2)
                for v in cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).reshape(-1, 3).mean(axis=0)]
         if not name:

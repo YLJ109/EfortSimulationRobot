@@ -2,9 +2,11 @@
 """控制器 Modbus 寄存器**只读**勘察工具。
 
 ★ 本工具只发 FC3（读保持寄存器），**绝不写入任何寄存器**。
-  存在的意义：robot.yaml 里 motion.write_base_addr / write_speed_addr /
-  estop_addr 至今标着 TODO（未按手册核对）。在手册到位之前，
-  至少要把"控制器到底暴露了哪些地址、哪些地址在动"摸清楚 ——
+  ★ 审计修复 P1-E5：原文写「robot.yaml 里 motion.write_base_addr / write_speed_addr /
+  estop_addr 至今标着 TODO（未按手册核对）」—— 已过期。2026-09-23 的实测勘察
+  （docs/控制器Modbus寄存器勘察报告.md）已把这三个假设**证伪**，robot.yaml 里现在
+  标的是「已证伪」，写路径改走 40101 指令字 / 40103 速度 / 40135 触发位 / 40139~44 目标角。
+  本工具的价值不变：现场仍要用只读方式确认"控制器暴露了哪些地址、哪些地址在动"——
   没有这些事实，开启 motion.real_write 就是在盲写真机。
 
 用法：

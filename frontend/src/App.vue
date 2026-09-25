@@ -26,6 +26,7 @@ import {
 } from "./utils/safetyLabels.js";
 import { useLinkStore } from "./stores/link.js";
 import { useExecStore } from "./stores/exec.js";
+import { useRcReadyStore } from "./stores/rcReady.js";
 import {
   resolveKey, isTypingTarget, tabKeyFor, SHORTCUT_BY_ID,
 } from "./shortcuts.js";
@@ -33,7 +34,8 @@ import {
   HOME_VIEW, isKnownView, safeView,
   visibleTabs as visibleTabsOf, allowedKeys as allowedKeysOf,
 } from "./tabs.js";
-import { apiUrl, wsUrl } from "./config.js";
+import { wsEventsUrl } from "./config.js";
+import { apiControl } from "./net/control.js";   // ★ P0-3：围栏上报需带控制令牌
 
 const robot = useRobotStore();
 const safe = useSafetyStore();
@@ -78,6 +80,9 @@ function releaseControl() { auth.logout(); }
 //   本组件只负责"取上下文 → 分派动作"，不在这里写任何键位判断 ——
 //   键盘是"按下去就出事"的东西，判据散在组件里没法断言。
 const exec = useExecStore();
+// ★ 需求：底栏"控制中"也要以控制器就绪为准 —— 只授权、未就绪时显示"已授权·待就绪"。
+//   rcReady 的 rc_status 快照由 robot store 经 WS 全局注入，不依赖是否打开过点位执行页。
+const rc = useRcReadyStore();
 
 /** 快捷键反馈提示（一次性，2 秒后自清）。 */
 const keyHint = ref("");
@@ -148,8 +153,13 @@ function onKeydown(ev) {
   const fn = KEY_ACTIONS[action];
   if (!fn) return;
   // 需要授权的动作：没令牌时给一句明确的话，而不是"按了没反应"
+  // ★ 审计修复 P1-D9②：**急停（Esc）不受 needAuth 前置拦截**。
+  //   原实现把 Esc 一起拦下 → 没令牌时按 Esc 只闪一句"需要控制权限"，
+  //   而急停恰恰是"不管三七二十一先按下去"的动作。现在放行到 doEstop，
+  //   由它负责：先停本地点动，再明确记一行"急停未发出"并弹出验证框。
   const def = SHORTCUT_BY_ID[action];
-  if (def && def.needAuth && !auth.controlActive && action !== "close_modal") {
+  if (def && def.needAuth && !auth.controlActive
+      && action !== "close_modal" && action !== "estop") {
     flashKeyHint(`「${def.desc}」需要控制权限，请先请求控制`);
     if (auth.requestLogin) auth.requestLogin();
     return;
@@ -175,11 +185,25 @@ const annOff = computed(() => !annCfg.value.enabled || (!annCfg.value.sound && !
 function toggleAnnounce() { showAnnounce.value = !showAnnounce.value; }
 
 // 后端事件总线（WS）→ 语音播报：warn 及以上才出声，info 只进历史
+// ★ P1-B6：事件帧已拆到 /ws/events，需带内出示控制令牌；未登录时不建连，
+//   拿到权限后再由 controlActive 监听重建，避免每 2s 打一次被 4401 的无用重连。
 let evWs = null;
 let evTimer = null;
+function disconnectEvents() {
+  if (evTimer) { clearTimeout(evTimer); evTimer = null; }
+  // ★ P1-E13（eslint no-empty）：这里两处空 catch 都是"关一个可能已经坏掉的 socket"，
+  //   再抛也无处可去 —— 填上注释说明**为什么允许它为空**，而不是让人以为是漏写。
+  if (evWs) { try { evWs.close(); } catch (e) { /* 关闭已断开的连接，失败无影响 */ } evWs = null; }
+}
 function connectEvents() {
+  disconnectEvents();
+  if (!auth.controlActive) return;
   try {
-    evWs = new WebSocket(wsUrl());
+    evWs = new WebSocket(wsEventsUrl());
+    evWs.onopen = () => {
+      try { evWs.send(JSON.stringify({ type: "auth", token: auth.token })); }
+      catch (e) { /* 发不出去，等后端超时关闭即可 */ }
+    };
     evWs.onmessage = (ev) => {
       try {
         const m = JSON.parse(ev.data);
@@ -194,10 +218,16 @@ function connectEvents() {
         }
       } catch (e) { /* 忽略坏帧 */ }
     };
-    evWs.onclose = () => { evTimer = setTimeout(connectEvents, 2000); };
-    evWs.onerror = () => { try { evWs.close(); } catch (e) {} };
+    // 4401 = 令牌缺失/失效：交给 controlActive 监听重建，不在此空转重连
+    evWs.onclose = (e) => {
+      if (e && e.code === 4401) return;
+      evTimer = setTimeout(connectEvents, 2000);
+    };
+    evWs.onerror = () => { try { evWs.close(); } catch (e) { /* 已在错误态，close 再抛也不管 */ } };
   } catch (e) { /* 忽略 */ }
 }
+// ★ P1-B6：登录/登出都要重建事件流（onMounted 时可能还没令牌）。
+watch(() => auth.controlActive, () => connectEvents());
 
 // ---------- 围栏实时状态上报（阶段 4：服务端互锁） ----------
 // 围栏余量是在前端 3D 里逐帧算出来的，后端看不见。这里每秒把状态喂给后端，
@@ -205,10 +235,15 @@ function connectEvents() {
 // 直接调 API 也发不下去。断/弱网上报失败不影响使用，只是互锁失效（后端会记 warns）。
 let liveTimer = null;
 async function reportLive() {
+  // ★ 未登录不上报：POST /safety/live 挂着 require_control，没令牌必然 401。
+  //   这里是每秒一次的轮询，不挡住的话控制台会被 401 刷满（登录后自然恢复）。
+  if (!auth.controlActive) return;
   const s = safety.value;
   try {
     // ★ apiUrl() 会自动补 /api 前缀，这里不要再写一遍，否则变成 /api/api/...（405）
-    await fetch(apiUrl("/safety/live"), {
+    // ★ 审计修复 P0-3：后端已给 /safety/live 挂上 require_control，
+    //   上报必须带控制令牌，否则互锁数据会被 401 挡掉（未登录时不上报即可）。
+    await apiControl("/safety/live", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -231,6 +266,16 @@ function setView(v) {
   // ★ ops 是纯数据页，没有 3D 容器：switchView 查不到容器会直接返回，
   //   画布留在上一个视图里（被 v-show 隐藏），切换回去时原样恢复。
   switchView(v);
+  // 审计修复 P0-ui-3：switchView 是**同步**执行的，此刻 Vue 还没把新视图 v-show 显示
+  // 出来 —— 目标容器仍 display:none，three/manager.resizeView 会因尺寸 0 早退，
+  // 画布停在旧缓冲/空帧上，要等 MonitorLayout 的 ResizeObserver + 240ms debounce
+  // 才补 setSize（窗口期内就是"3D 黑屏闪一下"）。
+  // 这里等 v-show 生效（nextTick，仍在本帧绘制之前）补一次 resizeView + 强制渲染
+  // 一帧，把 0 尺寸早退窗口彻底关掉。
+  nextTick(() => {
+    resizeView();
+    if (!glLost && !document.hidden) renderFrame();
+  });
 }
 
 // ---------- 页面持久化 + 权限显隐 ----------
@@ -263,6 +308,9 @@ function restoreView() {
 let ttlTimer = null;
 function checkTtl() {
   if (auth.token && auth.expiresAt !== 0 && auth.expiresAt <= Date.now()) auth._clear();
+  // ★ 审计修复 P1-D8：同一个 1 秒时钟顺带扫一次遥测新鲜度。
+  //   后端卡死时 WS 不一定断（TCP 还在），画面会定格但 connected 仍为 true。
+  try { robot.sweepTelemetry(); } catch (e) { /* store 未就绪 */ }
 }
 
 let rafId = null;
@@ -353,6 +401,10 @@ onMounted(async () => {
   //   若放在 restoreView 之后，刚刷新时 controlActive 还是 false，
   //   上次停在"点位执行/程序执行"的用户会被判为无权限而永远按在真实监控页。
   await auth.fetchStatus();
+  // ★ 需求：底部"管理员剩余时间"要逐秒更新。fetchStatus 成功时会启动 1s 心跳；
+  //   但若本次 /auth/status 失败（后端刚起/网络抖动）而本地仍持有有效令牌，
+  //   心跳就不会启动 → 倒计时看起来"冻住"。这里再兜一次。
+  if (auth.controlActive) auth.startTtlTick();
   onSafety((s) => { safety.value = s; safe.ingest(s); });
   await robot.loadMeta();  // 初始化机器人模型（子组件 onMounted 已登记容器）
   robot.connect();         // 建立 WebSocket（连上后由上面的 watch 拉起轮询）
@@ -378,8 +430,13 @@ onBeforeUnmount(() => {
   stopLoop();
   if (liveTimer) clearInterval(liveTimer);
   if (ttlTimer) clearInterval(ttlTimer);
-  if (evTimer) clearTimeout(evTimer);
-  if (evWs) { try { evWs.close(); } catch (e) {} }
+  disconnectEvents();
+  // ★ 审计修复 P1-D11：卸载必须主动关掉姿态 WS 与执行域定时器。
+  //   原实现只 clear 了本地定时器，robot store 的 WebSocket 句柄根本没人管
+  //   （_ws 挂在 store 里，HMR / 路由级卸载后依然活着）→ 断线重连定时器
+  //   继续在后台空转，连回一个已经销毁的页面，控制台一路红。
+  try { robot.disconnect(); } catch (e) { /* 卸载阶段异常不阻塞其他清理 */ }
+  try { exec.dispose(); } catch (e) { /* 同上 */ }
   link.stop();
   document.removeEventListener("visibilitychange", onVisibility);
   if (keyHintTimer) clearTimeout(keyHintTimer);
@@ -415,7 +472,7 @@ onBeforeUnmount(() => {
       <div id="global-speed" title="全局执行速度（点位 / 程序 / 文件执行共用）">
         <Icon name="sliders" :size="15" />
         <span class="gs-lbl">速度</span>
-        <input class="gs-range" type="range" min="1" max="100" step="1"
+        <input class="gs-range" type="range" min="5" max="100" step="1"
                v-model.number="exec.speed" @input="exec.saveSpeed()" />
         <span class="gs-val">{{ exec.speed }}%</span>
       </div>
@@ -472,6 +529,16 @@ onBeforeUnmount(() => {
 
       <!-- 播报中心 + 控制权限（原顶栏 #control-zone，整块移到这里的最右侧） -->
       <div id="control-zone">
+        <!-- ★ 全维度审查 N-01：轴锁模式常驻徽标。让操作员随时知道当前是
+             「J1–J6 全轴可动」（默认）还是「轴锁模式：仅 J6」（AI 测试模式）。
+             后端 /api/system/health 的 joint_lock 经 exec.loadLock() 拉取。 -->
+        <span class="lock-badge" :class="{ on: exec.jointLockEnabled }"
+              :title="exec.jointLockEnabled
+                ? '轴锁已开启：仅 J' + (exec.jointLock?.only || 6) + ' 可动（AI 测试模式）'
+                : '当前 J1–J6 全轴可动（操作员操控）'">
+          <Icon :name="exec.jointLockEnabled ? 'lock' : 'unlock'" :size="13" />
+          {{ exec.axisHint }}
+        </span>
         <button class="ann-btn" :class="{ off: annOff }" @click="toggleAnnounce"
                 :title="annOff ? '播报已关闭（点击配置）' : '播报中心：音效 / 中文语音'">
           <Icon :name="annOff ? 'volumeOff' : 'volume'" :size="15" />
@@ -481,7 +548,7 @@ onBeforeUnmount(() => {
                 :title="auth.isAdmin
                   ? '已获得管理员控制权限：可操控机器人、修改围栏配置、清理审计日志'
                   : '已获得操作员控制权限：只能操控机器人，改配置/清审计需管理员'">
-            <Icon name="shield" :size="14" /> 控制中<span v-if="auth.roleLabel"> · {{ auth.roleLabel }}</span> · {{ auth.ttlText }}
+            <Icon name="shield" :size="14" /> {{ rc.ready ? "控制中" : "已授权 · 待一键就绪" }}<span v-if="auth.roleLabel"> · {{ auth.roleLabel }}</span> · {{ auth.ttlText }}
           </span>
           <button class="ctrl-release" @click="releaseControl" title="释放控制权限">
             <Icon name="power" :size="14" /> 释放
@@ -584,6 +651,11 @@ onBeforeUnmount(() => {
   padding: 0 4px 0 12px; margin-left: auto; border-left: 1px solid var(--line); }
 .ctrl-badge { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ok);
   font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* ★ 全维度审查 N-01：轴锁模式常驻徽标（顶栏控制区最左侧） */
+.lock-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px;
+  color: var(--ok); white-space: nowrap; padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--bg); font-variant-numeric: tabular-nums; }
+.lock-badge.on { color: var(--warn); border-color: var(--warn-line); background: var(--warn-soft); }
 /* 操作员令牌：权限低一档，用强调色和绿色区分，避免现场误以为"什么都能改" */
 .ctrl-badge.op { color: var(--accent); }
 .ctrl-request, .ctrl-release { flex: none; width: auto; padding: 7px 14px;
