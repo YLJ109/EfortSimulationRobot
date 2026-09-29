@@ -111,6 +111,20 @@ export const useExecStore = defineStore("exec", {
     //   ★ 2026-09-29：吸放与点动共用 200（不再有 210）；吸气为**电平保持**，状态锁存。
     //   idle = 真空已关断（默认态）；suck = 吸气保持中。无 release 中间态。
     vacuumState: "idle",   // idle | suck
+    // ---- 序列编辑（程序执行页）----
+    //   seqItems 元素恒为四类之一：
+    //     {type:"point",  point_id:N}
+    //     {type:"suck"} / {type:"release"}
+    //     {type:"wait",   seconds:S}          ← 秒；落盘时后端转成 dwell_ms
+    seqItems: [],
+    seqName: "",
+    seqBusy: false,
+    seqErr: "",
+    seqMsg: "",
+    seqDirty: false,          // 有未保存改动 → 载入/清空前二次确认
+    runState: null,           // /control/run-state 的快照（进度/暂停态）
+    runPaused: false,
+    _seqPoll: null,           // 进度轮询句柄
     vacuumBusy: false,
     vacuumErr: null,
     // ★ 「停止吸气」在上一发还飞时被按下 → 记为待补发，收尾后立刻执行，绝不丢弃。
@@ -1166,6 +1180,285 @@ export const useExecStore = defineStore("exec", {
         }
       }
     },
+    // =================================================================
+    // ★ 2026-09-29 序列编辑器（「程序执行」页）
+    //   设计见 docs/方案-程序执行序列编辑器（四类操作·经210执行）.md
+    //   ★★ 只四类操作：标记点 point / 吸气 suck / 停止吸气 release / 等待 wait。
+    //      后端 POST /control/seq 会硬校验，前端这里也不给别的入口。
+    //   执行一律走 /control/run-file（items 模式）→ 后端逐步下发：
+    //      标记点 → 写目标+触发 Bit0 → 控制器常驻 210 执行 MJOINT
+    //      吸气/停止吸气 → 触发 Bit1/Bit2 → 210 写 io.DOut[N]
+    //      等待 → 软件计时（可暂停冻结、可停止打断）
+    // =================================================================
+
+    /** 追加一步。type 只接受四类。 */
+    addSeqStep(type) {
+      const TYPES = ["point", "suck", "release", "wait"];
+      if (!TYPES.includes(type)) return;
+      if (this.seqItems.length >= 200) { this.seqErr = "步骤数已达上限 200"; return; }
+      if (type === "point") {
+        const p = (this.points || [])[0];
+        if (!p) {
+          this.seqErr = "还没有已保存的点位 —— 请先在「点位执行」页示教并保存点位";
+          return;
+        }
+        this.seqItems.push({ type: "point", point_id: p.id });
+      } else if (type === "wait") {
+        this.seqItems.push({ type: "wait", seconds: 1 });
+      } else {
+        this.seqItems.push({ type });
+      }
+      this.seqDirty = true; this.seqErr = ""; this.seqMsg = "";
+    },
+    removeSeqStep(i) {
+      if (i < 0 || i >= this.seqItems.length) return;
+      this.seqItems.splice(i, 1);
+      this.seqDirty = true; this.seqMsg = "";
+    },
+    /** delta=-1 上移 / +1 下移（顺序就是执行顺序，用户自己排）。 */
+    moveSeqStep(i, delta) {
+      const j = i + delta;
+      if (i < 0 || i >= this.seqItems.length || j < 0 || j >= this.seqItems.length) return;
+      const [it] = this.seqItems.splice(i, 1);
+      this.seqItems.splice(j, 0, it);
+      this.seqDirty = true; this.seqMsg = "";
+    },
+    clearSeq(force = false) {
+      if (!this.seqItems.length) return;
+      if (!force && this.seqDirty && typeof window !== "undefined"
+          && !window.confirm("清空当前编辑器里的 " + this.seqItems.length + " 步？")) return;
+      this.seqItems = [];
+      this.seqDirty = true; this.seqErr = ""; this.seqMsg = "";
+    },
+    setSeqPoint(i, pointId) {
+      const it = this.seqItems[i];
+      if (!it || it.type !== "point") return;
+      it.point_id = Number(pointId);
+      this.seqDirty = true; this.seqMsg = "";
+    },
+    setSeqWait(i, seconds) {
+      const it = this.seqItems[i];
+      if (!it || it.type !== "wait") return;
+      let v = Number(seconds);
+      if (!isFinite(v)) v = 1;
+      it.seconds = Math.min(3600, Math.max(0.1, v));
+      this.seqDirty = true; this.seqMsg = "";
+    },
+    /** 步骤 → 界面上一行文字（列表显示用）。 */
+    seqLabel(it) {
+      if (!it) return "";
+      if (it.type === "point") {
+        const p = (this.points || []).find((x) => x.id === it.point_id);
+        return p ? p.name : ("点位 #" + it.point_id);
+      }
+      if (it.type === "wait") return it.seconds + " 秒";
+      if (it.type === "suck") return "打开真空（保持）";
+      return "关断真空";
+    },
+
+    /** 保存成本地文件 programs/<名称>.json（保存后立刻出现在「本地程序」列表）。 */
+    async saveSeq() {
+      if (this.seqBusy) return;
+      const name = (this.seqName || "").trim();
+      if (!name) { this.seqErr = "请先填序列名称"; return; }
+      if (!this.seqItems.length) { this.seqErr = "序列为空，请先添加步骤"; return; }
+      this.seqBusy = true; this.seqErr = ""; this.seqMsg = "";
+      try {
+        const r = await apiControl("/control/seq", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, items: this.seqItems, speed_pct: this.speed }),
+        });
+        if (r.status === 401 || r.status === 403) { this.needAuth(); return; }
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.ok) {
+          this.seqDirty = false;
+          this.seqMsg = (d.existed ? "已覆盖保存：" : "已保存：") + d.file + "（" + d.steps + " 步）";
+          this.logLine("ok", "序列已保存为本地文件：" + d.file);
+          await this.loadFiles();          // 让「本地程序」列表立刻可见
+        } else {
+          this.seqErr = this._msgOf(d, r.status);
+          this.logLine("err", "保存序列失败：" + this.seqErr);
+        }
+      } catch (e) {
+        this.seqErr = String((e && e.message) || e);
+      } finally {
+        this.seqBusy = false;
+      }
+    },
+
+    /** 载入已保存的序列文件到编辑器。 */
+    async loadSeq(file) {
+      const nm = String(file || "").trim();
+      if (!nm) return;
+      if (this.seqDirty && typeof window !== "undefined"
+          && !window.confirm("编辑器里有未保存的改动，载入会覆盖它们。继续？")) return;
+      this.seqBusy = true; this.seqErr = ""; this.seqMsg = "";
+      try {
+        // ★ 必须 encodeURIComponent：序列名含中文，未编码的 URL 会被拒
+        const r = await apiControl("/control/seq?name=" + encodeURIComponent(nm));
+        if (r.status === 401 || r.status === 403) { this.needAuth(); return; }
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || !d.ok) { this.seqErr = this._msgOf(d, r.status); return; }
+        // 落盘格式（point_id / op / dwell_ms）→ 编辑器格式（type / seconds）
+        this.seqItems = (d.items || []).map((it) => {
+          if (!it || typeof it !== "object") return null;
+          if (it.point_id != null) return { type: "point", point_id: Number(it.point_id) };
+          const op = String(it.op || "");
+          if (op === "suck") return { type: "suck" };
+          if (op === "release") return { type: "release" };
+          if (op === "wait") {
+            const sec = Math.max(0.1, Math.round(((Number(it.dwell_ms) || 0) / 1000) * 10) / 10);
+            return { type: "wait", seconds: sec };
+          }
+          return null;
+        }).filter(Boolean);
+        this.seqName = d.name || nm.replace(/\.json$/i, "");
+        this.seqDirty = false;
+        this.seqMsg = "已载入 " + (d.file || nm) + "（" + this.seqItems.length + " 步）";
+        this.logLine("ok", "已载入序列：" + this.seqName);
+      } catch (e) {
+        this.seqErr = String((e && e.message) || e);
+      } finally {
+        this.seqBusy = false;
+      }
+    },
+
+    /** 取出后端错误文案（detail 可能是字符串或对象）。 */
+    _msgOf(d, status) {
+      const dt = d && d.detail;
+      if (typeof dt === "string" && dt) return dt;
+      if (dt && typeof dt === "object") return dt.message || JSON.stringify(dt);
+      if (d && (d.error || d.message)) return String(d.error || d.message);
+      return "HTTP " + status;
+    },
+
+    /** 执行序列（dryRun=true 只校验不下发）。 */
+    async runSeq(dryRun = false) {
+      if (!this.seqItems.length) { this.seqErr = "序列为空，请先添加步骤"; return; }
+      if (this.seqBusy || this.fileBusy || this.runBusy) {
+        this.seqErr = "已有执行在进行，请先等它结束或点「停止执行」";
+        return;
+      }
+      if (this.needAuth()) return;
+      const name = (this.seqName || "").trim() || "未命名序列";
+      this.seqBusy = true; this.seqErr = ""; this.seqMsg = "";
+      this.runBusy = true; this.dryRun = !!dryRun;
+      this.running = !dryRun; this.runDry = !!dryRun;
+      this.runKind = "program";        // 与点位序列同型 → 步骤高亮走同一套
+      this.runName = name; this.runRunName = name;
+      this.runTotal = this.seqItems.length; this.runStep = 0;
+      this.lastRun = null; this.runPaused = false; this.runState = null;
+      this.logLine("info", (dryRun ? "试运行" : "执行") + "序列「" + name + "」："
+                    + this.seqItems.length + " 步");
+      if (!dryRun) this.startSeqPoll();
+      try {
+        const r = await apiControl("/control/run-file", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            items: this.seqItems, name, dry_run: !!dryRun, speed_pct: this.speed,
+          }),
+        });
+        if (r.status === 401 || r.status === 403) { this.needAuth(); return; }
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.seqErr = this._msgOf(d, r.status);
+          this.logLine("err", "序列执行被拒：" + this.seqErr);
+          return;
+        }
+        this.fileResult = d;
+        this.runStep = d.count || this.runTotal;
+        if (d.count) this.runTotal = d.count;
+        const bad = (d.steps || []).find((s) => s.ok === false) || null;
+        this.lastRun = {
+          name: d.name || name, kind: "program", ok: !!d.ok, dryRun: !!dryRun,
+          passed: d.passed || 0, count: d.count || 0,
+          duration_ms: d.duration_ms || 0, error: bad ? (bad.error || "") : "",
+        };
+        if (d.cancelled) {
+          this.seqMsg = "已停止（执行到第 " + (d.count || 0) + " 步）";
+          this.logLine("warn", "序列已被停止：" + this.seqMsg);
+        } else if (d.ok) {
+          this.seqMsg = (dryRun ? "试运行通过：" : "执行完成：")
+                        + (d.passed || 0) + "/" + (d.count || 0) + " 步";
+          this.logLine("ok", this.seqMsg);
+        } else {
+          this.seqMsg = "中断于第 " + (bad ? bad.index : "?") + " 步"
+                        + (bad && bad.name ? "（" + bad.name + "）" : "")
+                        + "：" + (bad && bad.error ? bad.error : "未知原因");
+          this.logLine("err", "序列中断：" + this.seqMsg);
+        }
+      } catch (e) {
+        this.seqErr = String((e && e.message) || e);
+        this.logLine("err", "序列执行异常：" + this.seqErr);
+      } finally {
+        this.stopSeqPoll();
+        this.seqBusy = false; this.runBusy = false;
+        this.running = false; this.runPaused = false;
+      }
+    },
+
+    /** 暂停。★ 语义如实：当前步结束后生效；等待步立即冻结计时。要立刻停用急停。 */
+    async pauseSeq() {
+      if (!this.running) { this.seqErr = "当前没有正在执行的序列"; return; }
+      try {
+        const r = await apiControl("/control/run-pause", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.ok) {
+          this.runPaused = true;
+          this.seqMsg = "已暂停（当前步结束后生效）";
+          this.logLine("warn", "已请求暂停：当前步结束后生效（等待步则立即冻结计时）");
+        } else {
+          this.logLine("err", "暂停失败：" + this._msgOf(d, r.status));
+        }
+      } catch (e) { this.logLine("err", "暂停请求异常：" + ((e && e.message) || e)); }
+    },
+    async resumeSeq() {
+      try {
+        const r = await apiControl("/control/run-resume", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.ok) {
+          this.runPaused = false;
+          this.seqMsg = "已继续执行";
+          this.logLine("ok", "已继续执行");
+        } else {
+          this.logLine("err", "继续失败：" + this._msgOf(d, r.status));
+        }
+      } catch (e) { this.logLine("err", "继续请求异常：" + ((e && e.message) || e)); }
+    },
+    /** 停止执行（复用 run-cancel：能打断飞行中的那一发）。 */
+    async stopSeq() {
+      this.stopSeqPoll();
+      this.runPaused = false;
+      await this.abortRun();
+      this.seqMsg = "已请求停止执行";
+    },
+
+    /** 执行中轮询进度（画进度条 + 当前步高亮 + 暂停态）。 */
+    startSeqPoll() {
+      this.stopSeqPoll();
+      if (typeof setInterval !== "function") return;
+      this._seqPoll = setInterval(async () => {
+        try {
+          const r = await apiControl("/control/run-state");
+          if (!r.ok) return;
+          const d = await r.json();
+          const s = d && d.state;
+          if (!s) return;
+          this.runState = s;
+          if (s.index) this.runStep = s.index;
+          if (s.total) this.runTotal = s.total;
+          this.runPaused = !!s.paused;
+        } catch (e) { /* 轮询失败不影响执行本身 */ }
+      }, 500);
+    },
+    stopSeqPoll() {
+      if (this._seqPoll) { clearInterval(this._seqPoll); this._seqPoll = null; }
+    },
+
     async refreshState() {
       if (!useAuthStore().controlActive) { this.estopState = null; return; }
       const r = await apiControl("/control/state");
@@ -1189,6 +1482,7 @@ export const useExecStore = defineStore("exec", {
     },
     dispose() {
       this.stopTimers();
+      this.stopSeqPoll();
       if (previewTimer) { clearTimeout(previewTimer); previewTimer = null; }
       this.leaveView();
     },

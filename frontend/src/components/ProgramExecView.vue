@@ -97,6 +97,41 @@ async function refetchFiles() {
   try { await exec.loadFiles(); } finally { refetching.value = false; }
 }
 
+// ---------- 序列编辑（只四类操作）----------
+// ★ 需求（2026-09-29）：像编辑器一样自己把顺序排好，然后执行 / 暂停 / 继续 / 停止执行，
+//   可保存成本地文件、可选择已保存文件载入并执行。**只有四类**：标记点/吸气/停止吸气/等待。
+//   方案见 docs/方案-程序执行序列编辑器（四类操作·经210执行）.md
+//   全部执行都在后端逐步下发（经控制器常驻程序 210），前端只负责编排与进度。
+
+/** 可载入的序列文件 = programs 目录里的 .json（后端保存的序列就是这种）。 */
+const seqFiles = computed(() =>
+  (exec.localFiles || []).filter((f) => String(f.file_ext || "").toLowerCase() === "json"));
+
+const seqLoadFile = ref("");
+function onLoadSeq() {
+  const v = seqLoadFile.value;
+  seqLoadFile.value = "";
+  if (v) exec.loadSeq(v);
+}
+
+const seqTypeName = (t) => ({
+  point: "标记点", suck: "吸气", release: "停止吸气", wait: "等待",
+}[t] || t);
+
+/** 执行中高亮当前步（进度来自后端 run-state 轮询）。 */
+function seqStepCls(i) {
+  if (!exec.running) return "";
+  const cur = (exec.runState && exec.runState.index) || exec.runStep;
+  if (!cur) return "";
+  if (i + 1 < cur) return "done";
+  if (i + 1 === cur) return "on";
+  return "";
+}
+
+/** 执行按钮可用性：需控制令牌 + 没有别的执行在跑 + 序列非空。 */
+const runSeqDisabled = computed(() => !auth.controlActive || exec.seqBusy
+  || exec.fileBusy || exec.runBusy || !exec.seqItems.length);
+
 // ---------- 运行日志 ----------
 // ★ 右侧栏的"运行日志"卡片已移除，日志统一由 MonitorLayout 的左下角浮动面板显示
 //   （自动跟随最新的"粘底"逻辑也在那边实现）。此处不再保留本地日志视图代码。
@@ -223,6 +258,117 @@ watch(() => auth.controlActive, (v) => {
           {{ exec.lastRun.error ? " · " + exec.lastRun.error : "" }}
         </span>
       </div>
+    </div>
+
+    <!-- ★ 序列编辑（只四类操作）：自己排序 → 执行 / 暂停 / 继续 / 停止执行 → 保存/载入 -->
+    <div class="card">
+      <h3><Icon name="layers" :size="15" /> 序列编辑
+        <span class="h3-sub">只四类：标记点 / 吸气 / 停止吸气 / 等待</span>
+      </h3>
+
+      <div class="pf-row">
+        <label>名称</label>
+        <input v-model="exec.seqName" type="text" maxlength="40"
+               :disabled="exec.running" placeholder="例如：取件-放件" />
+      </div>
+
+      <div class="btns" style="margin-top:6px">
+        <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('point')">
+          <Icon name="target" :size="13" /> 标记点
+        </button>
+        <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('suck')">
+          <Icon name="download" :size="13" /> 吸气
+        </button>
+        <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('release')">
+          <Icon name="upload" :size="13" /> 停止吸气
+        </button>
+        <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('wait')">
+          <Icon name="clock" :size="13" /> 等待
+        </button>
+      </div>
+
+      <div class="pt-list" style="margin-top:8px">
+        <div v-for="(it, i) in exec.seqItems" :key="'seq:' + i" class="pt-item" :class="seqStepCls(i)">
+          <div class="pt-main">
+            <span class="pt-tag">#{{ i + 1 }}</span>
+            <span class="pt-name">{{ seqTypeName(it.type) }}</span>
+            <select v-if="it.type === 'point'" :value="it.point_id"
+                    :disabled="exec.seqBusy || exec.running"
+                    @change="exec.setSeqPoint(i, $event.target.value)">
+              <option v-for="p in exec.points" :key="'p' + p.id" :value="p.id">{{ p.name }}</option>
+            </select>
+            <template v-else-if="it.type === 'wait'">
+              <input class="seq-sec" type="number" min="0.1" max="3600" step="0.1"
+                     :value="it.seconds" :disabled="exec.seqBusy || exec.running"
+                     @change="exec.setSeqWait(i, $event.target.value)" />
+              <span class="pt-joints">秒</span>
+            </template>
+            <span v-else class="pt-joints">
+              {{ it.type === 'suck' ? '打开真空（保持）' : '关断真空' }}
+            </span>
+          </div>
+          <div class="pt-ops">
+            <button :disabled="exec.seqBusy || exec.running || i === 0"
+                    title="上移" @click="exec.moveSeqStep(i, -1)">
+              <Icon name="chevronUp" :size="13" />
+            </button>
+            <button :disabled="exec.seqBusy || exec.running || i === exec.seqItems.length - 1"
+                    title="下移" @click="exec.moveSeqStep(i, 1)">
+              <Icon name="chevronDown" :size="13" />
+            </button>
+            <button :disabled="exec.seqBusy || exec.running"
+                    title="删除" @click="exec.removeSeqStep(i)">
+              <Icon name="trash" :size="13" />
+            </button>
+          </div>
+        </div>
+        <p v-if="!exec.seqItems.length" class="small">
+          还没有步骤。用上面四个按钮添加，再用 ▲▼ 排好顺序 —— 顺序就是执行顺序。
+        </p>
+      </div>
+
+      <div class="btns" style="margin-top:8px">
+        <button :disabled="exec.seqBusy || exec.running || !exec.seqItems.length"
+                @click="exec.saveSeq()">
+          <Icon name="download" :size="13" /> {{ exec.seqBusy ? "处理中…" : "保存到本地文件" }}
+        </button>
+        <select v-model="seqLoadFile" :disabled="exec.seqBusy || exec.running" @change="onLoadSeq">
+          <option value="">载入已保存的序列…</option>
+          <option v-for="f in seqFiles" :key="'sf' + f.name" :value="f.name">{{ f.name }}</option>
+        </select>
+        <button :disabled="exec.seqBusy || exec.running || !exec.seqItems.length"
+                @click="exec.clearSeq()">
+          <Icon name="close" :size="13" /> 清空
+        </button>
+      </div>
+
+      <div class="btns" style="margin-top:8px">
+        <button class="primary" :disabled="runSeqDisabled" @click="exec.runSeq(false)">
+          <Icon name="play" :size="13" /> 执行
+        </button>
+        <button :disabled="!exec.running || exec.runPaused" @click="exec.pauseSeq()">
+          <Icon name="pause" :size="13" /> 暂停
+        </button>
+        <button :disabled="!exec.running || !exec.runPaused" @click="exec.resumeSeq()">
+          <Icon name="play" :size="13" /> 继续
+        </button>
+        <button class="rec-on" :disabled="!exec.running && !exec.seqBusy" @click="exec.stopSeq()">
+          <Icon name="stop" :size="13" /> 停止执行
+        </button>
+      </div>
+
+      <div class="prog-bar" style="margin-top:8px">
+        <i :style="{ width: exec.runPct + '%' }"></i>
+      </div>
+      <p class="small muted" style="margin-top:6px">
+        进度 {{ exec.runStep }}/{{ exec.runTotal || exec.seqItems.length }}
+        · {{ exec.running ? (exec.runPaused ? "已暂停" : "运行中") : "空闲" }}
+        · 「暂停」在<b>当前步结束后</b>生效（等待步立即冻结计时）；要让机器人立刻停，请用<b>急停</b>。
+      </p>
+      <p v-if="exec.seqErr" class="pf-err">
+        <Icon name="alert" :size="13" /> {{ exec.seqErr }}
+      </p>
+      <p v-else-if="exec.seqMsg" class="small">{{ exec.seqMsg }}</p>
     </div>
 
     <!-- 示教器程序（控制器可执行的 .XPL） -->
@@ -382,4 +528,7 @@ watch(() => auth.controlActive, (v) => {
 .rb-sub { font-size: 11px; color: var(--muted); margin-top: 2px; line-height: 1.5; }
 .rb-ico { flex: none; color: var(--warn); }
 .ready-box.ok .rb-ico { color: var(--ok); }
+/* 序列编辑：等待步的秒数输入 */
+.seq-sec { width: 72px; padding: 2px 6px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--txt); }
 </style>

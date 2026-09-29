@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import json
 import os
+import re
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -689,13 +690,25 @@ def _steps_from(items, db) -> List[dict]:
             out.append({"index": idx, "name": it.get("name") or f"步骤{idx}",
                         "mode": "joint", "joints": [float(x) for x in it["joints"]],
                         "speed_pct": sp, "dwell_ms": dw})
-        elif it.get("op"):   # XPL 吸气/放气/等待 等 io 步骤：可校验，无移动目标
-            opn = {True: "吸气", False: "放气"}.get(it.get("on")) if it.get("op") == "suck" \
-                else ("等待" if it.get("op") == "wait" else it.get("op"))
-            out.append({"index": idx, "name": it.get("name") or opn,
-                        "ok": it.get("op") != "unknown",
-                        "op": it.get("op"), "on": it.get("on"),
-                        "dwell_ms": dw, "raw": it.get("raw"), "line": it.get("line")})
+        elif it.get("op"):   # io 步骤：吸气 / 停止吸气 / 等待（可校验，无移动目标）
+            # ★ 2026-09-29 序列编辑器：op 归一化为三值 suck / release / wait，
+            #   与界面上的四类操作一一对应（wait 的秒数由 dwell_ms 承载）。
+            #   · 显式 {"op":"suck"} / {"op":"release"}
+            #   · 兼容 XPL 解析器产出的 {"op":"suck","on":false}（= 停止吸气）
+            _raw = str(it.get("op") or "").strip().lower()
+            if _raw == "suck":
+                op = "suck" if it.get("on") is not False else "release"
+            elif _raw in ("release", "unsuck", "stop_suck"):
+                op = "release"
+            elif _raw in ("wait", "dwell"):
+                op = "wait"
+            else:
+                op = "unknown"
+            label = {"suck": "吸气", "release": "停止吸气", "wait": "等待"}.get(op, _raw)
+            out.append({"index": idx, "name": it.get("name") or label,
+                        "ok": op != "unknown", "op": op, "dwell_ms": dw,
+                        "error": None if op != "unknown" else ("未知操作类型：%s" % _raw),
+                        "raw": it.get("raw"), "line": it.get("line")})
         else:
             out.append({"index": idx, "ok": False,
                         "error": "步骤缺少 point_id / joints / tcp"})
@@ -818,7 +831,12 @@ def _resolve_file(filename: str, db):
 
 
 class RunFileIn(BaseModel):
-    filename: str = Field(..., min_length=1, max_length=200)
+    # ★ 2026-09-29 序列编辑器：filename 与 items **二选一**。
+    #   · 给了 filename → 按文件执行（以文件为准，忽略 items，避免"界面显示 A、实际跑 B"）
+    #   · 只给 items   → 直接跑编辑器里正在编的序列（不落盘也能试跑）
+    filename: str = Field(default="", max_length=200)
+    items: Optional[List[dict]] = None
+    name: Optional[str] = Field(default=None, max_length=60)   # items 模式下的显示名
     dry_run: bool = True                     # ★ 默认空跑测试，不下发
     # ★ 速度硬下限 5%：同 MoveIn，杜绝"很快"的误发。
     speed_pct: int = Field(default=5, ge=5, le=100)
@@ -827,6 +845,16 @@ class RunFileIn(BaseModel):
     #   不传则由后端生成（此时前端仍可用 /control/run-cancel 按文件名中止，
     #   见 api_run_cancel 的 fallback）。
     run_id: Optional[str] = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def _need_target(self):
+        has_file = bool((self.filename or "").strip())
+        has_items = isinstance(self.items, list) and len(self.items) > 0
+        if not has_file and not has_items:
+            raise ValueError("必须给 filename（按文件执行）或 items（直接跑编辑器序列）")
+        if not has_file and len(self.items) > SEQ_MAX_ITEMS:
+            raise ValueError("步骤数超过上限 %d" % SEQ_MAX_ITEMS)
+        return self
 
 
 # =====================================================================
@@ -842,6 +870,17 @@ _RUN_CANCEL: Dict[str, float] = {}      # run_id -> 请求取消的时间戳
 _RUN_CANCEL_LOCK = threading.Lock()
 _RUN_CANCEL_TTL = 3600.0                # 中止标记保留 1h，防止孤儿条目堆积
 _RUN_ACTIVE: Dict[str, Dict] = {}       # run_id -> {"filename":..., "started_at":...}
+# ★ 2026-09-29 序列编辑器：暂停开关与进度登记（与取消表共用同一把锁）
+#   _RUN_PAUSE : run_id -> Event（set = 已暂停）。执行循环在**步边界**与**等待步**上读取；
+#                点动/吸放步本身不中断（控制器正在执行 MJOINT / 写 IO），
+#                暂停在该步结束后生效 —— 界面必须如实写明（要立刻停用急停）。
+#   _RUN_PROGRESS : run_id -> 进度快照，供 GET /control/run-state 轮询。
+_RUN_PAUSE: Dict[str, "threading.Event"] = {}
+_RUN_PROGRESS: Dict[str, Dict] = {}
+# ★ 最近一次执行的 run_id。执行结束后 _RUN_ACTIVE 会被清空，但**终态必须还能读到**
+#   （前端要显示"完成/已停止"以及最终的 index/total）——否则 run-state 会在收尾瞬间
+#   变成 null，界面只能靠乐观值猜。
+_LAST_RUN_ID: Optional[str] = None
 
 
 def _cancel_expired() -> None:
@@ -856,6 +895,83 @@ def _is_cancelled(run_id: Optional[str]) -> bool:
         return False
     with _RUN_CANCEL_LOCK:
         return run_id in _RUN_CANCEL
+
+
+def _set_progress(run_id: Optional[str], **kw) -> None:
+    """更新某次执行的进度快照（线程安全；供 /control/run-state 读取）。"""
+    if not run_id:
+        return
+    with _RUN_CANCEL_LOCK:
+        st = _RUN_PROGRESS.get(run_id)
+        if st is None:
+            st = {"run_id": run_id, "running": True, "paused": False}
+            _RUN_PROGRESS[run_id] = st
+        st.update(kw)
+
+
+def _pause_event(run_id: str) -> "threading.Event":
+    """取（或建）该次执行的暂停开关。"""
+    with _RUN_CANCEL_LOCK:
+        ev = _RUN_PAUSE.get(run_id)
+        if ev is None:
+            ev = threading.Event()
+            _RUN_PAUSE[run_id] = ev
+        return ev
+
+
+def _is_paused(run_id: Optional[str]) -> bool:
+    if not run_id:
+        return False
+    with _RUN_CANCEL_LOCK:
+        ev = _RUN_PAUSE.get(run_id)
+    return bool(ev is not None and ev.is_set())
+
+
+def _wait_if_paused(run_id: Optional[str]) -> bool:
+    """已暂停则阻塞在这里。返回 True = 等待期间被"停止执行"打断。
+
+    ★ 只在**步边界**调用：点动/吸放步一旦下发就不打断（那是急停的语义）。
+    """
+    while _is_paused(run_id):
+        if _is_cancelled(run_id):
+            return True
+        time.sleep(0.1)
+    return _is_cancelled(run_id)
+
+
+def _sleep_pausable(seconds: float, run_id: Optional[str]) -> bool:
+    """可暂停、可打断的等待。暂停时**冻结剩余时间**（不会"暂停完发现已经等过了"）。
+
+    返回 True = 被"停止执行"打断。
+    """
+    remain = max(0.0, float(seconds))
+    while remain > 0:
+        if _is_cancelled(run_id):
+            return True
+        if _is_paused(run_id):
+            time.sleep(0.1)
+            continue                      # 冻结：不推进 remain
+        d = 0.05 if remain > 0.05 else remain
+        time.sleep(d)
+        remain -= d
+    return _is_cancelled(run_id)
+
+
+def _reject_if_run_active(what: str) -> None:
+    """★ 2026-09-29：序列/文件执行期间拒绝**手动**下发。
+
+    理由（真机层面）：手动点动与序列共用**同一个 40135 触发位寄存器**，
+    序列的 io 步骤还共用 40135.Bit1/Bit2；交错下发会互相覆盖/清掉触发位，
+    产生谁也说不清的半截状态（机器人走一半、阀开着、完成位对不上）。
+    要手动操作，请先点「停止执行」。
+    """
+    with _RUN_CANCEL_LOCK:
+        active = list(_RUN_ACTIVE.keys())
+    if active:
+        raise HTTPException(
+            409,
+            detail=("有序列/文件正在执行（%s），已拒绝手动%s —— 请先点「停止执行」，"
+                    "或等它跑完" % (", ".join(active[:2]), what)))
 
 
 class RunCancelIn(BaseModel):
@@ -916,6 +1032,199 @@ def api_run_cancel(body: RunCancelIn, tok: str = Depends(require_control)):
     return {"ok": True, "matched": sorted(set(matched)), "stop_sent": stop_sent}
 
 
+# =====================================================================
+# ★ 2026-09-29 序列编辑器（「程序执行」页）——进度 / 暂停 / 继续 / 序列文件读写
+#   设计见 docs/方案-程序执行序列编辑器（四类操作·经210执行）.md
+#   ★ 只支持四类操作：标记点(point) / 吸气(suck) / 停止吸气(release) / 等待(wait)。
+#     本文件是**唯一入口**，后端在这里做"只四类"的硬校验，前端不可能绕过。
+# =====================================================================
+SEQ_NAME_RE = re.compile(r"^[\w\u4e00-\u9fa5\-. ]{1,40}$")
+SEQ_MAX_ITEMS = 200          # 单条序列最多 200 步（防止界面失控 + 文件过大）
+SEQ_MAX_BYTES = 512 * 1024   # 保存文件大小上限
+
+
+def _seq_path(name: str) -> Optional[str]:
+    """序列名 → programs 目录内 .json 绝对路径（拒绝路径穿越）。返回 None = 非法。"""
+    base = os.path.abspath(_program_dir())
+    n = os.path.basename((name or "").strip().replace("\\", "/"))
+    if not n or n in (".", ".."):
+        return None
+    if not n.lower().endswith(".json"):
+        n += ".json"
+    p = os.path.abspath(os.path.join(base, n))
+    try:
+        if os.path.commonpath([p, base]) != base:
+            return None
+    except ValueError:          # 不同盘符
+        return None
+    return p
+
+
+def _norm_seq_items(items) -> List[dict]:
+    """把编辑器提交的步骤**归一化并硬校验为四类**，落盘格式与既有
+    `_steps_from` 完全兼容（point_id / op / dwell_ms）。
+
+    非四类的任何东西都在这里被拒 —— 这是"只做四个操作"的后端保证。
+    """
+    if not isinstance(items, list):
+        raise HTTPException(400, detail="items 必须是数组")
+    if len(items) > SEQ_MAX_ITEMS:
+        raise HTTPException(400, detail="步骤数超过上限 %d" % SEQ_MAX_ITEMS)
+    out: List[dict] = []
+    for i, it in enumerate(items, 1):
+        if not isinstance(it, dict):
+            raise HTTPException(400, detail="第 %d 步格式非法（必须是对象）" % i)
+        t = str(it.get("type") or it.get("op") or "").strip().lower()
+        if t in ("point", "move"):
+            pid = it.get("point_id")
+            if pid is None or not str(pid).strip().isdigit():
+                raise HTTPException(400, detail="第 %d 步（标记点）缺少有效的 point_id" % i)
+            out.append({"point_id": int(pid)})
+        elif t == "suck":
+            out.append({"op": "suck"})
+        elif t in ("release", "unsuck", "stop_suck"):
+            out.append({"op": "release"})
+        elif t in ("wait", "dwell"):
+            try:
+                sec = float(it.get("seconds", 0))
+            except (TypeError, ValueError):
+                raise HTTPException(400, detail="第 %d 步（等待）时长不是数字" % i)
+            if not (0.1 <= sec <= 3600.0):
+                raise HTTPException(400, detail="第 %d 步（等待）时长须在 0.1~3600 秒" % i)
+            out.append({"op": "wait", "dwell_ms": int(round(sec * 1000))})
+        else:
+            raise HTTPException(
+                400, detail=("第 %d 步操作类型「%s」不支持 —— 只允许 标记点/吸气/停止吸气/等待"
+                             % (i, t or "空")))
+    return out
+
+
+class SeqIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=40)
+    speed_pct: int = Field(default=5, ge=5, le=100)
+    items: List[dict] = Field(default_factory=list)
+    overwrite: bool = True
+
+
+@router.get("/run-state")
+def api_run_state(run_id: Optional[str] = Query(default=None, max_length=64),
+                  tok: str = Depends(require_control)):
+    """当前执行进度 / 暂停态快照（前端轮询它画进度条与当前步高亮）。"""
+    with _RUN_CANCEL_LOCK:
+        active = list(_RUN_ACTIVE.keys())
+        rid = run_id or (active[-1] if active else _LAST_RUN_ID)
+        st = dict(_RUN_PROGRESS.get(rid)) if rid else None
+        if st is not None:
+            st["paused"] = bool(_RUN_PAUSE.get(rid) and _RUN_PAUSE[rid].is_set())
+        return {"ok": True, "state": st, "active": active}
+
+
+@router.post("/run-pause")
+def api_run_pause(body: Optional[RunCancelIn] = None, tok: str = Depends(require_control)):
+    """暂停当前序列。
+
+    ★ 语义（如实，不夸大）：暂停在**当前步结束后**生效；「等待」步立即冻结计时。
+      想让机器人**立刻**停住，请用「急停」，不是暂停。
+    """
+    rid = (body.run_id if body else None) or None
+    with _RUN_CANCEL_LOCK:
+        targets = [rid] if rid else list(_RUN_ACTIVE.keys())
+    if not targets:
+        return {"ok": False, "error": "当前没有正在执行的序列/文件"}
+    for r in targets:
+        _pause_event(r).set()
+        _set_progress(r, paused=True)
+    emit_event("control", "warn", "control.run_pause",
+               "已请求暂停执行（当前步结束后生效）",
+               {"run_id": targets[0], "targets": targets}, actor=_actor(tok))
+    return {"ok": True, "paused": targets}
+
+
+@router.post("/run-resume")
+def api_run_resume(body: Optional[RunCancelIn] = None, tok: str = Depends(require_control)):
+    """继续执行。"""
+    rid = (body.run_id if body else None) or None
+    with _RUN_CANCEL_LOCK:
+        targets = [rid] if rid else list(_RUN_PAUSE.keys())
+    hit = []
+    for r in targets:
+        ev = _RUN_PAUSE.get(r)
+        if ev is not None and ev.is_set():
+            ev.clear()
+            _set_progress(r, paused=False)
+            hit.append(r)
+    if not hit:
+        return {"ok": False, "error": "当前没有处于暂停的执行"}
+    emit_event("control", "info", "control.run_resume", "已继续执行",
+               {"run_id": hit[0], "targets": hit}, actor=_actor(tok))
+    return {"ok": True, "resumed": hit}
+
+
+@router.get("/seq")
+def api_seq_load(name: str = Query(..., min_length=1, max_length=64),
+                 tok: str = Depends(require_control)):
+    """载入已保存的序列文件，供编辑器回填（返回原始 items）。"""
+    p = _seq_path(name)
+    if not p or not os.path.isfile(p):
+        raise HTTPException(404, detail="序列文件不存在：%s" % name)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, detail="序列文件读取失败：%s" % e)
+    if not isinstance(data, dict):
+        raise HTTPException(400, detail="序列文件内容必须是 JSON 对象")
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = data.get("steps") if isinstance(data.get("steps"), list) else []
+    return {"ok": True, "name": data.get("name") or os.path.splitext(os.path.basename(p))[0],
+            "file": os.path.basename(p), "speed_pct": data.get("speed_pct"),
+            "saved_at": data.get("saved_at"), "items": items}
+
+
+@router.post("/seq")
+def api_seq_save(body: SeqIn, tok: str = Depends(require_control)):
+    """把编辑器里的序列保存成本地文件 programs/<name>.json。
+
+    ★ 校验：名称字符集（中英文/数字/_/-/./空格）、四类操作硬校验、
+      步骤数上限、路径穿越防护、文件大小上限。
+    ★ 格式与既有 `_load_disk` / `_steps_from` 兼容 → 保存后立刻出现在
+      「本地程序」列表里，也能被「手动执行」按文件名跑。
+    """
+    name = (body.name or "").strip()
+    if not SEQ_NAME_RE.match(name):
+        raise HTTPException(400, detail="名称只能含中英文、数字、下划线、短横线、点与空格（1~40 字）")
+    items = _norm_seq_items(body.items)
+    if not items:
+        raise HTTPException(400, detail="至少需要一个步骤")
+    p = _seq_path(name)
+    if not p:
+        raise HTTPException(400, detail="名称非法（不允许路径分隔符）")
+    existed = os.path.isfile(p)
+    if existed and not body.overwrite:
+        raise HTTPException(409, detail="同名文件已存在：%s" % os.path.basename(p))
+    payload = {
+        "name": name,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "speed_pct": int(body.speed_pct),
+        "items": items,
+    }
+    blob = json.dumps(payload, ensure_ascii=False, indent=2)
+    if len(blob.encode("utf-8")) > SEQ_MAX_BYTES:
+        raise HTTPException(400, detail="序列过大（超过 %d KB）" % (SEQ_MAX_BYTES // 1024))
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(blob)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, detail="保存失败：%s" % e)
+    emit_event("control", "info", "control.seq_save",
+               "已保存序列：%s（%d 步）" % (name, len(items)),
+               {"file": os.path.basename(p), "steps": len(items),
+                "existed": existed}, actor=_actor(tok))
+    return {"ok": True, "file": os.path.basename(p), "name": name,
+            "steps": len(items), "existed": existed, "path": p}
+
+
 @router.get("/files")
 def api_files(tok: str = Depends(require_control)):
     """列出"可按文件名执行"的目标：数据库程序 / 点位 + programs 目录 JSON。"""
@@ -932,36 +1241,68 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
     # ★ P0-7：为本次执行分配 run_id 并登记，供 /control/run-cancel 精确中止。
     run_id = (body.run_id or "").strip() or ("run-%d" % time.time_ns())
     _cancel_expired()
+    disp_name = (body.name or "").strip() or ((body.filename or "").strip() or "序列")
     with _RUN_CANCEL_LOCK:
         _RUN_CANCEL.pop(run_id, None)     # 同一 run_id 复用时先清掉旧的中止标记
-    _RUN_ACTIVE[run_id] = {"filename": body.filename,
-                           "started_at": time.time()}
+        _RUN_PAUSE.pop(run_id, None)
+        # 只保留"最近一次"的进度快照，避免条目无限增长
+        for k in [k for k, v in _RUN_PROGRESS.items() if not v.get("running")]:
+            _RUN_PROGRESS.pop(k, None)
+    _RUN_ACTIVE[run_id] = {"filename": disp_name, "started_at": time.time()}
+    global _LAST_RUN_ID
+    _LAST_RUN_ID = run_id          # 供收尾后读取终态（见 api_run_state）
+    _set_progress(run_id, name=disp_name, running=True, paused=False,
+                  index=0, total=0, step_name="", phase="starting")
     cancelled = False
     db = SessionLocal()
     try:
-        res = _resolve_file(body.filename, db)
-        if not res:
-            emit_event("control", "warn", "control.run_file_missing",
-                       f"按文件名执行未命中：{body.filename}",
-                       {"filename": body.filename}, actor=_actor(tok))
-            raise HTTPException(404, detail={
-                "message": f"未找到可执行目标：{body.filename}",
-                "candidates": _candidates(db),
-            })
+        # ★ 2026-09-29：两种来源 —— 给了 filename 按文件执行（以文件为准）；
+        #   只给 items 则直接跑编辑器里正在编的序列（不落盘也能试跑）。
+        if (body.filename or "").strip():
+            res = _resolve_file(body.filename, db)
+            if not res:
+                emit_event("control", "warn", "control.run_file_missing",
+                           f"按文件名执行未命中：{body.filename}",
+                           {"filename": body.filename}, actor=_actor(tok))
+                raise HTTPException(404, detail={
+                    "message": f"未找到可执行目标：{body.filename}",
+                    "candidates": _candidates(db),
+                })
+        else:
+            _seq = _norm_seq_items(body.items)          # ★ 四类操作硬校验
+            if not _seq:
+                raise HTTPException(400, detail="至少需要一个步骤")
+            res = {"kind": "program", "name": disp_name, "source": "editor",
+                   "steps": _steps_from(_seq, db)}
         if res.get("error"):
             return {"ok": False, "dry_run": body.dry_run, "kind": res["kind"],
                     "name": res["name"], "source": res.get("source"),
                     "error": res["error"], "steps": [], "readonly": True}
 
+        # 常驻服务程序号（点动/吸放同号；= 控制器上的 210）。io 步骤要靠它执行。
+        try:
+            svc_prog = int(get_config().get("motion", "jog", "service_program", default=0) or 0)
+        except Exception:
+            svc_prog = 0
+
         results: List[dict] = []
         ok_all = True
         total_ms = 0
+        _set_progress(run_id, total=len(res["steps"]),
+                      speed_pct=body.speed_pct, dry_run=bool(body.dry_run))
 
         for st in res["steps"]:
             # ★ P0-7：每一步开始前先查中止表 —— 这是"中止"真正生效的位置。
             if _is_cancelled(run_id):
                 cancelled = True
                 break
+            # ★ 2026-09-29 暂停（序列编辑器）：**步边界**生效。
+            #   点动/吸放步一旦下发就不打断（那是急停的语义），暂停在它走完后生效。
+            if _wait_if_paused(run_id):
+                cancelled = True
+                break
+            _set_progress(run_id, index=st.get("index"), step_name=st.get("name"),
+                          current_op=st.get("op") or "point", phase="running")
             if st.get("ok") is False:
                 results.append(st)
                 ok_all = False
@@ -975,23 +1316,85 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
             sp = max(5, min(100, sp))
             dw = int(st.get("dwell_ms") or 0)
 
-            # ---------- io 步（XPL 吸气/放气/等待）：无移动目标 ----------
-            # 当前无真机吸气通道，只计步/算等待时长，不触发移动。move 目标步骤
-            # 照常执行；这样文件能整份跑通而不中途崩掉。
+            # ---------- io 步：吸气 / 停止吸气 / 等待（无移动目标） ----------
+            # ★★ 2026-09-29：**真的执行了**。原实现是空转 + 注释"当前无真机吸气通道"，
+            #   在 210 三合一常驻程序就位后已过时 ——
+            #     吸气     = 置 40135.Bit1 → 210 执行 io.DOut[N] := true（保持）
+            #     停止吸气 = 置 40135.Bit2 → 210 执行 io.DOut[N] := false
+            #     等待     = 纯软件计时（可暂停：计时冻结；可停止：立刻返回）
             if st.get("op"):
-                if st.get("op") == "wait":
+                op = st.get("op")
+                if st.get("ok") is False:
+                    results.append({"index": st["index"], "name": st.get("name") or op,
+                                    "ok": False, "op": op, "readonly": False,
+                                    "error": st.get("error") or "步骤非法"})
+                    ok_all = False
+                    break
+                if op == "wait":
                     if body.dry_run:
                         total_ms += dw
-                    elif _interruptible_sleep(max(0.05, dw / 1000.0), run_id):
+                    elif _sleep_pausable(dw / 1000.0, run_id):
                         cancelled = True
                         break
-                results.append({
-                    "index": st["index"], "name": st.get("name") or st.get("op"),
-                    "ok": st.get("ok") is not False, "op": st.get("op"),
-                    "on": st.get("on"), "dwell_ms": dw,
-                    "readonly": bool(body.dry_run),
-                })
-                continue
+                    else:
+                        total_ms += dw
+                    results.append({"index": st["index"], "name": st.get("name") or "等待",
+                                    "ok": True, "op": "wait", "dwell_ms": dw,
+                                    "readonly": bool(body.dry_run)})
+                    continue
+                if op in ("suck", "release"):
+                    if body.dry_run:
+                        total_ms += 300
+                        results.append({"index": st["index"], "name": st.get("name") or op,
+                                        "ok": True, "op": op, "readonly": True})
+                        continue
+                    if svc_prog <= 0:
+                        results.append({"index": st["index"], "name": st.get("name") or op,
+                                        "ok": False, "op": op, "readonly": False,
+                                        "error": ("未配置常驻服务程序号（config motion.jog."
+                                                  "service_program）—— 吸放步骤无法执行")})
+                        ok_all = False
+                        break
+                    # ★ 取执行互斥：吸放与点动**共用同一个 40135 寄存器**，
+                    #   若不互斥，与在飞的点动交错会互相清掉触发位。
+                    if not motion._exec_lock.acquire(blocking=False):
+                        results.append({"index": st["index"], "name": st.get("name") or op,
+                                        "ok": False, "op": op, "readonly": False,
+                                        "error": "有点动/下发正在执行，本步已拒绝（避免触发位互相覆盖）"})
+                        ok_all = False
+                        break
+                    try:
+                        # ① 常驻程序预检（幂等）：不在跑就 伺服→停机→加载→运行 210
+                        okp, perr = motion.modbus.rc_vacuum_prepare(svc_prog)
+                        if not okp:
+                            results.append({"index": st["index"],
+                                            "name": st.get("name") or op,
+                                            "ok": False, "op": op, "readonly": False,
+                                            "error": "常驻服务程序未就绪：%s" % perr})
+                            ok_all = False
+                            break
+                        # ② 触发并等完成位
+                        okv, verr, vdetail = motion.modbus.rc_vacuum(op, timeout=10.0)
+                    finally:
+                        motion._exec_lock.release()
+                    results.append({"index": st["index"], "name": st.get("name") or op,
+                                    "ok": bool(okv), "op": op, "readonly": False,
+                                    "error": verr, "detail": vdetail})
+                    if not okv:
+                        ok_all = False
+                        break
+                    emit_event("control", "info", "control.seq_io",
+                               "序列第 %d 步 %s 完成" % (st["index"], st.get("name") or op),
+                               {"run_id": run_id, "op": op, "step": st["index"],
+                                "elapsed_s": (vdetail or {}).get("elapsed_s")},
+                               actor=_actor(tok))
+                    continue
+                # 未知 op（_steps_from 已标 ok=False，正常到不了这里）
+                results.append({"index": st["index"], "name": st.get("name") or op,
+                                "ok": False, "op": op, "readonly": False,
+                                "error": "未知操作类型"})
+                ok_all = False
+                break
 
             # ---------- 试运行（空跑测试）----------
             if body.dry_run:
@@ -1062,7 +1465,9 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
             if not r.get("ok"):
                 ok_all = False
                 break
-            if _interruptible_sleep(max(0.15, dw / 1000.0 + 0.2), run_id):
+            _set_progress(run_id, phase="settling")
+            # ★ 用可暂停等待：点动步的"收尾静置"是暂停最自然的落点
+            if _sleep_pausable(max(0.15, dw / 1000.0 + 0.2), run_id):
                 cancelled = True
                 break
 
@@ -1105,6 +1510,11 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
         with _RUN_CANCEL_LOCK:
             _RUN_ACTIVE.pop(run_id, None)
             _RUN_CANCEL.pop(run_id, None)
+            _RUN_PAUSE.pop(run_id, None)
+        # ★ 2026-09-29：进度快照**保留**（供前端读取最后状态），但标记为已结束；
+        #   下一次执行开始时会清掉这些已结束的旧条目。
+        _set_progress(run_id, running=False, paused=False,
+                      phase=("cancelled" if cancelled else "done"))
         db.close()
 
 
@@ -1360,17 +1770,28 @@ def api_vacuum(body: VacuumIn, tok: str = Depends(require_control)):
     if not real_write_enabled():
         raise HTTPException(
             403, detail="真实下发未开启（需 EFORT_REAL_MOTION=1 且 motion.real_write=true）")
-    # ★ 确保常驻服务程序在运行：伺服→停止当前→加载→运行（幂等）。
-    #   合并方案下本程序与点动是同号(200)，程序通常已在跑 → prepare 立即返回，
-    #   不再发生"停 200 → 加载 210"的来回切换（那正是 5005 反复出现的根因）。
-    from app.core.config import get_config
-    prog_no = int(get_config().get("motion", "vacuum", "service_program",
-                                   default=200) or 0)
-    if prog_no > 0:
+    # ★ 2026-09-29：序列/文件执行期间拒绝手动吸放 —— 两者共用 40135.Bit1/Bit2，
+    #   交错下发会互相清触发位（界面显示"吸气完成"而实际被序列的停止吸气关掉）。
+    _reject_if_run_active("吸放")
+    # ★ 取执行互斥：吸放与点动**共用同一个 40135 寄存器**，不能与在飞的下发交错。
+    if not motion._exec_lock.acquire(blocking=False):
+        raise HTTPException(
+            409, detail="有点动/下发正在执行，已拒绝本次吸放（避免触发位互相覆盖）")
+    try:
+        # ★ 确保常驻服务程序在运行：伺服→停止当前→加载→运行（幂等）。
+        #   现场 210 = 三合一常驻服务（点动 + 吸气保持 + 停止吸气），与点动**同号** →
+        #   程序通常已在跑，prepare 立即返回；不会来回切程序（切程序正是 5005 的根因）。
+        prog_no = int(get_config().get("motion", "vacuum", "service_program",
+                                       default=0) or 0)
+        if prog_no <= 0:
+            raise HTTPException(
+                400, detail="未配置常驻服务程序号（config motion.vacuum.service_program）")
         ok, perr = motion.modbus.rc_vacuum_prepare(prog_no)
         if not ok:
             raise HTTPException(502, detail="常驻服务程序未就绪：%s" % perr)
-    ok, err, detail = motion.modbus.rc_vacuum(body.action, body.timeout)
+        ok, err, detail = motion.modbus.rc_vacuum(body.action, body.timeout)
+    finally:
+        motion._exec_lock.release()
     if not ok:
         raise HTTPException(502, detail=err or "吸放触发失败")
     emit_event("control", "info", "control.vacuum",
@@ -1387,6 +1808,9 @@ def api_jog_step(body: JogStepIn, tok: str = Depends(require_control)):
     """
     if body.dir not in (1, -1):
         raise HTTPException(400, detail="dir 只能是 +1 或 -1")
+    # ★ 2026-09-29：序列/文件执行期间拒绝手动点动（共用 40135.Bit0 触发位）。
+    #   注意只拦"下发"，不拦 /jog/stop —— 停永远要能停。
+    _reject_if_run_active("点动")
     frame, ferr = jf.norm_frame(body.frame)
     if ferr:
         raise HTTPException(400, detail=ferr)
@@ -1418,6 +1842,7 @@ def api_jog_start(body: JogStartIn, tok: str = Depends(require_control)):
     frame, ferr = jf.norm_frame(body.frame)
     if ferr:
         raise HTTPException(400, detail=ferr)
+    _reject_if_run_active("连续点动")
     res = jog.start(body.joint, body.dir, body.speed_dps,
                     frame=frame, user_frame=body.user_frame, slow=body.slow)
     unit = jf.unit_of(frame, body.joint)

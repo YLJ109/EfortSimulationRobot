@@ -1,0 +1,309 @@
+# -*- coding: utf-8 -*-
+"""序列编辑器（「程序执行」页四类操作）的回归测试。
+
+覆盖：
+  1. 后端是"只四类"的唯一入口：循环/条件/子程序/未知类型一律 400
+  2. 参数校验：空序列、标记点缺 point_id、等待时长越界
+  3. 名称与路径穿越防护
+  4. 保存 → 载入 回环（落盘格式与既有 _steps_from 兼容）
+  5. run-file 的 items 模式（编辑器缓冲直接跑）+ dry_run 不下发
+  6. 进度/暂停/继续 接口
+  7. 暂停语义：等待步**冻结计时**；停止能打断
+  8. 互锁：序列执行期间手动点动/吸放被拒
+
+★ 全程不写真机：conftest 已把真实下发总闸关掉、Modbus 指向不可达端口；
+  写盘用 EFORT_PROGRAM_DIR 指到临时目录，绝不污染仓库 programs/。
+"""
+from __future__ import annotations
+
+import json
+import threading
+import time
+
+import pytest
+
+import app.api.control as C
+
+
+def _admin(client) -> dict:
+    r = client.post("/api/auth/login", json={"password": "test1234"})
+    assert r.status_code == 200, r.text
+    return {"X-Control-Token": r.json()["token"]}
+
+
+@pytest.fixture
+def seq_dir(tmp_path, monkeypatch):
+    """把可执行程序目录指到临时目录 —— 保存/载入测试不污染仓库。"""
+    d = tmp_path / "programs"
+    d.mkdir()
+    monkeypatch.setenv("EFORT_PROGRAM_DIR", str(d))
+    return d
+
+
+@pytest.fixture(autouse=True)
+def _clean_runner_state():
+    """★ 执行器状态是**进程级全局**（进行中登记 / 进度 / 暂停开关 / 最近 run_id）。
+
+    不复位就会串味：跑过一个用例后 `_LAST_RUN_ID` 已有值，`/control/run-state`
+    会返回上一次的终态，于是"空态应为 None"这类断言随机红。
+    （与 conftest._reset_settings_overlay 同一套思路：用例之间不继承差异。）
+    """
+
+    def _clean():
+        with C._RUN_CANCEL_LOCK:
+            C._RUN_ACTIVE.clear()
+            C._RUN_CANCEL.clear()
+            C._RUN_PAUSE.clear()
+            C._RUN_PROGRESS.clear()
+        C._LAST_RUN_ID = None
+
+    _clean()
+    yield
+    _clean()
+
+
+# ---------------------------------------------------------------- 1. 只四类
+@pytest.mark.parametrize("bad", [
+    {"type": "loop"}, {"type": "if"}, {"type": "call"}, {"type": "goto"},
+    {"type": "setvar"}, {"type": "unknown"},
+])
+def test_seq_rejects_non_four_types(client, seq_dir, bad):
+    """★ 四种之外的操作一律拒绝 —— 这是"不要乱添加别的东西"的后端保证。"""
+    r = client.post("/api/control/seq", json={"name": "t1", "items": [bad]}, headers=_admin(client))
+    assert r.status_code == 400, r.text
+    assert "只允许" in r.text
+
+
+def test_seq_accepts_exactly_four(client, seq_dir):
+    """四类各一条 → 全部接受，且落盘格式与 _steps_from 兼容。"""
+    items = [{"type": "point", "point_id": 1}, {"type": "suck"},
+             {"type": "release"}, {"type": "wait", "seconds": 1.5}]
+    r = client.post("/api/control/seq", json={"name": "four", "items": items},
+                    headers=_admin(client))
+    assert r.status_code == 200, r.text
+    with open(seq_dir / "four.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["items"] == [
+        {"point_id": 1}, {"op": "suck"}, {"op": "release"},
+        {"op": "wait", "dwell_ms": 1500},
+    ]
+    # 三条 io 步骤必须能被既有 _steps_from 解析成 suck/release/wait
+    #（点位步需要数据库会话，这里单独验它的归一化字段即可）
+    steps = C._steps_from(data["items"][1:], None)
+    assert [s.get("op") for s in steps] == ["suck", "release", "wait"]
+    assert [s.get("name") for s in steps] == ["吸气", "停止吸气", "等待"]
+    assert [s.get("index") for s in steps] == [1, 2, 3]
+    assert steps[2]["dwell_ms"] == 1500
+    assert all(s.get("ok") is not False for s in steps), steps
+    # ★ 兼容 XPL 解析器的老写法：{"op":"suck","on":false} = 停止吸气
+    old = C._steps_from([{"op": "suck", "on": True}, {"op": "suck", "on": False}], None)
+    assert [s.get("op") for s in old] == ["suck", "release"]
+    # ★ 未知 op 必须显式标失败（不能静默当成功）
+    unk = C._steps_from([{"op": "blow"}], None)
+    assert unk[0]["ok"] is False and unk[0]["op"] == "unknown"
+
+
+# ---------------------------------------------------------------- 2/3. 校验
+def test_seq_input_validation(client, seq_dir):
+    h = _admin(client)
+    cases = [
+        ({"name": "x", "items": []}, "空序列"),
+        ({"name": "x", "items": [{"type": "point"}]}, "标记点缺 point_id"),
+        ({"name": "x", "items": [{"type": "point", "point_id": "abc"}]}, "point_id 非数字"),
+        ({"name": "x", "items": [{"type": "wait", "seconds": 0}]}, "等待过短"),
+        ({"name": "x", "items": [{"type": "wait", "seconds": 99999}]}, "等待过长"),
+        ({"name": "x", "items": [{"type": "wait", "seconds": "abc"}]}, "等待非数字"),
+        # 名称长度由 Pydantic 边界挡（422），语义上同样是"拒绝"
+        ({"name": "", "items": [{"op": "suck"}]}, "空名称"),
+        ({"name": "a" * 41, "items": [{"op": "suck"}]}, "名称过长"),
+    ]
+    for body, label in cases:
+        r = client.post("/api/control/seq", json=body, headers=h)
+        assert r.status_code in (400, 422), "%s 未被拒: %s" % (label, r.text)
+
+
+def test_seq_name_rejects_path_traversal(client, seq_dir):
+    """名称里的路径片段必须被拒（且不能逃出程序目录）。"""
+    h = _admin(client)
+    for bad in ["../../evil", "a/b", "..\\evil", "..", "/etc/passwd"]:
+        r = client.post("/api/control/seq",
+                        json={"name": bad, "items": [{"op": "suck"}]}, headers=h)
+        assert r.status_code == 400, "%r 未被拒: %s" % (bad, r.text)
+    # 目录里不应出现任何越界文件
+    assert not list(seq_dir.parent.glob("evil*"))
+
+
+def test_seq_path_helper_blocks_escape(seq_dir):
+    assert C._seq_path("../evil") in (None,) or \
+        str(C._seq_path("../evil")).startswith(str(seq_dir))
+    p = C._seq_path("ok-name")
+    assert p and p.endswith("ok-name.json") and p.startswith(str(seq_dir))
+
+
+# ---------------------------------------------------------------- 4. 回环
+def test_seq_save_load_roundtrip(client, seq_dir):
+    h = _admin(client)
+    items = [{"type": "point", "point_id": 7}, {"type": "wait", "seconds": 2.5},
+             {"type": "suck"}]
+    r = client.post("/api/control/seq",
+                    json={"name": "中文 序列-1", "items": items, "speed_pct": 5}, headers=h)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["ok"] and d["steps"] == 3 and d["file"] == "中文 序列-1.json"
+
+    r2 = client.get("/api/control/seq", params={"name": "中文 序列-1"}, headers=h)
+    assert r2.status_code == 200, r2.text
+    got = r2.json()
+    assert got["name"] == "中文 序列-1"
+    assert got["items"] == [{"point_id": 7}, {"op": "wait", "dwell_ms": 2500},
+                            {"op": "suck"}]
+
+    # 覆盖保存要如实回报
+    r3 = client.post("/api/control/seq",
+                     json={"name": "中文 序列-1", "items": items}, headers=h)
+    assert r3.json().get("existed") is True
+    # overwrite=False 时拒绝
+    r4 = client.post("/api/control/seq",
+                     json={"name": "中文 序列-1", "items": items, "overwrite": False}, headers=h)
+    assert r4.status_code == 409
+
+
+def test_seq_load_missing(client, seq_dir):
+    r = client.get("/api/control/seq", params={"name": "__none__"}, headers=_admin(client))
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------- 5. items 模式
+def test_runfile_items_mode_dry_run(client, seq_dir):
+    """编辑器缓冲可直接执行（items 模式），dry_run 只解析不下发。"""
+    body = {"items": [{"type": "point", "point_id": 1}, {"type": "suck"},
+                      {"type": "wait", "seconds": 0.2}, {"type": "release"}],
+            "name": "ed", "dry_run": True, "speed_pct": 5}
+    r = client.post("/api/control/run-file", json=body, headers=_admin(client))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["kind"] == "program" and d["count"] == 4 and d["readonly"] is True
+    assert [s.get("op") for s in d["steps"]] == [None, "suck", "wait", "release"]
+
+
+def test_runfile_needs_a_target(client, seq_dir):
+    r = client.post("/api/control/run-file", json={"dry_run": True}, headers=_admin(client))
+    assert r.status_code == 422, r.text
+
+
+def test_runfile_items_rejects_non_four(client, seq_dir):
+    r = client.post("/api/control/run-file",
+                    json={"items": [{"type": "loop"}], "dry_run": True},
+                    headers=_admin(client))
+    assert r.status_code == 400, r.text
+
+
+# ---------------------------------------------------------------- 6/7. 暂停/停止
+def test_run_state_empty(client):
+    r = client.get("/api/control/run-state", headers=_admin(client))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["ok"] is True and d["state"] is None
+
+
+def test_pause_resume_without_run(client):
+    h = _admin(client)
+    r = client.post("/api/control/run-pause", json={}, headers=h)
+    assert r.status_code == 200 and r.json()["ok"] is False
+    r = client.post("/api/control/run-resume", json={}, headers=h)
+    assert r.status_code == 200 and r.json()["ok"] is False
+
+
+def test_sleep_pausable_freezes_and_cancels():
+    """★ 暂停时**冻结剩余时间**（不是"暂停完发现已经等过了"）；停止能立刻打断。"""
+    rid = "unit-sleep-1"
+    try:
+        # 暂停中：3 秒的等待不会推进
+        C._pause_event(rid).set()
+        t0 = time.time()
+        th = threading.Thread(target=C._sleep_pausable, args=(3.0, rid), daemon=True)
+        th.start()
+        time.sleep(0.6)
+        assert th.is_alive(), "暂停中不该结束"
+        C._pause_event(rid).clear()
+        th.join(timeout=5.0)
+        assert not th.is_alive()
+        # 解除暂停后仍要把 3 秒走完（≈3s，而不是 0.6s 就结束）
+        assert time.time() - t0 >= 2.5, "剩余时间被吞了：暂停没有冻结计时"
+
+        # 停止：立即返回 True
+        rid2 = "unit-sleep-2"
+        with C._RUN_CANCEL_LOCK:
+            C._RUN_CANCEL[rid2] = time.time()
+        t1 = time.time()
+        assert C._sleep_pausable(5.0, rid2) is True
+        assert time.time() - t1 < 0.5, "停止没有立刻打断等待"
+    finally:
+        with C._RUN_CANCEL_LOCK:
+            C._RUN_PAUSE.pop(rid, None)
+            C._RUN_PAUSE.pop("unit-sleep-2", None)
+            C._RUN_CANCEL.pop(rid2, None)
+
+
+def test_wait_if_paused_returns_cancelled():
+    rid = "unit-wait-1"
+    try:
+        C._pause_event(rid).set()
+        with C._RUN_CANCEL_LOCK:
+            C._RUN_CANCEL[rid] = time.time()
+        t0 = time.time()
+        assert C._wait_if_paused(rid) is True
+        assert time.time() - t0 < 0.5
+    finally:
+        with C._RUN_CANCEL_LOCK:
+            C._RUN_PAUSE.pop(rid, None)
+            C._RUN_CANCEL.pop(rid, None)
+
+
+def test_pause_progress_registry():
+    rid = "unit-prog-1"
+    try:
+        C._set_progress(rid, name="p", running=True, total=4, index=2, paused=False)
+        with C._RUN_CANCEL_LOCK:
+            st = dict(C._RUN_PROGRESS[rid])
+        assert st["total"] == 4 and st["index"] == 2 and st["running"] is True
+        # paused 由 Event 决定（不是直接写字段）
+        C._pause_event(rid).set()
+        assert C._is_paused(rid) is True
+    finally:
+        with C._RUN_CANCEL_LOCK:
+            C._RUN_PROGRESS.pop(rid, None)
+            C._RUN_PAUSE.pop(rid, None)
+
+
+# ---------------------------------------------------------------- 8. 互锁
+def test_manual_jog_rejected_while_run_active(client):
+    """序列执行期间手动点动被拒（共用 40135 触发位，不能交错）。"""
+    h = _admin(client)
+    rid = "unit-active-1"
+    with C._RUN_CANCEL_LOCK:
+        C._RUN_ACTIVE[rid] = {"filename": "unit", "started_at": time.time()}
+    try:
+        r = client.post("/api/control/jog/step", json={"joint": 6, "dir": 1, "amount": 1},
+                        headers=h)
+        assert r.status_code == 409, r.text
+        assert "正在执行" in r.text
+        r = client.post("/api/control/vacuum", json={"action": "suck"}, headers=h)
+        assert r.status_code in (409, 403), r.text
+    finally:
+        with C._RUN_CANCEL_LOCK:
+            C._RUN_ACTIVE.pop(rid, None)
+
+
+def test_jog_stop_not_blocked_by_run(client):
+    """★ 停永远要能停：/jog/stop 不被互锁挡。"""
+    h = _admin(client)
+    rid = "unit-active-2"
+    with C._RUN_CANCEL_LOCK:
+        C._RUN_ACTIVE[rid] = {"filename": "unit", "started_at": time.time()}
+    try:
+        r = client.post("/api/control/jog/stop", json={}, headers=h)
+        assert r.status_code == 200, r.text
+    finally:
+        with C._RUN_CANCEL_LOCK:
+            C._RUN_ACTIVE.pop(rid, None)
