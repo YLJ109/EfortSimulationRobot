@@ -199,8 +199,18 @@ class MotionService:
             #   _exec_lock 内 → "校验→写速度→写目标→回读→触发" 原子化，
             #   不再可能被并发请求插进来改速/改目标。
             # ★ 全维度审查 B-03：速度用统一常量夹取（原来是散落的 max(1, min(100,...))）
-            speed = clamp_speed(speed_pct)
-            ok, err = self.modbus.write_reg(ADDR_SET_SPEED, speed)
+            # ★ 速度补偿（铁律 6）：有效速度 = 程序内 v…perc × 40103。
+            #   常驻服务程序 200 带 v50perc，若直接把 UI 速度写进 40103，
+            #   机器人实际只走 一半（设 20% → 实际 10%）。为让「右上角速度 = 实际速度」，
+            #   这里**反算** 40103 = clamp(UI速度 ÷ (v…perc/100))，再写 40103。
+            #   v…perc 取 config motion.jog.service_program_vperc（现场 50 = v50perc）。
+            vperc = float(get_config().get("motion", "jog",
+                                            "service_program_vperc", default=50) or 50)
+            if vperc <= 0:
+                vperc = 50.0
+            # 反算：UI 速度(speed_pct) 是"期望实际速度"，故 40103 = speed_pct / (vperc/100)
+            speed_40103 = clamp_speed(int(round(speed_pct / (vperc / 100.0))))
+            ok, err = self.modbus.write_reg(ADDR_SET_SPEED, speed_40103)
             if err is not None or ok is None:
                 with self._lock:
                     self.moving = False
@@ -213,13 +223,14 @@ class MotionService:
                 echo_i = int(ok)
             except (TypeError, ValueError):
                 echo_i = None
-            if echo_i is not None and echo_i != speed:
+            if echo_i is not None and echo_i != speed_40103:
                 with self._lock:
                     self.moving = False
-                    self.last_error = "速度设定回读不一致：写 %d%% 读回 %d%%" % (speed, echo_i)
+                    self.last_error = ("速度设定回读不一致：写 %d%% 读回 %d%%"
+                                       % (speed_40103, echo_i))
                 log.error("速度回读不一致，已中止下发: %s", self.last_error)
                 return {"ok": False, "mode": mode, "error": self.last_error,
-                        "speed_written": speed, "speed_echo": echo_i}
+                        "speed_written": speed_40103, "speed_echo": echo_i}
             # ★ should_abort：急停置位后，飞行中的点动链路（写目标→触发→轮询
             #   完成位，最长 30s）能立刻感知并撤触发中止，而不是排队走完。
             #   _lock 不可重入且不能在 I/O 期间持有，用短锁快照读 stopped。
@@ -237,7 +248,7 @@ class MotionService:
                     return True
             try:
                 ok, err, detail = self.modbus.rc_jog_execute(
-                    self.last_target, speed, should_abort=_abort_now,
+                    self.last_target, speed_40103, should_abort=_abort_now,
                     cur_joints=cur_j)
             except Exception as e:  # noqa: BLE001 —— 兜底：任何异常都必须复位 moving
                 log.exception("下发序列异常")
@@ -252,7 +263,8 @@ class MotionService:
                     self.last_error = err
                     return {"ok": False, "mode": mode, "error": err or "下发失败",
                             "detail": detail}
-            return {"ok": True, "target": self.last_target, "speed_pct": speed,
+            return {"ok": True, "target": self.last_target,
+                    "speed_pct": speed_pct, "speed_40103_written": speed_40103,
                     "mode": mode, "executed": True, "detail": detail}
 
         # 模拟模式: 仅校验 + 记录；★ Stage C：同时把目标交给有状态仿真机，

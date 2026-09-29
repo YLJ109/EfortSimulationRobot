@@ -150,6 +150,9 @@
       .side { width: var(--side-w, 400px); flex: none; background: var(--panel);
         border-left: 1px solid var(--line);
         display: flex; flex-direction: column; padding: 14px; gap: 12px; overflow-y: auto;
+        min-height: 0;            /* ★ 根治：flex 列子项默认 min-height:auto 会被内容撑高、
+                                      导致 .side 跟着变高而非自身滚动。显式 0 让它在父级限高内滚动 */
+        overscroll-behavior: contain;   /* 栏内滚到底不向外冒泡（避免误触发整页/3D 缩放） */
         transition: width .16s ease, padding .16s ease; }
       /* 折叠：宽度归零 + 去掉内边距与边框。★ 不要用 display:none ——
          SafetyPanel 里挂着监听和定时器，保持挂载更稳，切回来状态不丢。 */

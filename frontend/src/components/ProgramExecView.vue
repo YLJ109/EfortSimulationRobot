@@ -110,7 +110,10 @@ const steps = computed(() => {
       index: i + 1,
       name: (p && p.name) || ("点位 #" + (it.point_id ?? "?")),
       pointId: it.point_id,
-      speed: it.speed_pct || 100,
+      // ★ 实际执行速度 = 右上角全局速度 exec.speed（后台会按 v…perc 反算 40103，
+      //   使"右上角速度 = 实际速度"）；it.speed_pct 是 XPL 内部常量，不代表下发速度，
+      //   不能写死 100 误导用户。这里统一显示 exec.speed。
+      speed: exec.speed,
       dwell: it.dwell_ms || 0,
       missing: !p,
     };
