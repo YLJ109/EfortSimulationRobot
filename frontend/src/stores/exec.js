@@ -53,6 +53,8 @@ export const useExecStore = defineStore("exec", {
   state: () => ({
     // ---- 数据 ----
     points: [],
+    /** ★ 点位执行新需求：被「点选」常驻跟随的点位 id（残影钉在该点位姿，直到点别的点/离开）。 */
+    pinnedPointId: null,
     programs: [],
     files: [],
     pointsErr: "",
@@ -617,6 +619,19 @@ export const useExecStore = defineStore("exec", {
     },
     unhoverPoint() { if (!this.runBusy) showGhost(false); },
     hideGhost() { showGhost(false); highlightJoint(-1); },
+    /** ★ 点选（选中）某点位：残影**常驻**跟随该点位姿，直到点别的点或离开页面。
+     *  与 hoverPoint（悬停临时预演）的区别：pin 是持久化选中态，鼠标移开不消失。 */
+    pinPoint(p) {
+      if (p && p.joints && p.joints.length === 6) {
+        setGhostPose(p.joints);
+        showGhost(true);
+        this.pinnedPointId = p.id;
+      } else {
+        this.pinnedPointId = null;
+        showGhost(false);
+      }
+    },
+    unpinPoint() { this.pinnedPointId = null; },
 
     /**
      * **下发门控**：把残影摆到目标位姿，立刻量一次围栏/地面 —— 不撞才放行。
@@ -680,6 +695,49 @@ export const useExecStore = defineStore("exec", {
       const r = await apiControl(`/points/${p.id}`, { method: "DELETE" });
       if (r.ok) { await this.loadPoints(); return true; }
       if (r.status === 401 || r.status === 403) this.needAuth();
+      return false;
+    },
+    /**
+     * ★ 一键标记当前点：读取机器人**当前实时位姿**（readoutQ 六关节角）存成新点位。
+     *
+     * ★ 为什么 T1/T2 也能用：标记动作**只读当前位姿 + 写库**，**不向机器人下发任何
+     *   运动指令**——而真正需要 AUTO + 伺服上电的是"执行/点动"那类下发链路。所以这里
+     *   只拦「控制令牌 + 已连接 + 遥测可信」，**不拦 readyGate（不要求一键就绪 / AUTO）**。
+     *   现场最常见的用法正是：操作员在示教器上把机器人手动对到 T1/T2 的某个位置，
+     *   然后在网页点一下「标记当前点」就把这个点存下来，回 AUTO 后再挑出来执行。
+     *   备注留空，可在列表「编辑」里补；标记成功后自动 pin（残影跳到该点，便于对照）。
+     */
+    async markCurrentPoint() {
+      if (this.needAuth()) return false;
+      const robot = useRobotStore();
+      if (!robot.connected) {
+        this.logLine("warn", "无法标记当前点：机器人未连接，读不到当前位姿");
+        return false;
+      }
+      if (robot.telemetryStale) {
+        this.logLine("warn", "无法标记当前点：遥测超时（位姿读数不可信），请确认机器人在线后再标记");
+        return false;
+      }
+      const q = (robot.readoutQ && robot.readoutQ.length === 6) ? robot.readoutQ : null;
+      if (!q) {
+        this.logLine("warn", "无法标记当前点：当前位姿读数不可用");
+        return false;
+      }
+      const joints = q.map((v) => Number(Number(v || 0).toFixed(2)));
+      const name = "标记点 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      const res = await this.savePoint(
+        { kind: "joint", joints, name, group: "默认", note: "" }, null);
+      if (res.ok) {
+        await this.loadPoints();
+        const np = this.points.find((x) => x.name === name);
+        if (np) {
+          this.pinPoint(np);
+          this.logLine("ok", `已标记当前点「${name}」[${joints.map((v) => v.toFixed(1)).join(", ")}]`
+            + `（T1/T2 示教对位亦可；可在「编辑」补备注）`);
+        }
+        return true;
+      }
+      this.logLine("err", "标记当前点失败：" + (res.error || "未知"));
       return false;
     },
     /** 直角坐标点位保存前先解算成关节角（后端只吃 joints）。 */
@@ -1053,6 +1111,7 @@ export const useExecStore = defineStore("exec", {
       this.stopTimers();
       showGhost(false);
       highlightJoint(-1);
+      this.pinnedPointId = null;
     },
     dispose() {
       this.stopTimers();

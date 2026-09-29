@@ -106,6 +106,18 @@ function saveTeachAsPoint() {
 
 function exportPoint(p) { window.open(apiUrl(`/points/${p.id}/export`), "_blank"); }
 
+/** 点列表里的点 → 选中（残影常驻跟随该点位姿）。与悬停临时预演区分开。 */
+function onSelectPoint(p) { exec.pinPoint(p); }
+/** 鼠标移出某点：若已选中（pin）其它点则回到该选中点的残影；否则收起。 */
+function onLeavePoint(p) {
+  if (exec.pinnedPointId != null) {
+    const pp = exec.points.find((x) => x.id === exec.pinnedPointId);
+    if (pp) exec.pinPoint(pp); else exec.hideGhost();
+  } else {
+    exec.unhoverPoint();
+  }
+}
+
 function triggerImport() { fileInput.value && fileInput.value.click(); }
 async function onImport(e) {
   const f = e.target.files && e.target.files[0];
@@ -305,10 +317,23 @@ watch(() => auth.controlActive, (v) => {
       </h3>
       <div class="btns" style="margin-bottom:10px">
         <button class="primary" @click="openNew"><Icon name="edit" :size="14" /> 新建点位</button>
+        <button :disabled="!canControl"
+                :title="canControl ? '读取机器人当前 6 个关节坐标存为点位（T1/T2 示教器手动对位也可，仅记录不运动）'
+                                  : '需控制权限且机器人已连接、遥测可信'"
+                @click="exec.markCurrentPoint">
+          <Icon name="pin" :size="14" /> 标记当前点
+        </button>
         <button @click="triggerImport"><Icon name="upload" :size="14" /> 导入</button>
+        <button v-if="exec.runBusy" class="warn" @click="exec.abortRun()">
+          <Icon name="stop" :size="14" /> 停止
+        </button>
         <input ref="fileInput" type="file" accept="application/json" style="display:none"
                @change="onImport" />
       </div>
+      <p class="small pt-hint">
+        <Icon name="pin" :size="12" /> 「标记当前点」读取机器人实时位姿（T1/T2 示教器手动对位也可用，仅记录、不发送运动）；
+        点列表里任意点位 → 残影常驻跟随其位置；「执行」需在 AUTO 下一键就绪后。
+      </p>
 
       <div v-if="editing" class="pt-form">
         <div class="pf-row">
@@ -357,7 +382,9 @@ watch(() => auth.controlActive, (v) => {
 
       <div class="pt-list">
         <div v-for="p in exec.points" :key="p.id" class="pt-item"
-             @mouseenter="exec.hoverPoint(p)" @mouseleave="exec.unhoverPoint()">
+             :class="{ selected: exec.pinnedPointId === p.id }"
+             @mouseenter="exec.hoverPoint(p)" @mouseleave="onLeavePoint(p)"
+             @click="onSelectPoint(p)">
           <div class="pt-main">
             <span class="pt-name">{{ p.name }}</span>
             <span class="pt-tag">{{ p.group }}</span>
@@ -366,7 +393,8 @@ watch(() => auth.controlActive, (v) => {
             </span>
             <span class="pt-joints">[{{ exec.jointsSummary(p) }}]</span>
           </div>
-          <div class="pt-ops">
+          <div v-if="p.note" class="pt-note"><Icon name="note" :size="12" /> {{ p.note }}</div>
+          <div class="pt-ops" @click.stop>
             <button :disabled="!exec.canExec || exec.runBusy" @click="exec.execPoint(p)">
               <Icon name="target" :size="13" /> 执行
             </button>
@@ -396,4 +424,24 @@ watch(() => auth.controlActive, (v) => {
   color: var(--warn); background: var(--warn-soft);
   border: 1px solid var(--warn-line); border-radius: 8px;
 }
+/* ★ 点位卡片：T1/T2 提示条 + 选中高亮 + 备注行 */
+.pt-hint {
+  display: flex; align-items: flex-start; gap: 5px;
+  margin: -2px 0 8px; line-height: 1.5;
+}
+.pt-hint svg { color: var(--accent); flex: none; margin-top: 2px; }
+.pt-item.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.pt-note {
+  display: flex; align-items: center; gap: 5px;
+  margin: 4px 2px 2px; font-size: 11px; color: var(--muted); line-height: 1.4;
+}
+.pt-note svg { color: var(--muted); flex: none; }
+.btns button.warn {
+  color: var(--warn); border-color: var(--warn-line); background: var(--warn-soft);
+}
+.btns button.warn:hover:not(:disabled) { filter: brightness(0.97); }
 </style>
