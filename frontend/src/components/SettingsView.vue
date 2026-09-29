@@ -263,6 +263,9 @@ async function applyTtl() {
     if (!r.ok) { ttlErr.value = d.message || d.detail || ("设置失败（" + r.status + "）"); return; }
     ttlCurrent.value = d.ttl;
     ttlSel.value = d.ttl;
+    // ★ 双向绑定：立刻同步到全局 auth store —— 顶栏/登录弹窗里的"有效期 X"
+    //   马上跟着变，不必等下一次 /auth/status 回来。
+    auth.cfgTtl = d.ttl;
     ttlMsg.value = d.note || "已生效";
   } catch (e) {
     ttlErr.value = "设置失败：" + e.message;

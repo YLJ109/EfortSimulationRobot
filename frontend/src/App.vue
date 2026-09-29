@@ -575,7 +575,8 @@ onBeforeUnmount(() => {
           </button>
         </div>
         <p class="modal-tip">
-          连接真实机器人进行控制前，需输入管理员密码获取限时控制令牌（默认 30 分钟）。
+          连接真实机器人进行控制前，需输入管理员密码获取限时控制令牌（有效期
+          {{ auth.cfgTtlText }}；可在「系统设置 → 控制权限时长」调整）。
         </p>
         <ul class="modal-roles">
           <li>

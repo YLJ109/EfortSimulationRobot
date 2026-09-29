@@ -40,6 +40,10 @@ export const useAuthStore = defineStore("auth", {
     return {
       token: t ? t.token : "",
       expiresAt: t ? t.expiresAt : 0,
+      // ★ 后端**当前生效**的控制令牌时长（秒），由 /api/auth/status 的 ttl 同步。
+      //   null = 还没拉到。界面文案一律用它，不再硬编码"默认 30 分钟"
+      //   —— 否则设置页改成 2 小时后，界面还写着 30 分钟，操作员会误判。
+      cfgTtl: null,
       // 角色：admin | operator | ""。后端 /auth/login 与 /auth/status 都会回。
       // ★ 这里只用于「决定显示哪些入口」，真正的权限判定永远在后端（require_control /
       //   require_admin）—— 前端藏起来只是为了不让现场看到一片全灰的按钮。
@@ -78,6 +82,17 @@ export const useAuthStore = defineStore("auth", {
       const m = Math.floor(s2 / 60), ss = s2 % 60;
       return m > 0 ? `${m}分${ss}秒` : `${ss}秒`;
     },
+    /** ★ 后端**配置**的令牌时长（不是剩余时间）的人话标签。
+     *  用于把界面文案里的"默认 30 分钟"换成真实值：
+     *  设置页改完 → /api/auth/status 同步 → 这里立刻跟着变（双向绑定）。 */
+    cfgTtlText: (s) => {
+      const v = s.cfgTtl;
+      if (v === null || v === undefined) return "限时令牌";
+      if (v === 0) return "不限时";
+      if (v % 3600 === 0) return `${v / 3600} 小时`;
+      if (v % 60 === 0) return `${v / 60} 分钟`;
+      return `${v} 秒`;
+    },
   },
   actions: {
     /** 启动/停止 TTL 实时倒计时（页面可见时自动启动）。 */
@@ -102,6 +117,10 @@ export const useAuthStore = defineStore("auth", {
           const d = await r.json();
           this.required = !!d.required;
           if (d.roles_enabled) this.rolesEnabled = d.roles_enabled;
+          // ★ 双向绑定：把后端**当前生效**的令牌时长同步进来。
+          //   界面文案（曾硬编码"默认 30 分钟"）与设置页因此永远等于真实值，
+          //   不再出现"界面写 30 分钟、后端其实 2 小时"的脱钩。
+          if (typeof d.ttl === "number") this.cfgTtl = d.ttl;
           if (d.control_active) {
             this.role = d.role || "";
             this.startTtlTick();  // ★ 有效令牌时启动实时倒计时

@@ -96,6 +96,30 @@ def _reset_settings_overlay():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_env_file(tmp_path, monkeypatch):
+    """★★★ 红线：测试**绝不允许**改写项目根的 `.env` ★★★
+
+    事故（2026-09-29，用户反复反馈很久没找到原因）：
+      `tests/test_auth_ttl.py::test_control_ttl_updates_and_affects_new_tokens_only`
+      会调 `POST /api/settings/control-ttl {"ttl_sec": 1800}`，而 `api/settings.py`
+      的这个接口会把值**回写项目根 `.env`** 的 `EFORT_CONTROL_TTL` 行（本意是好的：
+      让设置持久化）。但测试没做隔离 →
+      **任何人跑一次测试套件，操作员的设置就被改回 1800（30 分钟）**；
+      而且后端启动时只读 `.env`，于是"设置页改成 2 小时 → 跑测试 → 重启 → 回到 30 分钟"，
+      用户喊了无数遍都不生效。`/api/settings/password` 同样会写 `.env`
+      （`EFORT_ADMIN_PASSWORD`，风险更大：会把真实管理员口令改掉）。
+
+    做法：把 `settings._env_path` 指到临时文件。**所有**写 `.env` 的路径都经过它，
+    因此本夹具是"单点收口"——今后新增任何写 `.env` 的接口/测试都自动被隔离。
+    """
+    import app.api.settings as settings_api
+
+    fake = tmp_path / ".env.test"
+    monkeypatch.setattr(settings_api, "_env_path", lambda: str(fake), raising=True)
+    yield fake
+
+
+@pytest.fixture(autouse=True)
 def _pin_joint_lock_off(monkeypatch):
     """★★ 轴锁策略与"现场配置"解耦（2026-09-29）★★
 
