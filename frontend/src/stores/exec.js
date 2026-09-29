@@ -106,6 +106,14 @@ export const useExecStore = defineStore("exec", {
     estopBusy: false,
     execState: null,
 
+    // ---- 真空吸放（Web 触发 40135.Bit1/Bit2 → 控制器常驻服务程序 200 执行，不移动机器人）----
+    //   ★ 与 jog 同真实下发双闸；控制器须 AUTO/远程且常驻程序(200)运行中才生效。
+    //   ★ 2026-09-29：吸放与点动共用 200（不再有 210）；吸气为**电平保持**，状态锁存。
+    //   idle = 真空已关断（默认态）；suck = 吸气保持中。无 release 中间态。
+    vacuumState: "idle",   // idle | suck
+    vacuumBusy: false,
+    vacuumErr: null,
+
     // ---- 程序执行运行态 ----
     running: false,
     runAbort: false,
@@ -1087,6 +1095,56 @@ export const useExecStore = defineStore("exec", {
         }
       } catch (e) {
         this.logLine("err", "急停复位异常：" + (e && e.message ? e.message : e));
+      }
+    },
+    /**
+     * 吸气 / 停止吸气（不移动机器人）：写 40135.Bit1/Bit2 触发位 → 控制器常驻服务程序(200)执行。
+     * ★ 与 jog 同真实下发双闸；控制器须 AUTO/远程且常驻程序(200)运行中才生效。
+     *   action: "suck"（吸真空，**电平保持**，不自动停）| "release"（立即关断真空）。
+     * ★ 2026-09-29：吸气取消 0.5s 自动停 → 状态必须**锁存**（latch）。
+     *   旧实现 2s 后自动回 idle；保持型语义下阀还开着、界面却显示"空闲"，
+     *   操作员会误判 → 属安全隐患。现在只有 release 成功才回 idle。
+     */
+    async vacuum(action) {
+      if (action !== "suck" && action !== "release") return;
+      if (this.needAuth()) return;
+      const prev = this.vacuumState;   // 失败时回退，绝不谎报阀状态
+      this.vacuumBusy = true;
+      this.vacuumErr = null;
+      this.vacuumState = action;
+      this.logLine("info", action === "suck"
+        ? "Web 触发吸气（40135.Bit1，电平保持，需手动停止）"
+        : "Web 触发停止吸气（40135.Bit2）");
+      try {
+        const r = await apiControl("/control/vacuum", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action }),
+        });
+        if (r.status === 401 || r.status === 403) { this.vacuumState = prev; this.needAuth(); return; }
+        if (r.ok) {
+          // ★ 保持型语义：吸 → 一直显示"吸气中"，直到停止吸气成功才回 idle
+          this.vacuumState = action === "suck" ? "suck" : "idle";
+          this.logLine("ok", action === "suck"
+            ? "吸气已开启（保持中，请按「停止吸气」关断）"
+            : "已停止吸气（真空已关断）");
+        } else {
+          let msg = "吸放触发失败";
+          try {
+            const d = await r.json();
+            const inner = (d && d.detail !== undefined && typeof d.detail === "object" && d.detail !== null) ? d.detail : d;
+            msg = (inner && (inner.message || inner.error || inner.detail))
+              || (typeof d.detail === "string" ? d.detail : "") || ("HTTP " + r.status);
+          } catch (e) { msg = "HTTP " + r.status; }
+          this.vacuumErr = String(msg);
+          this.vacuumState = prev;
+          this.logLine("err", "吸放触发失败：" + msg);
+        }
+      } catch (e) {
+        this.vacuumErr = e && e.message ? String(e.message) : String(e);
+        this.vacuumState = prev;
+        this.logLine("err", "吸放触发异常：" + this.vacuumErr);
+      } finally {
+        this.vacuumBusy = false;
       }
     },
     async refreshState() {

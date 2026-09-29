@@ -43,6 +43,16 @@ ADDR_SET_PROG = 103      # 40104 目标程序号
 ADDR_RO_TRIG = 134       # 40135 PC→机器人位区（Bit0 = 点动触发，电平）
 ADDR_JOG_ANG = 138       # 40139~44 J1~J6 目标绝对角 ×100（int16 补码）
 ADDR_WO_STAT = 34        # 40035 机器人→PC 位区（Bit0 = 点动完成）
+# ★ 真空吸放触发位（与 40135 同寄存器区；铁律：PC 写触发、控制器常驻服务程序执行）
+#   40135.Bit1 = 吸气触发 → 常驻程序读到 → io.DOut[N]=true（吸真空，**电平保持**）
+#   40135.Bit2 = 停止吸气触发 → 常驻程序读到 → io.DOut[N]=false（关断真空）
+#   ★ N = 电磁阀实际输出号，以现场 IO 监控实测为准（程序源码内注释有说明）。
+#   ★ 2026-09-29：吸放与点动**共用同一个常驻程序 200**（不再拆 210）；
+#     吸气不做 0.5s 脉冲自动停 —— 保持到显式 Bit2 关断。
+#   完成回写：40035.Bit1（吸完成）/ Bit2（关断完成），与 40035.Bit0（点动完成）同寄存器区。
+#   ★ 三条完成位在常驻程序每个大循环顶部都会被清 0（防"残留 1 被 PC 误判已完成"）。
+VAC_BIT_SUCK = 0x0002     # 40135.Bit1
+VAC_BIT_RELEASE = 0x0004  # 40135.Bit2
 ANG_SCALE = 100
 
 # 命令字：必须同沿单条写入，且始终保留 Bit0(上伺服)+Bit12(伺服使能)
@@ -470,6 +480,135 @@ class ModbusRobot:
             return False, "完成但撤触发失败: %s" % cerr, detail
         ev("done", "完成位已置 1，用时 %0.2fs" % detail["elapsed_s"])
         return True, None, detail
+
+    def rc_vacuum(self, action: str, timeout: float = 6.0):
+        """触发吸/放（不移动机器人关节）。
+
+        action='suck'  → 置 40135.Bit1，常驻服务程序执行 io.DOut[N]=true（吸真空，**保持**）；
+        action='release' → 置 40135.Bit2，常驻服务程序执行 io.DOut[N]=false（关断真空）。
+        与 rc_jog_execute 同构：置触发位 → 轮询 40035 对应完成位 → finally 撤触发。
+        ★ 2026-09-29：吸放与点动共用同一个常驻程序（config 两处 service_program 同为 200），
+          不再拆成 210；吸气为电平保持（无 0.5s 自动停），必须显式 release。
+        前置：控制器须在接受 PC 指令的模式（AUTO/远程）且常驻服务程序运行中，
+              否则触发位无人响应 → 超时失败（安全：不写任何运动指令）。
+        """
+        if action == "suck":
+            trig, done_bit, label = VAC_BIT_SUCK, 0x0002, "吸"
+        elif action == "release":
+            trig, done_bit, label = VAC_BIT_RELEASE, 0x0004, "放"
+        else:
+            return False, "action 必须是 suck/release", {}
+        detail: Dict[str, Any] = {"action": action}
+
+        # 0) 前置守卫：触发位必须空闲（上一发没收尾就再写 = 竞态，拒绝）
+        ro, err = self.read_regs(ADDR_RO_TRIG, RO_WINDOW)
+        if ro is None:
+            return False, "读触发位失败: %s" % err, detail
+        if ro[0] & trig:
+            return False, "%s触发位仍为 1（上一发未收尾），已拒绝" % label, detail
+
+        # 1) 触发
+        _, err = self.write_reg(ADDR_RO_TRIG, trig)
+        if err:
+            return False, "置%s触发位失败: %s" % (label, err), detail
+        detail["triggered"] = True
+
+        # 2) 轮询完成位（40035.Bit1/Bit2）；无论成败 finally 撤触发
+        t0 = time.time()
+        done = False
+        cerr = None
+        try:
+            while time.time() - t0 < timeout:
+                wo, err = self.read_regs(ADDR_WO_STAT, 1)
+                if wo is not None and (wo[0] & done_bit):
+                    done = True
+                    break
+                time.sleep(0.05)
+        finally:
+            _, cerr = self.write_reg(ADDR_RO_TRIG, 0x0000)
+        detail["elapsed_s"] = round(time.time() - t0, 3)
+        if not done:
+            return False, ("%s完成位 %0.1fs 内未置位（检查控制器是否在 AUTO/远程模式"
+                           "且常驻服务程序(200)运行中）"
+                           % (label, timeout)), detail
+        if cerr:
+            return False, "完成但撤触发失败: %s" % cerr, detail
+        detail["done"] = True
+        return True, None, detail
+
+    def rc_vacuum_prepare(self, prog_no: int) -> Tuple[bool, Optional[str]]:
+        """确保真空服务程序常驻运行：伺服吸合 → 停止当前程序 → 加载 → 运行。
+
+        ★ 官方手册：程序运行过程中不可加载 —— 必须先 CMD_STOP（程序停止，非急停，
+          不产生运动），否则 CMD_LOAD 被控制器静默忽略（实测：prog 纹丝不动）。
+        ★ 加载成功判据 = 40006(prog) 变为目标程序号；prog_loaded 位是**残留的**
+          （上一发加载过就恒 1），只看它会误判。
+        幂等：目标程序已在运行 → 直接成功。
+        """
+        s, err = self.rc_snapshot()
+        if s is None:
+            return False, "读控制器快照失败: %s" % err
+        if s["prog"] == prog_no and s["bits"].get("run"):
+            return True, None
+        # 1) 伺服吸合（掉电时 CMD_LOAD/CMD_RUN 被忽略；上伺服不含运动指令）
+        if not s["bits"].get("servo"):
+            self.rc_command(CMD_ZERO)
+            time.sleep(0.6)
+            self.rc_command(CMD_SERVO)
+            t0 = time.time()
+            ok_servo = False
+            while time.time() - t0 < 5.0:
+                s, _ = self.rc_snapshot()
+                if s and s["bits"].get("servo"):
+                    ok_servo = True
+                    break
+                time.sleep(0.2)
+            if not ok_servo:
+                return False, "伺服 5s 内未吸合（检查急停/安全回路/示教器使能）"
+        # 2) 停止当前在跑的程序（官方：运行中不可加载）
+        _, err = self.rc_command(CMD_STOP)
+        if err:
+            return False, "CMD_STOP 失败: %s" % err
+        t0 = time.time()
+        while time.time() - t0 < 2.0:
+            s, _ = self.rc_snapshot()
+            if s and not s["bits"].get("run"):
+                break
+            time.sleep(0.1)
+        # 3) 加载（成功判据 = 目标程序号已就位；★ 不能只看 prog_loaded —— 见下）
+        _, err = self.write_reg(ADDR_SET_PROG, prog_no)
+        if err:
+            return False, "写 40104 失败: %s" % err
+        _, err = self.rc_command(CMD_LOAD)
+        if err:
+            return False, "CMD_LOAD 失败: %s" % err
+        t0 = time.time()
+        s = None
+        while time.time() - t0 < 3.0:
+            s, _ = self.rc_snapshot()
+            # ★★ 2026-09-29 实机修正：程序一 RUN 起来，"已加载"位(状态字 bit11) 会**落下**
+            #    （实测 prog=210 / run=1 / prog_loaded=0 就是正常运行态）。
+            #    原来只认 prog_loaded → 永远等不到 → 假报"程序加载失败(5005)"，
+            #    并把这个错误方向一路传给现场。判据改为「号对 + (已加载 或 运行中)」。
+            if s and s["prog"] == prog_no and (s["bits"].get("prog_loaded")
+                                               or s["bits"].get("run")):
+                break
+            time.sleep(0.1)
+        else:
+            return False, ("程序 %d 加载失败（控制器目标程序号仍为 %s）——可能是该程序号在"
+                           "控制器上不存在、有未清报警(5005)，或示教器停在文件/编辑界面"
+                           % (prog_no, s.get("prog") if s else "?"))
+        # 4) 运行（挂起等触发，不产生运动）
+        _, err = self.rc_command(CMD_RUN)
+        if err:
+            return False, "CMD_RUN 失败: %s" % err
+        t0 = time.time()
+        while time.time() - t0 < 2.0:
+            s, _ = self.rc_snapshot()
+            if s and s["bits"].get("run"):
+                return True, None
+            time.sleep(0.1)
+        return False, "程序 %d 运行位 2s 未置位" % prog_no
 
     @staticmethod
     def _max_displacement(joints: List[float],

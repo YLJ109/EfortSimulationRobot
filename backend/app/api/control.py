@@ -1342,6 +1342,43 @@ def api_jog_state():
     return jog.state()
 
 
+class VacuumIn(BaseModel):
+    action: str = Field(..., pattern="^(suck|release)$")
+    timeout: float = Field(default=6.0, gt=0.0, le=30.0)
+
+
+@router.post("/vacuum")
+def api_vacuum(body: VacuumIn, tok: str = Depends(require_control)):
+    """吸气/放气（不移动机器人关节）：写 40135.Bit1/Bit2 触发位 → 控制器常驻服务程序执行。
+
+    ★ 走与 jog 相同的真实下发双闸（real_write_enabled：EFORT_REAL_MOTION=1 + motion.real_write=true）。
+      控制器须在 AUTO/远程模式且常驻服务程序在运行，否则触发位无人响应 → 502。
+      此接口只驱动电磁阀输出（吸盘/破真空），不写任何运动指令 → 不会移动机器人。
+    ★ 2026-09-29：吸放与点动**共用同一个常驻程序 200**（见 config motion.jog/vacuum.service_program）。
+      吸气=电平保持（不自动停），停止吸气需显式按「停止吸气」。
+    """
+    if not real_write_enabled():
+        raise HTTPException(
+            403, detail="真实下发未开启（需 EFORT_REAL_MOTION=1 且 motion.real_write=true）")
+    # ★ 确保常驻服务程序在运行：伺服→停止当前→加载→运行（幂等）。
+    #   合并方案下本程序与点动是同号(200)，程序通常已在跑 → prepare 立即返回，
+    #   不再发生"停 200 → 加载 210"的来回切换（那正是 5005 反复出现的根因）。
+    from app.core.config import get_config
+    prog_no = int(get_config().get("motion", "vacuum", "service_program",
+                                   default=200) or 0)
+    if prog_no > 0:
+        ok, perr = motion.modbus.rc_vacuum_prepare(prog_no)
+        if not ok:
+            raise HTTPException(502, detail="常驻服务程序未就绪：%s" % perr)
+    ok, err, detail = motion.modbus.rc_vacuum(body.action, body.timeout)
+    if not ok:
+        raise HTTPException(502, detail=err or "吸放触发失败")
+    emit_event("control", "info", "control.vacuum",
+               "%s完成" % ("吸气" if body.action == "suck" else "放气"),
+               {"action": body.action, **(detail or {})}, actor=_actor(tok))
+    return {"ok": True, "action": body.action, "detail": detail}
+
+
 @router.post("/jog/step")
 def api_jog_step(body: JogStepIn, tok: str = Depends(require_control)):
     """增量点动：按一次走固定距离/角度（可选 0.1/1/5/10），到限位自动夹紧并提示。

@@ -83,6 +83,33 @@ const estopText = computed(() => {
       <Icon name="alert" :size="13" /> {{ exec.blockReason }}
     </p>
 
+    <!-- ★ 真空吸放：写 40135.Bit1/Bit2 触发位，控制器常驻服务程序 200 执行，不移动机器人。
+         吸气=电平保持（不自动停，需按「停止吸气」关断）；停止吸气=立即关断（默认态）。
+         ★ 状态由 store 锁存：吸气成功后持续显示"吸气中"，避免"阀开着却显示空闲"。 -->
+    <hr class="sp-hr" />
+    <div class="vac-title">
+      <Icon name="grip" :size="13" /> 真空吸放
+      <span class="h3-sub" :class="exec.vacuumState === 'suck' ? 'on-suck' : ''">
+        {{ exec.vacuumState === 'suck' ? '吸气中（保持）' : '已关断' }}
+      </span>
+    </div>
+    <div class="btns" style="margin-top:6px">
+      <button class="vac-suck" :disabled="!canControl || exec.vacuumBusy"
+              @click="exec.vacuum('suck')">
+        <Icon name="download" :size="14" /> 吸气
+      </button>
+      <button class="vac-release" :disabled="!canControl || exec.vacuumBusy"
+              @click="exec.vacuum('release')">
+        <Icon name="upload" :size="14" /> 停止吸气
+      </button>
+    </div>
+    <p v-if="exec.vacuumErr" class="pf-err">
+      <Icon name="alert" :size="13" /> {{ exec.vacuumErr }}
+    </p>
+    <p v-else class="small">
+      吸气为保持型（不会自动停止），须按「停止吸气」关断。控制器须 AUTO 且常驻程序 200 运行中。
+    </p>
+
     <div class="btns" style="margin-top:8px">
       <button class="rec-on" :disabled="!canEstop || exec.estopBusy"
               @click="exec.doEstop()">
@@ -110,4 +137,11 @@ const estopText = computed(() => {
 <style scoped>
 .ctrl-release { color: var(--warn); }
 .ctrl-release:hover { border-color: var(--warn); }
+.vac-title { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.vac-suck { color: var(--c-suck, #2f9e6f); border-color: var(--c-suck-line, #2f9e6f55); }
+.vac-suck:hover:not(:disabled) { background: var(--c-suck, #2f9e6f); color: #fff; }
+.vac-release { color: var(--c-release, #d98a2b); border-color: var(--c-release-line, #d98a2b55); }
+.vac-release:hover:not(:disabled) { background: var(--c-release, #d98a2b); color: #fff; }
+.on-suck { color: var(--c-suck, #2f9e6f); }
+.on-release { color: var(--c-release, #d98a2b); }
 </style>

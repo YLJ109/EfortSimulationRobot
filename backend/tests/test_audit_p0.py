@@ -542,6 +542,66 @@ def test_abort_check_threaded_into_dispatch(monkeypatch):
     assert cap["should_abort"]() is False
 
 
+def test_failed_dispatch_rolls_back_last_target(monkeypatch):
+    """★★ 2026-09-29：下发失败必须回滚 motion.last_target ★★
+
+    缺陷实景（真机复现）：一发失败的点动（完成位超时 / 被急停打断）机器人**没动**，
+    但原实现在**下发前**就把 last_target 推前，且失败时不回滚。而 jog._current()
+    优先取 last_target 作为下一次增量点动的基准 —— 于是"没发生过的位移"被累加：
+        实测 J6 -5.98 → 目标 -4.98（失败，未动）→ 再按，目标变成 -3.98
+    误差逐次放大，且与真实位姿越漂越远（下次真走起来就是一次跳动）。
+
+    本用例钉死两条：① 失败后 last_target 回到下发前的值；② 不能把成功值也回滚掉。
+    """
+    from app.services import collector as cmod
+    from app.services import motion as M
+
+    state = {"fail": True}
+
+    class _MB:
+        def write_reg(self, addr, value):
+            return value, None
+
+        def rc_jog_execute(self, joints, speed_pct=100, on_event=None,
+                           should_abort=None, cur_joints=None):
+            if state["fail"]:
+                return False, "注入：点动完成位超时", {}
+            return True, None, {}
+
+    # command() 会把实时真值写回 motion.real（P1-A7），跑完还原，别漏给后续用例
+    real_before = M.motion.real
+    monkeypatch.setattr(M.motion, "real", real_before, raising=False)
+    monkeypatch.setattr(M, "real_write_enabled", lambda: True)
+    monkeypatch.setattr(M.motion, "modbus", _MB())
+    monkeypatch.setattr(cmod.collector, "get_latest",
+                        lambda: {f"j{i}": 0.0 for i in range(1, 7)})
+    # 链路真实性守卫(B-02)：必须让链路看起来不是模拟，否则 command() 直接拒绝
+    monkeypatch.setenv("EFORT_SIMULATE", "auto")
+    monkeypatch.setattr(cmod.collector, "simulated", False)
+
+    M.motion.reset_estop()
+    try:
+        # ① 首次下发就失败 → last_target 必须仍是 None（不能留下一个"幽灵目标"）
+        M.motion.last_target = None
+        r = M.motion.command([10.0, 0, 0, 0, 0, 0], 5)
+        assert r["ok"] is False, r
+        assert M.motion.last_target is None, (
+            "下发失败后 last_target 必须回滚到下发前的 None，实测=%r" % (M.motion.last_target,))
+
+        # ② 成功一次落到目标，之后失败必须退回**成功值**而不是清空
+        state["fail"] = False
+        assert M.motion.command([10.0, 0, 0, 0, 0, 0], 5)["ok"] is True
+        assert M.motion.last_target and M.motion.last_target[0] == 10.0
+
+        state["fail"] = True
+        assert M.motion.command([20.0, 0, 0, 0, 0, 0], 5)["ok"] is False
+        assert M.motion.last_target[0] == 10.0, (
+            "失败必须退回上一次**成功**的逻辑目标，实测=%r" % (M.motion.last_target,))
+    finally:
+        M.motion.last_target = None
+        M.motion.reset_estop()
+
+
 # =====================================================================
 # P1-B6 —— WebSocket：Origin 校验 + 事件流/姿态流分流与鉴权
 # =====================================================================

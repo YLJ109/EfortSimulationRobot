@@ -303,8 +303,31 @@ class ReadinessService:
 
         # 6) 加载点动服务程序
         #   ★ prog_no / 白名单已在上面的"0.5) 程序号白名单"里校验并绑定，这里直接用。
-        if b["prog_loaded"] and snap["prog"] == prog_no:
-            self._step(steps, "prog", on_step, True, "程序 %d 已在加载态（跳过）" % prog_no)
+        #
+        #   ★★ 判据修正（2026-09-29 实机确认）★★
+        #   实测：控制器处于**正常运行态**时读到的是  prog=210 / run(bit6)=1 /
+        #   prog_loaded(bit11)=0 —— 即"已加载"位在程序 RUN 起来之后会**落下**。
+        #   原实现只认 prog_loaded：
+        #     · 短路条件 `prog_loaded and prog==目标` 永不成立 → 每次都去发 CMD_LOAD；
+        #     · 加载成功判据又是 `prog_loaded` → 2.5s 等不到 → 每次都假报
+        #       "程序 210 加载失败（5005=加载的程序不存在）"。
+        #   而程序其实**早就加载并在跑了** —— 这条假报警把现场一路引向
+        #   "去示教器找程序 / 退出文件管理器"的错误方向，真实原因在判据本身。
+        #   正确判据：目标程序号已就位，且处于「已加载」或「正在运行」任一态。
+        def _prog_ok(snapx) -> bool:
+            if not snapx:
+                return False
+            try:
+                if int(snapx.get("prog") or 0) != prog_no:
+                    return False
+            except (TypeError, ValueError):
+                return False
+            bb = snapx.get("bits") or {}
+            return bool(bb.get("prog_loaded") or bb.get("run"))
+
+        if _prog_ok(snap):
+            self._step(steps, "prog", on_step, True,
+                       "程序 %d 已在加载/运行态（跳过加载）" % prog_no)
         else:
             _, e1 = mb.write_reg(ADDR_SET_PROG, prog_no)    # 40104 目标程序号
             if e1:
@@ -314,19 +337,25 @@ class ReadinessService:
                 return {"ok": False, "error": "加载命令失败: %s" % e2, "steps": steps}
             t0 = time.time()
             loaded = False
-            while time.time() - t0 < 2.5:
+            s2 = None
+            while time.time() - t0 < 3.0:
                 s2, _ = mb.rc_snapshot()
-                if s2 and s2["bits"]["prog_loaded"]:
+                if _prog_ok(s2):
                     loaded = True
                     break
                 time.sleep(0.1)
+            got = (s2 or {}).get("prog")
             self._step(steps, "prog", on_step, loaded,
-                       "程序 %d 已加载（%.2fs）" % (prog_no, time.time() - t0) if loaded
-                       else "程序加载位 2.5s 内未置位（5005=程序不存在？）")
+                       "程序 %d 已就位（%.2fs）" % (prog_no, time.time() - t0) if loaded
+                       else "程序 %d 未就位（目标程序号仍为 %s）" % (prog_no, got))
             if not loaded:
                 return {"ok": False,
-                        "error": ("程序 %d 加载失败（5005=加载的程序不存在；确认控制器上有 "
-                                  "JOGSVC/点动程序且示教器没停在文件管理器）" % prog_no),
+                        "error": ("程序 %d 未加载成功：控制器目标程序号仍为 %s（未切到 %d）。"
+                                  "可能原因：① 控制器上确实没有该程序号；"
+                                  "② 控制器有报警未清（如 5005 加载错误）；"
+                                  "③ 示教器停在文件管理/编辑界面时拒绝远程加载。"
+                                  "请在示教器确认程序 %d 存在、退出文件界面后重试"
+                                  % (prog_no, got, prog_no, prog_no)),
                         "steps": steps}
 
         # 7) 运行（程序会执行到 WAIT 挂起等触发 —— 不产生任何运动）

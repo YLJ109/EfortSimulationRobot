@@ -1,136 +1,104 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--Date(ymd)/time(hms) 2026/09/29 14:20:00-->
+<!-- Date(ymd)/time(hms) 2026/09/29 16:50:00 -->
 <Xpl-source>
-  <HostEnvironment>
-    <Config>
-      <FileId>0x2100a210</FileId>
-      <Target>Robox Motion Control</Target>
-      <XplType>RoboticProgramLanguage</XplType>
-    </Config>
-  </HostEnvironment>
-  <XplEnvironment>
-    <Info>
-      <Title LcId="1033"><![CDATA[210 吸气/放气服务]]]></Title>
-      <Description LcId="1033"><![CDATA[纯吸放常驻服务：40135.Bit1=吸气 Bit2=放气；与 200 轮流使用（200 含点动，本程序仅吸放，不含点动）]]></Description>
-      <Version>1.0.0</Version>
-      <Author>FIT</Author>
-    </Info>
-    <VarDeclarations>
-      <VarExtern/>
-      <VarGlobal/>
-    </VarDeclarations>
-    <Pous>
-      <Pou>
-        <Name>Main</Name>
-        <Type>Program</Type>
-        <VarDeclarations/>
-        <Body>
-          <while>
-            <cond>true</cond>
-            <pouref>1</pouref>
-          </while>
-          <end_pro/>
-        </Body>
-      </Pou>
-      <Pou>
-        <Name>1</Name>
-        <Body>
-          <rem>
-            <text>调度：每扫描一轮依次门控 吸气(Bit1)/放气(Bit2)。铁律2：并行门控，不串联阻塞 WAIT（避免一个服务卡死饿死另一个）。</text>
-          </rem>
-          <while>
-            <cond>fidbus.mtcp_ro_b[1]</cond>
-            <pouref>2</pouref>
-          </while>
-          <while>
-            <cond>fidbus.mtcp_ro_b[2]</cond>
-            <pouref>3</pouref>
-          </while>
-          <dwell>
-            <expr>0.02</expr>
-          </dwell>
-        </Body>
-      </Pou>
-      <Pou>
-        <Name>2</Name>
-        <Body>
-          <rem>
-            <text>① 吸气服务：等 40135.Bit1 → io.DOut[8]=true 吸真空</text>
-          </rem>
-          <set>
-            <dest>fidbus.mtcp_wo_b[1]</dest>
-            <expr>false</expr>
-          </set>
-          <wait>
-            <condition>fidbus.mtcp_ro_b[1]</condition>
-            <timeout></timeout>
-            <var></var>
-          </wait>
-          <set>
-            <dest>io.DOut[8]</dest>
-            <expr>true</expr>
-          </set>
-          <dwell>
-            <expr>0.30</expr>
-          </dwell>
-          <set>
-            <dest>fidbus.mtcp_wo_b[1]</dest>
-            <expr>true</expr>
-          </set>
-          <wait>
-            <condition>!fidbus.mtcp_ro_b[1]</condition>
-            <timeout></timeout>
-            <var></var>
-          </wait>
-        </Body>
-      </Pou>
-      <Pou>
-        <Name>3</Name>
-        <Body>
-          <rem>
-            <text>② 放气服务：等 40135.Bit2 → io.DOut[8]=false 断吸 + io.DOut[9] 吹气破真空</text>
-          </rem>
-          <set>
-            <dest>fidbus.mtcp_wo_b[2]</dest>
-            <expr>false</expr>
-          </set>
-          <wait>
-            <condition>fidbus.mtcp_ro_b[2]</condition>
-            <timeout></timeout>
-            <var></var>
-          </wait>
-          <set>
-            <dest>io.DOut[8]</dest>
-            <expr>false</expr>
-          </set>
-          <dwell>
-            <expr>0.30</expr>
-          </dwell>
-          <set>
-            <dest>io.DOut[9]</dest>
-            <expr>true</expr>
-          </set>
-          <dwell>
-            <expr>0.40</expr>
-          </dwell>
-          <set>
-            <dest>io.DOut[9]</dest>
-            <expr>false</expr>
-          </set>
-          <dwell>
-            <expr>0.10</expr>
-          </dwell>
-          <set>
-            <dest>fidbus.mtcp_wo_b[2]</dest>
-            <expr>true</expr>
-          </set>
-          <wait>
-            <condition>!fidbus.mtcp_ro_b[2]</condition>
-            <timeout></timeout>
-            <var></var>
-          </wait>
-        </Body>
-      </Pou>
-    </Pous>
-  </XplEnvironment>
+<HostEnvironment>
+<Config>
+<FileId>0x2100a210</FileId>
+<Target>Robox Motion Control</Target>
+<XplType>RoboticProgramLanguage</XplType>
+</Config>
+</HostEnvironment>
+<XplEnvironment>
+<Title LcId="1033">
+<![CDATA[210 吸气/放气服务]]>
+</Title>
+<Description LcId="1033">
+<![CDATA[吸放常驻服务：40135.Bit1=吸气(保持) Bit2=放气(默认态,仅关断)。★ 注意：DOut[8] 是参考项目接法，本机电磁阀实际输出号以现场实测为准（改 <dest>io.DOut[N]</dest> 的 N）]]>
+</Description>
+<Version>1.1.0</Version>
+<Author>FIT</Author>
+<Pous>
+<Pou>
+<Name>Main</Name>
+<Type>Program</Type>
+<Body>
+<while>
+<cond>true</cond>
+<pouref>1</pouref>
+</while>
+</Body>
+<Pou>
+<Name>1</Name>
+<Body>
+<rem>
+<text>调度：并行门控 吸(Bit1)/放(Bit2)。吸气=输出保持 ON；放气=输出 OFF（默认态）</text>
+</rem>
+<set>
+<dest>fidbus.mtcp_wo_b[1]</dest>
+<expr>false</expr>
+</set>
+<set>
+<dest>fidbus.mtcp_wo_b[2]</dest>
+<expr>false</expr>
+</set>
+<while>
+<cond>fidbus.mtcp_ro_b[1]</cond>
+<pouref>2</pouref>
+</while>
+<while>
+<cond>fidbus.mtcp_ro_b[2]</cond>
+<pouref>3</pouref>
+</while>
+<dwell>
+<expr>0.02</expr>
+</dwell>
+</Body>
+<Pou>
+<Name>2</Name>
+<Body>
+<rem>
+<text>吸气：DOut[N]=true 并保持（直到放气）；★ N 以现场实测电磁阀为准，当前 8 为参考项目接法</text>
+</rem>
+<wait>
+<condition>fidbus.mtcp_ro_b[1]</condition>
+</wait>
+<set>
+<dest>io.DOut[8]</dest>
+<expr>true</expr>
+</set>
+<set>
+<dest>fidbus.mtcp_wo_b[1]</dest>
+<expr>true</expr>
+</set>
+<wait>
+<condition>!fidbus.mtcp_ro_b[1]</condition>
+</wait>
+</Body>
+</Pou>
+<Pou>
+<Name>3</Name>
+<Body>
+<rem>
+<text>放气（默认态）：DOut[N]=false 关真空，程序回到挂起等触发</text>
+</rem>
+<wait>
+<condition>fidbus.mtcp_ro_b[2]</condition>
+</wait>
+<set>
+<dest>io.DOut[8]</dest>
+<expr>false</expr>
+</set>
+<set>
+<dest>fidbus.mtcp_wo_b[2]</dest>
+<expr>true</expr>
+</set>
+<wait>
+<condition>!fidbus.mtcp_ro_b[2]</condition>
+</wait>
+</Body>
+</Pou>
+</Pou>
+</Pou>
+</Pous>
+</XplEnvironment>
 </Xpl-source>

@@ -2,10 +2,13 @@
 """四条安全红线的回归测试（全维度审查 2026-09-25）。
 
 红线：
-  R1 轴锁：默认全轴可动；仅 AI 测试模式（config motion.joint_lock.enabled=true）下仅 J6 可控。
+  R1 轴锁：**现场默认 = 仅 J6 可动**（robot.yaml joint_lock.enabled=true，J1~J5 锁定，
+           仿真同限）；测试环境由 conftest._pin_joint_lock_off 统一钉为关闭，
+           以便用例只测机制（用例体内 monkeypatch 可覆盖）。
   R2 速度下限：任何下发 speed_pct 必须 >= 5（Pydantic 边界 + 后端 clamp）。
   R3 真机不可误写：测试环境 EFORT_REAL_MOTION=0 / simulate=always → 永远走 sim，不写 192.168.1.12:502。
-  R4 程序白名单：/api/ready 只允许加载白名单内的程序号，operator/管理员令牌都不能越权跑任意程序。
+  R4 程序白名单：/api/ready 只允许加载白名单内的程序号，operator/管理员令牌都不能越权跑任意程序；
+           且点动/吸放必须共用同一个真实存在的服务程序号 200（拆号=来回切程序=5005）。
 
 全部用 TestClient + monkeypatch，不连真机、不写寄存器。
 """
@@ -103,14 +106,67 @@ def test_parse_joints_accepts_valid():
 
 
 # ---------------------------------------------------------------- R1 轴锁
-def test_joint_lock_default_off_allows_all():
-    """★ R1：默认 joint_lock.enabled=false → J1–J6 全轴可控（操作员需求）。"""
+def test_joint_lock_off_in_test_env_allows_all():
+    """★ R1：测试环境轴锁被统一钉为关闭（conftest._pin_joint_lock_off）→ 全轴可动。
+
+    这里断言的是"测试夹具生效"，不是"现场默认"。现场默认见下一条。
+    """
     st = sc.joint_lock_state()
     assert st["enabled"] is False
+    assert st["locked"] == []
 
 
-def test_move_default_allows_j1(client):
-    """★ R1：默认（锁关闭）下移动 J1 应成功（sim）。"""
+def test_shipped_config_defaults_to_j6_only():
+    """★★ R1：**现场出厂默认必须是「仅 J6」**（2026-09-29 用户口径）。
+
+    直接读 config/robot.yaml 的原始文本（绕开测试环境的"钉关闭"夹具，也不受
+    config/app_settings.json 覆盖层影响），防止现场配置被误改回"全轴可动"。
+    这是与安全直接相关的现场策略，一旦漂移必须报红。
+    """
+    import os
+    import yaml as _yaml
+    from app.core.config import project_root
+
+    path = os.path.join(project_root(), "config", "robot.yaml")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = _yaml.safe_load(f)
+    jl = (raw.get("motion") or {}).get("joint_lock") or {}
+    assert jl.get("enabled") is True, "现场默认必须为仅 J6（joint_lock.enabled: true）"
+    assert [int(x) for x in (jl.get("locked_joints") or [])] == [1, 2, 3, 4, 5]
+    assert int(jl.get("only_joint")) == 6
+    assert jl.get("apply_in_sim") is True, "仿真必须同限，否则'真机不能动、仿真能动'"
+
+
+def test_shipped_config_has_no_stale_program_number():
+    """★★ R4/R1：点动与吸放必须**共用同一个常驻服务程序号**，且该号在就绪白名单内。
+
+    历史教训（2026-09-29）：点动/吸放被拆成两个号后，每按一次按钮 Web 端都要
+    「停当前程序 → 加载另一个号 → 运行」；而被切过去的号在控制器上并不存在
+    → 反复报 5005（加载的程序不存在）。当前现场该号为 **210**（三合一），
+    200 是旧的纯点动程序（留作回退）。
+      本用例把"两者必须相等 + 必须在白名单里"钉死，防止有人再把它们拆开
+    —— 注意不写死具体数字，因为现场换号（200↔210）属正常运维，不该报红。
+    """
+    import os
+    import yaml as _yaml
+    from app.core.config import project_root
+
+    path = os.path.join(project_root(), "config", "robot.yaml")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = _yaml.safe_load(f)
+    mo = raw.get("motion") or {}
+    jog_prog = int((mo.get("jog") or {}).get("service_program") or 0)
+    vac_prog = int((mo.get("vacuum") or {}).get("service_program") or 0)
+    assert jog_prog > 0, "点动服务程序号必须显式配置（0 = 未指定，加载会 5005）"
+    assert vac_prog == jog_prog, (
+        "吸放必须与点动共用同一个常驻程序号；拆号 = 每按按钮来回切程序 → 反复 5005")
+    allowed = [int(x) for x in ((mo.get("ready") or {}).get("allowed_programs") or [])]
+    assert jog_prog in allowed, "服务程序号必须在 /api/ready 白名单内，否则一键就绪会被拦"
+    assert 411 not in allowed, "产线/测试程序不得进入就绪白名单"
+
+
+def test_move_allows_j1_when_lock_off(client):
+    """★ R1：轴锁关闭（测试夹具口径）下移动 J1 应成功（sim）。"""
     r = client.post("/api/control/move",
                     json={"joints": [10, 0, 0, 0, 0, 0], "speed_pct": 5},
                     headers=_admin(client))

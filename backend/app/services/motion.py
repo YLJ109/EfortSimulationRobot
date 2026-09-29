@@ -183,6 +183,12 @@ class MotionService:
                         "error": "当前位姿已过期（遥测冻结），读数不可信，已拒绝真机下发"}
 
         with self._lock:
+            # ★ 2026-09-29：失败回滚基线。last_target 是"逻辑目标"，增量点动的下一次
+            #   目标由它推算（jog._current() 优先取它）。原实现在**下发前**就无条件把
+            #   last_target 推前，失败也不回滚 → 一发失败的 1° 点动虽然机器人没动，
+            #   但逻辑目标已经跑了 1°，下一次按下会走 2°（实测：-5.98 → 目标 -4.98 失败
+            #   → 再按目标变成 -3.98），误差逐次累积、且与真实位姿越漂越远。
+            _prev_target = self.last_target
             self.moving = True
             self.last_target = [round(float(x), 3) for x in joints]
             self.last_error = None
@@ -215,6 +221,7 @@ class MotionService:
                 with self._lock:
                     self.moving = False
                     self.last_error = err
+                    self.last_target = _prev_target     # ★ 失败回滚（见上）
                 return {"ok": False, "mode": mode, "error": "写速度设定失败: %s" % err}
             # ★ 全维度审查 B-03：速度是安全红线，必须**回读比对数值**
             #   （40139~40144 有完整回读，唯独速度这条最关键的通道原来只查错误码、
@@ -228,6 +235,7 @@ class MotionService:
                     self.moving = False
                     self.last_error = ("速度设定回读不一致：写 %d%% 读回 %d%%"
                                        % (speed_40103, echo_i))
+                    self.last_target = _prev_target     # ★ 失败回滚（见上）
                 log.error("速度回读不一致，已中止下发: %s", self.last_error)
                 return {"ok": False, "mode": mode, "error": self.last_error,
                         "speed_written": speed_40103, "speed_echo": echo_i}
@@ -255,12 +263,17 @@ class MotionService:
                 with self._lock:
                     self.moving = False
                     self.last_error = str(e)
+                    self.last_target = _prev_target     # ★ 失败回滚（见上）
                 return {"ok": False, "mode": mode, "error": "下发异常: %s" % e}
             with self._lock:
                 self.moving = False
                 self.last_executed_at = time.time()
                 if not ok:
                     self.last_error = err
+                    # ★ 失败回滚：机器人没到位（完成位超时/被急停打断/触发失败），
+                    #   逻辑目标必须退回到下发前 —— 否则下一次增量点动会基于一个
+                    #   "没发生过的位移"累加，误差逐次放大。
+                    self.last_target = _prev_target
                     return {"ok": False, "mode": mode, "error": err or "下发失败",
                             "detail": detail}
             return {"ok": True, "target": self.last_target,
