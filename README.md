@@ -1,13 +1,43 @@
-# EFORT Web Monitoring
+# EfortSimulationRobot
 
 埃夫特 **ER8-700H** 六轴工业机器人 · **全栈网页端三维实时监控与仿真系统**。
+
+> **关于本项目（About）**：基于 Modbus TCP 读取真实控制器数据、用 Three.js 按官方 DH 参数驱动
+> **STEP 数模导出的 GLB**，在浏览器里 1:1 还原机器人并实时跟随；支持关节/机器人（笛卡尔六自由度）
+> 双模式操控、轨迹录制回放、工业安全围栏四级报警、海康工业相机 + YOLO 视觉检测。
+> 后端 FastAPI + WebSocket，前端 Vue3 + Pinia + Three.js，相机独立进程 MJPEG 推流。
+
+| 项目图片 · ER8-700H 官方数模渲染与规格 | |
+|---|---|
+| ![ER8-700H 渲染主视图](assets/cad/ds_full.png) | ![左视图](assets/cad/ds_left.png) |
+| **渲染主视图（ds_full）** | **左视图（ds_left）** |
+| ![右视图](assets/cad/ds_right.png) | ![底部视角](assets/cad/z_bottom.png) |
+| **右视图（ds_right）** | **底部视角（z_bottom）** |
+| ![运动范围](assets/cad/mr_hi.png) | ![数据手册](assets/cad/ER8-700H_datasheet_p1.png) |
+| **运动范围图（motion range）** | **官方数据手册首页（PDF：[ER8-700H_datasheet.pdf](assets/cad/ER8-700H_datasheet.pdf)）** |
+
+> 完整素材：`assets/cad/`（12 张图 + 2 份 PDF：数据手册 / 运动范围）。
 
 后端通过 Modbus TCP 读取机器人关节角 (J1–J6) → 正运动学计算 TCP → WebSocket 实时推送；
 前端用 Three.js 按 DH 参数驱动 **官方 STEP 数模导出的 GLB**，真实还原机器人形态并实时跟随。
 > ⚠️ **不是纯只读系统**：默认（双闸关闭）只读不写；双闸打开后 `/api/control/*` 会真机下发。
 > 完整的写入权限与安全约束见 [§8.2 写入权限与双闸](#82-控制--运动学-apicontrol)。
-前端用 Three.js 按 DH 参数驱动 **官方 STEP 数模导出的 GLB**，真实还原机器人形态并实时跟随。
 内置工业安全围栏（区域越界 + 地面碰撞四级报警）、实验室场景、离线模拟演示、录制回放与视觉检测。
+
+---
+
+## 〇、项目速览（About）
+
+| 项 | 内容 |
+|---|---|
+| **名称** | EfortSimulationRobot |
+| **对象** | 埃夫特 ER8-700H 六轴工业机器人（负载 8kg / 臂展 700mm，见 `assets/cad/ER8-700H_datasheet.pdf`） |
+| **形态** | FastAPI 后端(:8000) + Vue3/Three.js 前端 + 独立相机服务(:8100) + SQLite(WAL) |
+| **通信** | Modbus TCP 192.168.1.12:502（读位姿常态 20Hz；写指令需"双闸 + 控制令牌"） |
+| **三维** | 官方 STEP 数模 → GLB；按 DH 参数建立运动链；智能剖切 / 实验室场景 / 安全围栏 |
+| **操控** | 关节模式（J1–J6 滑条）/ 机器人模式（机器人坐标系六自由度 X/Y/Z + A/B/C，IK 整臂联动） |
+| **视觉** | 海康 MV-CU120-10GM GigE 相机 MJPEG 实时流 + YOLO 目标检测（按需加载/一键释放） |
+| **安全** | 围栏四级阈值(安全/接近/危险/碰撞) + 最低点离台面高度检测 + 双闸写入 + 控制令牌 + 急停 |
 
 ---
 

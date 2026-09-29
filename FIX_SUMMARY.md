@@ -1,4 +1,4 @@
-# EFORT Web Monitoring - 问题修复完成总结
+# EfortSimulationRobot - 问题修复完成总结
 
 ## 执行状态
 - ✅ 后端测试：**197 passed**（原 185，本轮新增限位收敛 + `/ready/cancel` 4 例）
