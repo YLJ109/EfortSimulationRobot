@@ -230,41 +230,52 @@ class ReadinessService:
                     "error": "控制器在手动档（T1/T2）：上位机指令无效，请把模式开关拨到 AUTO 或 远程",
                     "steps": steps}
 
-        # 3.5) ★★ 2026-09-29 实机修复：清报警前**必须先停掉正在运行的程序** ★★
-        #   实测（真机复现）：程序还在跑的时候发 CMD_CLEAR(0x1009)，报警**看起来清掉了**，
+        # 4) 报警
+        #   ★★ 2026-09-29 实机修复：**清报警必须先停掉正在运行的程序** ★★
+        #   实测（真机复现）：程序还在跑的时候发 CMD_CLEAR(0x1009)，报警看起来清掉了，
         #   但 0.5s 内就被那个（坏/半残的）运行中程序重新顶上来：
         #       初始   alarm=1(5005) run=1
         #       CMD_STOP  → run=0（报警仍在）
         #       CMD_CLEAR → alarm=0/0 **且不再复现**
-        #   于是原顺序下流程必然报"清报警后仍处于报警状态（5005）"，而那条提示语
-        #   把矛头指向示教器（"退出文件管理器/恢复连接"）—— **真因是顺序**，
-        #   整轮排查都被这句话带偏。
+        #   于是原顺序必然报"清报警后仍处于报警状态（5005）"，而那条提示语把矛头
+        #   指向示教器（"退出文件管理器/恢复连接"）—— **真因是顺序**。
         #   CMD_STOP 是"程序停止"，不是急停：不断伺服、不产生任何位移。
-        #   （官方手册亦明确：程序运行中不可加载，加载前必须先 STOP。）
-        if b.get("run"):
-            _, sterr = mb.rc_command(CMD_STOP)
-            if sterr:
-                self._step(steps, "stop", on_step, False, "停止程序失败: %s" % sterr)
-                return {"ok": False, "error": "停掉当前程序失败: %s（清报警前需先停机）" % sterr,
-                        "steps": steps}
-            t0 = time.time()
-            stopped = False
-            while time.time() - t0 < 2.0:
-                s2, _ = mb.rc_snapshot()
-                if s2 and not s2["bits"].get("run"):
-                    stopped = True
-                    break
-                time.sleep(0.1)
-            self._step(steps, "stop", on_step, stopped,
-                       "已停机（%.2fs）——为让清报警生效，程序必须先停" % (time.time() - t0)
-                       if stopped else "停机后运行位 2s 内未落下")
-            if not stopped:
-                return {"ok": False,
-                        "error": "程序仍在运行（运行位未落下），无法可靠清报警。"
-                                 "请确认控制器急停/安全回路正常后重试",
-                        "steps": steps}
+        #
+        #   ★★ 注意：**只在真有报警时才停机** ★★
+        #   第一版把停机写成了无条件执行 —— 结果"程序本来正常在跑、无报警"这条
+        #   最常见的路径也被停掉，而 STOP 之后 `_prog_ok` 认为已完成加载会跳过
+        #   CMD_LOAD，紧接着 CMD_RUN 起不来（实测 2.5s 运行位不置位）。
+        #   所以停机与"强制重新加载"必须配对出现，且只在清报警这条支路上。
+        stopped_for_alarm = False
+        if b["alarm"]:
+            if b.get("run"):
+                _, sterr = mb.rc_command(CMD_STOP)
+                if sterr:
+                    self._step(steps, "stop", on_step, False, "停止程序失败: %s" % sterr)
+                    return {"ok": False,
+                            "error": "停掉当前程序失败: %s（清报警前需先停机）" % sterr,
+                            "steps": steps}
+                t0 = time.time()
+                stopped = False
+                while time.time() - t0 < 2.0:
+                    s2, _ = mb.rc_snapshot()
+                    if s2 and not s2["bits"].get("run"):
+                        stopped = True
+                        break
+                    time.sleep(0.1)
+                self._step(steps, "stop", on_step, stopped,
+                           "已停机（%.2fs）——运行中的程序会把报警重新顶上来，"
+                           "必须先停再清" % (time.time() - t0) if stopped
+                           else "停机后运行位 2s 内未落下")
+                if not stopped:
+                    return {"ok": False,
+                            "error": "程序仍在运行（运行位未落下），无法可靠清报警。"
+                                     "请确认控制器急停/安全回路正常后重试",
+                            "steps": steps}
+                b = dict(b)
+                b["run"] = 0
+                stopped_for_alarm = True
 
-        # 4) 报警
         if b["alarm"]:
             # ★ 现场实测：0x1009 清报警后控制器需要一点时间回写报警位，单次 0.4s
             #   轮询偶尔会"抓到还没落定"的报警位 → 误报"清报警后仍处于报警状态"。
@@ -363,10 +374,14 @@ class ReadinessService:
             bb = snapx.get("bits") or {}
             return bool(bb.get("prog_loaded") or bb.get("run"))
 
-        if _prog_ok(snap):
+        if (not stopped_for_alarm) and _prog_ok(snap):
             self._step(steps, "prog", on_step, True,
                        "程序 %d 已在加载/运行态（跳过加载）" % prog_no)
         else:
+            # ★ 刚为清报警 STOP 过 → 加载状态已被打断，**必须重新 LOAD**，
+            #   否则紧接着的 CMD_RUN 起不来（实测：跳过加载 → 运行位 2.5s 不置位）。
+            #   （不额外上报中间步骤，避免出现两条同名的 prog 步骤；原因写进最终文案。）
+            why_reload = "（因清报警停过程序，强制重新加载）" if stopped_for_alarm else ""
             _, e1 = mb.write_reg(ADDR_SET_PROG, prog_no)    # 40104 目标程序号
             if e1:
                 return {"ok": False, "error": "写目标程序号失败: %s" % e1, "steps": steps}
@@ -384,7 +399,8 @@ class ReadinessService:
                 time.sleep(0.1)
             got = (s2 or {}).get("prog")
             self._step(steps, "prog", on_step, loaded,
-                       "程序 %d 已就位（%.2fs）" % (prog_no, time.time() - t0) if loaded
+                       ("程序 %d 已就位（%.2fs）%s"
+                        % (prog_no, time.time() - t0, why_reload)) if loaded
                        else "程序 %d 未就位（目标程序号仍为 %s）" % (prog_no, got))
             if not loaded:
                 return {"ok": False,

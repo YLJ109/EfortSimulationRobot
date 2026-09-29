@@ -258,6 +258,84 @@ def test_ready_allows_whitelisted_program(client, monkeypatch, fake_ready_mb):
     assert "不在就绪白名单" not in (d.get("error") or "")
 
 
+# ---------------------------------------------------------------- 就绪流程：停机时机
+def test_ready_does_not_stop_healthy_running_program(client, monkeypatch, fake_ready_mb):
+    """★★ 回归：程序已正常运行且**无报警**时，就绪流程不得发 CMD_STOP ★★
+
+    缺陷实景（2026-09-29 真机）：为"清报警必须先停机"新增的 STOP 被写成**无条件**执行
+    —— 于是"程序本来正常在跑、没有报警"这条最常见的路径也被停掉；而 STOP 之后
+    加载状态已被打断，`_prog_ok` 却认为已完成加载会跳过 CMD_LOAD，紧接着 CMD_RUN
+    起不来（实测：运行位 2.5s 不置位，一键就绪直接失败）。
+    本条把"无报警绝不停机"钉死。
+    """
+    import app.services.motion as motion
+    import app.services.rc_ready as rc_ready
+    monkeypatch.setattr(motion, "real_write_enabled", lambda: True)
+    monkeypatch.setattr(rc_ready, "real_write_enabled", lambda: True)
+    # 假控制器：200 已在运行、无报警
+    fake = fake_ready_mb
+    r = client.post("/api/ready", json={"prog": 200}, headers=_admin(client))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d.get("ok") is True, d
+    cmds = [c[1] for c in fake.calls if isinstance(c, tuple) and c[0] == "cmd"]
+    assert rc_ready.CMD_STOP not in cmds, (
+        "无报警时不该发 CMD_STOP（实测会把健康的常驻程序停掉→运行位起不来）: %s" % cmds)
+    steps = [s["step"] for s in d.get("steps", [])]
+    assert "stop" not in steps, "无报警时不该出现 stop 步骤: %s" % steps
+
+
+def test_ready_stops_before_clearing_alarm(client, monkeypatch, fake_ready_mb):
+    """★★ 回归：**有报警**时必须「先 CMD_STOP 停机、再 CMD_CLEAR 清报警」★★
+
+    真机复现：程序还在跑时清报警，报警 0.5s 内就被它重新顶上来
+    （实测 alarm=1/run=1 → STOP 后 run=0 → 此时 CLEAR 才生效且不复现）。
+    顺序错了就会假报"清报警后仍处于报警状态(5005)"，并把矛头指向示教器。
+    """
+    import app.api.robot as robot_api
+    import app.services.motion as motion
+    import app.services.rc_ready as rc_ready
+    monkeypatch.setattr(motion, "real_write_enabled", lambda: True)
+    monkeypatch.setattr(rc_ready, "real_write_enabled", lambda: True)
+
+    class _MB:
+        """最小控制器模型：STOP 后运行位真的落下；报警恒清不掉（只为验证**顺序**）。"""
+
+        def __init__(self):
+            self.calls = []
+            self.run = 1
+
+        def rc_snapshot(self):
+            self.calls.append("snapshot")
+            return {
+                "ok": True, "status_word": 0, "mode": "auto",
+                "bits": {"servo": 1, "alarm": 1, "prog_loaded": 1, "run": self.run,
+                         "manual": 0, "auto": 1, "remote": 0, "estop": 0},
+                "prog": 200, "alarm1": 5005, "alarm2": 0,
+                "jog_trig": False, "speed_pct": 5, "joints": [0.0] * 6,
+            }, None
+
+        def rc_command(self, cmd):
+            self.calls.append(("cmd", cmd))
+            if cmd == rc_ready.CMD_STOP:
+                self.run = 0     # ★ 停机后运行位落下（否则流程走不到清报警，测不出顺序）
+            return True, None
+
+        def write_reg(self, addr, val):
+            self.calls.append(("write", addr, val))
+            return val, None
+
+    fake = _MB()
+    monkeypatch.setattr(robot_api._ready, "_mb", fake, raising=True)
+    r = client.post("/api/ready", json={"prog": 200}, headers=_admin(client))
+    assert r.status_code == 200, r.text
+    cmds = [c[1] for c in fake.calls if isinstance(c, tuple) and c[0] == "cmd"]
+    assert rc_ready.CMD_STOP in cmds, "有报警且程序在跑时必须先停机: %s" % cmds
+    assert rc_ready.CMD_CLEAR in cmds, "必须尝试清报警: %s" % cmds
+    assert cmds.index(rc_ready.CMD_STOP) < cmds.index(rc_ready.CMD_CLEAR), (
+        "顺序必须是 STOP 早于 CLEAR，实测反了就会把 5005 一次次顶回来: %s" % cmds)
+
+
 # ---------------------------------------------------------------- 急停结果可见（B-06）
 def test_estop_returns_stopped(client):
     """★ B-06：急停必须返回 stopped=true（不能「以为停了实际没停」）。"""

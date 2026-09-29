@@ -83,9 +83,11 @@ const estopText = computed(() => {
       <Icon name="alert" :size="13" /> {{ exec.blockReason }}
     </p>
 
-    <!-- ★ 真空吸放：写 40135.Bit1/Bit2 触发位，控制器常驻服务程序 200 执行，不移动机器人。
+    <!-- ★ 真空吸放：写 40135.Bit1/Bit2 触发位，控制器常驻服务程序 **210** 执行，不移动机器人。
          吸气=电平保持（不自动停，需按「停止吸气」关断）；停止吸气=立即关断（默认态）。
-         ★ 状态由 store 锁存：吸气成功后持续显示"吸气中"，避免"阀开着却显示空闲"。 -->
+         ★ 状态由 store 锁存：吸气成功后持续显示"吸气中"，避免"阀开着却显示空闲"。
+         ★ 「停止吸气」**不因 vacuumBusy 被禁用** —— 它是安全动作，
+           哪怕上一发吸气请求还挂着，操作员也必须能立刻关阀。 -->
     <hr class="sp-hr" />
     <div class="vac-title">
       <Icon name="grip" :size="13" /> 真空吸放
@@ -94,11 +96,12 @@ const estopText = computed(() => {
       </span>
     </div>
     <div class="btns" style="margin-top:6px">
-      <button class="vac-suck" :disabled="!canControl || exec.vacuumBusy"
+      <button class="vac-suck" :class="{ 'is-on': exec.vacuumState === 'suck' }"
+              :disabled="!canControl || exec.vacuumBusy"
               @click="exec.vacuum('suck')">
         <Icon name="download" :size="14" /> 吸气
       </button>
-      <button class="vac-release" :disabled="!canControl || exec.vacuumBusy"
+      <button class="vac-release" :disabled="!canControl"
               @click="exec.vacuum('release')">
         <Icon name="upload" :size="14" /> 停止吸气
       </button>
@@ -107,7 +110,7 @@ const estopText = computed(() => {
       <Icon name="alert" :size="13" /> {{ exec.vacuumErr }}
     </p>
     <p v-else class="small">
-      吸气为保持型（不会自动停止），须按「停止吸气」关断。控制器须 AUTO 且常驻程序 200 运行中。
+      吸气为保持型（不会自动停止），须按「停止吸气」关断。控制器须 AUTO 且常驻程序 210 运行中。
     </p>
 
     <div class="btns" style="margin-top:8px">
@@ -140,8 +143,10 @@ const estopText = computed(() => {
 .vac-title { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-top: 4px; }
 .vac-suck { color: var(--c-suck, #2f9e6f); border-color: var(--c-suck-line, #2f9e6f55); }
 .vac-suck:hover:not(:disabled) { background: var(--c-suck, #2f9e6f); color: #fff; }
+/* ★ 吸气是"保持型"执行器 —— 保持中时按钮必须看得出是"已engage"，
+   否则截图给现场看，没人能一眼分辨"按过没生效"还是"正保持中"。 */
+.vac-suck.is-on { background: var(--c-suck, #2f9e6f); color: #fff; border-color: var(--c-suck, #2f9e6f); }
 .vac-release { color: var(--c-release, #d98a2b); border-color: var(--c-release-line, #d98a2b55); }
 .vac-release:hover:not(:disabled) { background: var(--c-release, #d98a2b); color: #fff; }
 .on-suck { color: var(--c-suck, #2f9e6f); }
-.on-release { color: var(--c-release, #d98a2b); }
 </style>

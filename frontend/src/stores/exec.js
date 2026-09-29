@@ -113,6 +113,8 @@ export const useExecStore = defineStore("exec", {
     vacuumState: "idle",   // idle | suck
     vacuumBusy: false,
     vacuumErr: null,
+    // ★ 「停止吸气」在上一发还飞时被按下 → 记为待补发，收尾后立刻执行，绝不丢弃。
+    vacuumPendingRelease: false,
 
     // ---- 程序执行运行态 ----
     running: false,
@@ -1108,6 +1110,18 @@ export const useExecStore = defineStore("exec", {
     async vacuum(action) {
       if (action !== "suck" && action !== "release") return;
       if (this.needAuth()) return;
+
+      // ★★ 安全优先：**停止吸气请求绝不丢弃** ★★
+      //   上一发（通常是吸气）还在飞时，后端 rc_vacuum 的前置守卫会以
+      //   「吸触发位仍为 1（上一发未收尾），已拒绝」回 502 ——
+      //   操作员慌乱中按"停止吸气"，看到的是"按了没反应还报错"，而阀其实还开着。
+      //   这里记下意图，等上一发收尾后立刻补发，保证"停"的语义最终一定生效。
+      if (action === "release" && this.vacuumBusy) {
+        this.vacuumPendingRelease = true;
+        this.logLine("info", "停止吸气已排队：等上一发收尾后立即执行");
+        return;
+      }
+
       const prev = this.vacuumState;   // 失败时回退，绝不谎报阀状态
       this.vacuumBusy = true;
       this.vacuumErr = null;
@@ -1145,6 +1159,11 @@ export const useExecStore = defineStore("exec", {
         this.logLine("err", "吸放触发异常：" + this.vacuumErr);
       } finally {
         this.vacuumBusy = false;
+        // ★ 收尾即补发排队中的"停止吸气"，不让它被丢掉
+        if (this.vacuumPendingRelease) {
+          this.vacuumPendingRelease = false;
+          this.vacuum("release");
+        }
       }
     },
     async refreshState() {
