@@ -46,7 +46,7 @@ WHILE true DO
                       fidbus.mtcp_ro_i[4]/100.0,
                       fidbus.mtcp_ro_i[5]/100.0), v50perc, fine, tool0);
         fidbus.mtcp_wo_b[0] := true;
-        WAIT(NOT fidbus.mtcp_ro_b[0]);
+        WAIT(!fidbus.mtcp_ro_b[0]);
         fidbus.mtcp_wo_b[0] := false;
     END_WHILE;
 
@@ -54,7 +54,7 @@ WHILE true DO
     WHILE fidbus.mtcp_ro_b[1] DO
         io.DOut[8] := true;              (* ★ N=8，以现场实测为准 *)
         fidbus.mtcp_wo_b[1] := true;
-        WAIT(NOT fidbus.mtcp_ro_b[1]);
+        WAIT(!fidbus.mtcp_ro_b[1]);
         fidbus.mtcp_wo_b[1] := false;
     END_WHILE;
 
@@ -62,7 +62,7 @@ WHILE true DO
     WHILE fidbus.mtcp_ro_b[2] DO
         io.DOut[8] := false;             (* ★ N 同 ② *)
         fidbus.mtcp_wo_b[2] := true;
-        WAIT(NOT fidbus.mtcp_ro_b[2]);
+        WAIT(!fidbus.mtcp_ro_b[2]);
         fidbus.mtcp_wo_b[2] := false;
     END_WHILE;
 
