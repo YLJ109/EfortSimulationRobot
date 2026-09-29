@@ -46,6 +46,19 @@ def main():
     tok = d["token"]
     call("POST", "/api/control/run-mode", {"mode": "AUTO", "note": "probe bit0"}, tok=tok)
 
+    # --prog N：先强制一键就绪加载运行程序 N（用于区分"程序内容问题"与"环境问题"）
+    force_prog = None
+    for i, a in enumerate(sys.argv):
+        if a == "--prog" and i + 1 < len(sys.argv):
+            force_prog = int(sys.argv[i + 1])
+    if force_prog is not None:
+        print("--- 先就绪到程序 %d ---" % force_prog)
+        st, rr = call("POST", "/api/ready", {"prog": force_prog}, tok=tok, timeout=90)
+        print("ready http=%s ok=%s err=%s" % (st, rr.get("ok"), rr.get("error")))
+        for s in (rr.get("steps") or []):
+            print("   %-9s ok=%-5s %s" % (s.get("step"), s.get("ok"), s.get("msg")))
+        time.sleep(0.4)
+
     s0 = snap(tok)
     cur = [round(float(x), 3) for x in s0.get("joints", [])]
     bits = {k: v for k, v in (s0.get("bits") or {}).items() if v}
@@ -63,10 +76,23 @@ def main():
         print("   请在示教器把模式开关拨到 AUTO，并在示教器上运行 210，然后重跑本脚本。")
         return 4
     if not running:
-        print("\n!! 程序 %s 当前**未在运行**(run=0) → 触发位没人读，本次探针**无结论**。"
-              % s0.get("prog"))
-        print("   请在示教器上运行 210（或由网页「一键就绪」拉起）后重跑本脚本。")
-        return 5
+        # 已加载未运行 → 直接由「一键就绪」拉起（等触发，不产生运动），再重读状态
+        prog = s0.get("prog") or 210
+        print("\n  程序 %s 未在运行 → 调用一键就绪拉起…" % prog)
+        st, rr = call("POST", "/api/ready", {"prog": int(prog)}, tok=tok, timeout=90)
+        print("  ready http=%s ok=%s err=%s" % (st, rr.get("ok"), rr.get("error")))
+        for s in (rr.get("steps") or []):
+            print("     %-9s ok=%-5s %s" % (s.get("step"), s.get("ok"), s.get("msg")))
+        time.sleep(0.4)
+        s0 = snap(tok)
+        cur = [round(float(x), 3) for x in s0.get("joints", [])]
+        bits = {k: v for k, v in (s0.get("bits") or {}).items() if v}
+        print("  拉起后状态字: %s (raw=%s)  prog=%s" % (
+            bits, s0.get("status_word"), s0.get("prog")))
+        print("  拉起后位姿  : %s" % cur)
+        if not (s0.get("bits") or {}).get("run"):
+            print("\n!! 程序仍**未运行**(run=0) → 本次探针**无结论**。请在示教器上手动运行 210。")
+            return 5
 
     print("\n--- 零位移点动：目标 = 当前位姿，speed 5% ---")
     st, r = call("POST", "/api/control/move",

@@ -28,6 +28,7 @@ from app.services.modbus import (
     ADDR_SET_PROG,
     CMD_CLEAR,
     CMD_LOAD,
+    CMD_STOP,
     CMD_RUN,
     CMD_SERVO,
     CMD_STOP,
@@ -45,9 +46,12 @@ ALARM_HINTS: Dict[int, str] = {
     1812: "安全门/安全回路不满足：检查安全门、光栅、外部急停是否复位",
     3909: ("示教器（bcc 客户端）通讯断开/未连接：远程加载与运行都依赖示教器在线，"
            "请检查示教器线缆、电源与急停，恢复连接后重试「一键就绪」"),
-    5005: ("远程加载程序错误（程序不存在，或示教器停在文件管理/编辑界面，"
-           "或示教器未连接 3909）：先让示教器退出文件界面/恢复连接，"
-           "确认程序号已保存且控制器上确有该程序后再试"),
+    5005: ("远程加载/运行程序错误。★ 2026-09-29 实机更正：最常见的原因不是示教器，"
+           "而是**程序停在报警态且仍在运行** —— 此时清报警会被它立刻重新顶上"
+           "（清完 0.5s 内复现）。正确处置：先 CMD_STOP 停掉当前程序，再清报警，"
+           "然后重新加载（本流程已按此顺序执行）。若停机后仍清不掉，再查："
+           "① 控制器上确实没有目标程序号；② 示教器停在文件管理/编辑界面；"
+           "③ 示教器未连接(3909)；④ 该程序文件损坏(4902)"),
     4902: "XPL 文件损坏：重新导出/保存该程序",
 }
 
@@ -225,6 +229,40 @@ class ReadinessService:
             return {"ok": False,
                     "error": "控制器在手动档（T1/T2）：上位机指令无效，请把模式开关拨到 AUTO 或 远程",
                     "steps": steps}
+
+        # 3.5) ★★ 2026-09-29 实机修复：清报警前**必须先停掉正在运行的程序** ★★
+        #   实测（真机复现）：程序还在跑的时候发 CMD_CLEAR(0x1009)，报警**看起来清掉了**，
+        #   但 0.5s 内就被那个（坏/半残的）运行中程序重新顶上来：
+        #       初始   alarm=1(5005) run=1
+        #       CMD_STOP  → run=0（报警仍在）
+        #       CMD_CLEAR → alarm=0/0 **且不再复现**
+        #   于是原顺序下流程必然报"清报警后仍处于报警状态（5005）"，而那条提示语
+        #   把矛头指向示教器（"退出文件管理器/恢复连接"）—— **真因是顺序**，
+        #   整轮排查都被这句话带偏。
+        #   CMD_STOP 是"程序停止"，不是急停：不断伺服、不产生任何位移。
+        #   （官方手册亦明确：程序运行中不可加载，加载前必须先 STOP。）
+        if b.get("run"):
+            _, sterr = mb.rc_command(CMD_STOP)
+            if sterr:
+                self._step(steps, "stop", on_step, False, "停止程序失败: %s" % sterr)
+                return {"ok": False, "error": "停掉当前程序失败: %s（清报警前需先停机）" % sterr,
+                        "steps": steps}
+            t0 = time.time()
+            stopped = False
+            while time.time() - t0 < 2.0:
+                s2, _ = mb.rc_snapshot()
+                if s2 and not s2["bits"].get("run"):
+                    stopped = True
+                    break
+                time.sleep(0.1)
+            self._step(steps, "stop", on_step, stopped,
+                       "已停机（%.2fs）——为让清报警生效，程序必须先停" % (time.time() - t0)
+                       if stopped else "停机后运行位 2s 内未落下")
+            if not stopped:
+                return {"ok": False,
+                        "error": "程序仍在运行（运行位未落下），无法可靠清报警。"
+                                 "请确认控制器急停/安全回路正常后重试",
+                        "steps": steps}
 
         # 4) 报警
         if b["alarm"]:
