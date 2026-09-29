@@ -497,6 +497,14 @@
       .pf-row .v { color: var(--txt); font-variant-numeric: tabular-nums; }
       .pf-grid { display: grid; grid-template-columns: 28px 1fr 28px 1fr 28px 1fr;
         gap: 6px 8px; align-items: center; }
+      /* ★ 六等分网格：关节角表单是"6 个标签一行 + 6 个输入框一行"（12 个子元素按行填充），
+         不能用上面"标签+输入框成对同行"的 28px/1fr 列模板 —— 否则自动落位后
+         J1/J3/J5 落进 28px 窄列、J2/J4/J6 落进 1fr 宽列，六个框宽窄不一（现场截图问题）。 */
+      .pf-grid6 { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 6px 8px; align-items: center; }
+      .pf-grid6 label { color: var(--muted); font-size: 12px; text-align: center; }
+      .pf-grid6 input, .pf-grid6 select { width: 100%; background: var(--bg); color: var(--txt);
+        border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; font-size: 12px; }
       .pf-grid label { color: var(--muted); font-size: 12px; }
       .pf-grid input, .pf-grid select { width: 100%; background: var(--bg); color: var(--txt);
         border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; font-size: 12px; }

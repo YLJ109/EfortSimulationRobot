@@ -325,7 +325,9 @@ watch(() => auth.controlActive, (v) => {
           </select>
         </div>
         <template v-if="form.kind === 'joint'">
-          <div class="pf-grid">
+          <!-- ★ pf-grid6：六等分列（标签一行 + 输入一行），六个框等宽；
+               不能用 pf-grid 的 28px/1fr 成对列模板（会宽窄不一，见现场截图） -->
+          <div class="pf-grid6">
             <label v-for="i in 6" :key="i">J{{ i }}</label>
             <input v-for="i in 6" :key="'j' + i" type="number" step="1"
                    v-model.number="form.joints[i - 1]" />
