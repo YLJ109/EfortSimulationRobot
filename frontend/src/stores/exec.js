@@ -207,9 +207,6 @@ export const useExecStore = defineStore("exec", {
       if (!s.runTotal) return 0;
       return Math.max(0, Math.min(100, Math.round((s.runStep / s.runTotal) * 100)));
     },
-    jointsSummary() {
-      return (p) => (p && p.joints ? p.joints : []).map((v) => Number(v).toFixed(0)).join(", ");
-    },
     /**
      * 示教器（控制器）程序：后端 /control/files 里 group="teach" 的候选，
      *   即 programs 目录下的 .XPL 文件（200/JOGSVC、411 等示教器导出的程序）。
@@ -723,7 +720,7 @@ export const useExecStore = defineStore("exec", {
         this.logLine("warn", "无法标记当前点：当前位姿读数不可用");
         return false;
       }
-      const joints = q.map((v) => Number(Number(v || 0).toFixed(2)));
+      const joints = q.map((v) => Number(v || 0));   // ★ 保留完整精度浮点，不四舍五入（标记点要精准数据）
       const name = "标记点 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
       const res = await this.savePoint(
         { kind: "joint", joints, name, group: "默认", note: "" }, null);
@@ -732,8 +729,8 @@ export const useExecStore = defineStore("exec", {
         const np = this.points.find((x) => x.name === name);
         if (np) {
           this.pinPoint(np);
-          this.logLine("ok", `已标记当前点「${name}」[${joints.map((v) => v.toFixed(1)).join(", ")}]`
-            + `（T1/T2 示教对位亦可；可在「编辑」补备注）`);
+          const shown = (np.joints || joints).map((v) => Number(v).toFixed(3)).join(", ");
+          this.logLine("ok", `已标记当前点「${name}」[${shown}]（T1/T2 示教对位亦可；可在「编辑」补备注）`);
         }
         return true;
       }

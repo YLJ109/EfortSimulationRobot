@@ -117,6 +117,8 @@ function onLeavePoint(p) {
     exec.unhoverPoint();
   }
 }
+/** 是否「标记当前点」生成的标记点（用于显示「已标记」徽标）。 */
+function isMarked(p) { return !!(p && p.name && p.name.startsWith("标记点")); }
 
 function triggerImport() { fileInput.value && fileInput.value.click(); }
 async function onImport(e) {
@@ -387,11 +389,18 @@ watch(() => auth.controlActive, (v) => {
              @click="onSelectPoint(p)">
           <div class="pt-main">
             <span class="pt-name">{{ p.name }}</span>
-            <span class="pt-tag">{{ p.group }}</span>
-            <span class="pt-tag" :class="{ warn: p.kind === 'cartesian' }">
-              {{ p.kind === "cartesian" ? "直角" : "关节" }}
+            <div class="pt-tags">
+              <span v-if="isMarked(p)" class="pt-tag marked"><Icon name="pin" :size="11" /> 已标记</span>
+              <span class="pt-tag">{{ p.group }}</span>
+              <span class="pt-tag" :class="{ warn: p.kind === 'cartesian' }">
+                {{ p.kind === "cartesian" ? "直角" : "关节" }}
+              </span>
+            </div>
+          </div>
+          <div class="pt-coords">
+            <span class="coord" v-for="(jv, ji) in p.joints" :key="ji">
+              <b>J{{ ji + 1 }}</b>{{ Number(jv).toFixed(3) }}
             </span>
-            <span class="pt-joints">[{{ exec.jointsSummary(p) }}]</span>
           </div>
           <div v-if="p.note" class="pt-note"><Icon name="note" :size="12" /> {{ p.note }}</div>
           <div class="pt-ops" @click.stop>
@@ -430,16 +439,50 @@ watch(() => auth.controlActive, (v) => {
   margin: -2px 0 8px; line-height: 1.5;
 }
 .pt-hint svg { color: var(--accent); flex: none; margin-top: 2px; }
+/* ★ 点位列表：纵向堆叠（上下关系），取消默认横向内联 */
+.pt-item {
+  display: block;                 /* 取消 flex：名称 / 标签 / 坐标 / 备注 / 操作 上下排列 */
+  padding: 9px 11px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.pt-item:hover { border-color: var(--accent-line); }
 .pt-item.selected {
   border-color: var(--accent);
   background: var(--accent-soft);
   box-shadow: inset 3px 0 0 var(--accent);
 }
+.pt-main {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+}
+.pt-name { font-size: 13px; font-weight: 600; color: var(--txt); }
+.pt-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.pt-tag {
+  font-size: 11px; padding: 1px 7px; border-radius: 20px;
+  color: var(--muted); border: 1px solid var(--line); background: var(--panel2);
+}
+.pt-tag.warn { color: var(--warn); border-color: var(--warn-line); background: var(--warn-soft); }
+.pt-tag.marked {
+  color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft);
+  display: inline-flex; align-items: center; gap: 3px;
+}
+.pt-tag.marked svg { flex: none; }
+.pt-coords { display: flex; flex-wrap: wrap; gap: 4px 8px; margin: 6px 0 2px; }
+.coord {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px;
+}
+.coord b { color: var(--accent); font-weight: 600; margin-right: 3px; }
 .pt-note {
   display: flex; align-items: center; gap: 5px;
-  margin: 4px 2px 2px; font-size: 11px; color: var(--muted); line-height: 1.4;
+  margin: 5px 2px 2px; font-size: 11px; color: var(--muted); line-height: 1.4;
 }
 .pt-note svg { color: var(--muted); flex: none; }
+.pt-ops { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
 .btns button.warn {
   color: var(--warn); border-color: var(--warn-line); background: var(--warn-soft);
 }
