@@ -43,8 +43,11 @@ log = get_logger("rc_ready")
 # docs/控制器Modbus寄存器勘察报告.md）。未列出的码给通用提示，避免"猜错方向"。
 ALARM_HINTS: Dict[int, str] = {
     1812: "安全门/安全回路不满足：检查安全门、光栅、外部急停是否复位",
-    5005: ("远程加载程序错误（程序不存在，或示教器停在文件管理/编辑界面）："
-           "先让示教器退出文件界面，确认程序号已保存后再试"),
+    3909: ("示教器（bcc 客户端）通讯断开/未连接：远程加载与运行都依赖示教器在线，"
+           "请检查示教器线缆、电源与急停，恢复连接后重试「一键就绪」"),
+    5005: ("远程加载程序错误（程序不存在，或示教器停在文件管理/编辑界面，"
+           "或示教器未连接 3909）：先让示教器退出文件界面/恢复连接，"
+           "确认程序号已保存且控制器上确有该程序后再试"),
     4902: "XPL 文件损坏：重新导出/保存该程序",
 }
 
@@ -225,21 +228,45 @@ class ReadinessService:
 
         # 4) 报警
         if b["alarm"]:
-            _, cerr = mb.rc_command(CMD_CLEAR)
-            time.sleep(0.4)
-            snap2, err2 = mb.rc_snapshot()
-            alarm_now = bool(snap2 and snap2["bits"]["alarm"])
+            # ★ 现场实测：0x1009 清报警后控制器需要一点时间回写报警位，单次 0.4s
+            #   轮询偶尔会"抓到还没落定"的报警位 → 误报"清报警后仍处于报警状态"。
+            #   改为最多 3 次重试、每次 0.6s 后回读，给控制器足够的落定时间；
+            #   若仍清不掉（如 3909 示教器未连接 / 5005 程序确实加载不上），那是
+            #   真因未除，下面给出精准处置提示，而不是假失败把人带偏。
+            alarm_cleared = False
+            snap2 = None
+            for _ in range(3):
+                _, cerr = mb.rc_command(CMD_CLEAR)
+                if cerr:
+                    break
+                time.sleep(0.6)
+                snap2, _ = mb.rc_snapshot()
+                if snap2 and not snap2["bits"]["alarm"]:
+                    alarm_cleared = True
+                    break
+            alarm_now = not alarm_cleared
             self._step(steps, "alarm", on_step, not alarm_now,
                        ("清报警失败（码 %s/%s 仍在）" % (snap["alarm1"], snap["alarm2"]))
-                       if alarm_now else "报警已清（原码 %s/%s）" % (snap["alarm1"], snap["alarm2"]))
+                       if alarm_now else
+                       ("报警已清（原码 %s/%s）" % (snap["alarm1"], snap["alarm2"])))
             if alarm_now:
-                a1 = (snap2 or {}).get("alarm1", "?")
-                a2 = (snap2 or {}).get("alarm2", "?")
-                try:
-                    code = int(a1)
-                except (TypeError, ValueError):
-                    code = 0
-                hint = ALARM_HINTS.get(code, "请按示教器报警信息排查，处理后重试")
+                a1 = (snap2 or snap or {}).get("alarm1", "?")
+                a2 = (snap2 or snap or {}).get("alarm2", "?")
+                # ★ 同时给 alarm1 / alarm2 两条码出提示（如 5005+3909 并存）：
+                #   只给 alarm1 的提示会漏掉"示教器未连接"这条根因。
+                hints = []
+                for raw in (a1, a2):
+                    try:
+                        ci = int(raw)
+                    except (TypeError, ValueError):
+                        ci = None
+                    if ci in ALARM_HINTS:
+                        hints.append(ALARM_HINTS[ci])
+                    elif ci not in (None, 0):
+                        hints.append("报警 %s：请按示教器报警明细排查" % raw)
+                if not hints:
+                    hints.append("请按示教器报警信息排查，处理后重试")
+                hint = "；".join(dict.fromkeys(hints))
                 return {"ok": False,
                         "error": ("清报警后仍处于报警状态（当前码 %s/%s）。%s"
                                   % (a1, a2, hint)),
