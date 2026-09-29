@@ -140,13 +140,26 @@ def main():
         results.append(("移动：J6 真实位移且仅 J6 动", ok_m,
                         "" if ok_m else "位移 %+.3f 其余 %s" % (dev, others)))
 
-        print("\n[3b] 轴锁验证：尝试动 J1（必须被拒）")
-        _, m1 = call("POST", "/api/control/jog/step",
-                     {"joint": 1, "dir": 1, "amount": 1.0, "speed_dps": 5.0, "frame": "joint"},
-                     tok=tok, timeout=60)
-        rejected = (not m1.get("ok")) and ("轴锁" in (m1.get("error") or ""))
-        print("    ok=%s  %s" % (m1.get("ok"), (m1.get("error") or "")[:70]))
-        results.append(("轴锁：J1 被拒", rejected, ""))
+        # ★★ 轴锁验证：只在护栏**确实开启**时才去试 J1。
+        #   护栏是给 AI 做真机验证用的临时开关，生产默认关闭
+        #   （操作员 J1~J6 全轴可动）。锁没开时若照样发 J1 点动，
+        #   那就不是"验证被拒"，而是**真的把 J1 动了** —— 绝对不允许。
+        _, hd = call("GET", "/api/system/health")
+        lock_on = bool(((hd or {}).get("joint_lock") or {}).get("enabled"))
+        if lock_on:
+            print("\n[3b] 轴锁验证（护栏已开启）：尝试动 J1，必须被拒")
+            _, m1 = call("POST", "/api/control/jog/step",
+                         {"joint": 1, "dir": 1, "amount": 1.0, "speed_dps": 5.0,
+                          "frame": "joint"}, tok=tok, timeout=60)
+            msg = str((m1.get("detail") if isinstance(m1, dict) else "")
+                      or (m1.get("error") if isinstance(m1, dict) else "") or "")
+            rejected = (not m1.get("ok")) and ("轴锁" in msg)
+            print("    ok=%s  %s" % (m1.get("ok"), msg[:70]))
+            results.append(("轴锁：J1 被拒", rejected, "" if rejected else msg[:60]))
+        else:
+            print("\n[3b] 轴锁未开启（生产默认：操作员全轴可动）"
+                  "→ **跳过** J1 拒绝验证，不去动 J1")
+            results.append(("轴锁：未开启（生产默认，已跳过 J1 试探）", True, ""))
     else:
         print("\n[3] 跳过真实位移（--no-move）")
 

@@ -99,15 +99,14 @@ def _reset_settings_overlay():
 def _pin_joint_lock_off(monkeypatch):
     """★★ 轴锁策略与"现场配置"解耦（2026-09-29）★★
 
-    背景：现场口径已定为 **仅 J6 可动**（`config/robot.yaml` →
-    `motion.joint_lock.enabled: true`，用户要求，生产默认）。但本套件里绝大多数
-    用例测的是点动 / 移动 / 运行模式 / 仿真同步的**机制**，它们天然会带动 J1~J5。
-    若让这些用例继承现场配置，就会整片误红，而且会随现场配置反复漂移
-    （2026-09-29 就真实发生过：打开轴锁后 15 条用例连环失败）。
+    口径（别搞反）：生产默认 `config/robot.yaml → motion.joint_lock.enabled: false`
+    = **操作员 J1~J6 全轴可动**；「仅 J6」是**给 AI 做真机验证的临时护栏**。
 
-    所以：测试环境统一把轴锁**钉在关闭**，让用例只测机制；专门验证轴锁的用例
-    （tests/test_safety_redline.py 的 R1 组）自行在用例体内 monkeypatch 打开 ——
-    用例体内的 setattr 晚于所有 fixture 装配，能正常覆盖本 fixture。
+    但本套件里绝大多数用例测的是点动 / 移动 / 运行模式 / 仿真同步的**机制**，
+    它们天然会带动 J1~J5。所以测试环境统一把轴锁**钉在关闭**，让用例只测机制，
+    不受"现场当前开关状态"影响（现场若临时打开护栏，套件也不该因此整片红）。
+    专门验证轴锁的用例（tests/test_safety_redline.py 的 R1 组）自行 monkeypatch 打开
+    —— 用例体内的 setattr 晚于所有 fixture 装配，能正常覆盖本 fixture。
 
     ★ 必须同时打两处，因为 motion.py 在 import 时把函数绑进了自己的命名空间，
       只打 safety_const 是打不到下发判据的：

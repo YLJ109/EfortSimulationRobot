@@ -2,9 +2,10 @@
 """四条安全红线的回归测试（全维度审查 2026-09-25）。
 
 红线：
-  R1 轴锁：**现场默认 = 仅 J6 可动**（robot.yaml joint_lock.enabled=true，J1~J5 锁定，
-           仿真同限）；测试环境由 conftest._pin_joint_lock_off 统一钉为关闭，
-           以便用例只测机制（用例体内 monkeypatch 可覆盖）。
+  R1 轴锁：**生产默认 = 操作员 J1~J6 全轴可动**（robot.yaml enable=false）；
+           「仅 J6」是**给 AI 做真机验证的临时护栏**（EFORT_J6_ONLY=1 或临时改 true），
+           开启后 J1~J5 一律拒绝、仿真同限。测试环境由 conftest._pin_joint_lock_off
+           统一钉为关闭，以便用例只测机制（用例体内 monkeypatch 可覆盖）。
   R2 速度下限：任何下发 speed_pct 必须 >= 5（Pydantic 边界 + 后端 clamp）。
   R3 真机不可误写：测试环境 EFORT_REAL_MOTION=0 / simulate=always → 永远走 sim，不写 192.168.1.12:502。
   R4 程序白名单：/api/ready 只允许加载白名单内的程序号，operator/管理员令牌都不能越权跑任意程序；
@@ -116,12 +117,19 @@ def test_joint_lock_off_in_test_env_allows_all():
     assert st["locked"] == []
 
 
-def test_shipped_config_defaults_to_j6_only():
-    """★★ R1：**现场出厂默认必须是「仅 J6」**（2026-09-29 用户口径）。
+def test_shipped_config_allows_full_axis_for_operator():
+    """★★ R1：**生产默认必须是「操作员全轴可动」**（joint_lock.enabled=false）★★
 
-    直接读 config/robot.yaml 的原始文本（绕开测试环境的"钉关闭"夹具，也不受
-    config/app_settings.json 覆盖层影响），防止现场配置被误改回"全轴可动"。
-    这是与安全直接相关的现场策略，一旦漂移必须报红。
+    用户口径（2026-09-29 再确认）：
+      · 轴锁是**给 AI 做真机验证用的临时护栏**，不是给操作员设的限制；
+      · 操作员在安全前提下 J1–J6 **全轴可控** ——「仅 J6」绝不能作为生产默认。
+    事故背景：曾把 enabled 误当生产默认改成 true 并长期留着，
+      结果**操作员自己点动 J1 被拒**（"轴锁模式已开启：J1 不可动（仅 J6 可动）"）。
+    本用例把"默认必须关闭"钉死；同时校验"模式开启时"的参数仍正确
+    （AI 验证期间会临时打开，那时 locked/only/容差/仿真同限都要对）。
+
+    直接读 config/robot.yaml 原始文本（绕开测试环境的钉关夹具与覆盖层），
+    一旦有人把它改回 true 就报红。
     """
     import os
     import yaml as _yaml
@@ -131,10 +139,25 @@ def test_shipped_config_defaults_to_j6_only():
     with open(path, "r", encoding="utf-8") as f:
         raw = _yaml.safe_load(f)
     jl = (raw.get("motion") or {}).get("joint_lock") or {}
-    assert jl.get("enabled") is True, "现场默认必须为仅 J6（joint_lock.enabled: true）"
+    assert jl.get("enabled") is False, (
+        "生产默认必须是 false（操作员全轴可动）。AI 真机验证请用环境变量 "
+        "EFORT_J6_ONLY=1 或**临时**改 true，验证完必须改回 —— "
+        "否则操作员会被自己的系统拒之门外")
+    # 模式开启时（AI 验证）的参数必须仍然正确
     assert [int(x) for x in (jl.get("locked_joints") or [])] == [1, 2, 3, 4, 5]
     assert int(jl.get("only_joint")) == 6
-    assert jl.get("apply_in_sim") is True, "仿真必须同限，否则'真机不能动、仿真能动'"
+    assert jl.get("apply_in_sim") is True, "模式开启时仿真须同限，否则'真机不能动、仿真能动'"
+    assert 0 < float(jl.get("tolerance_deg")) <= 5.0
+
+
+def test_joint_lock_mode_still_usable_when_enabled(monkeypatch):
+    """★ R1：护栏本身没废 —— 打开后（AI 真机验证口径）仍严格只放行 J6。"""
+    import app.core.safety_const as sc
+    monkeypatch.setattr(sc, "joint_lock_enabled", lambda: True)
+    st = sc.joint_lock_state()
+    assert st["enabled"] is True
+    assert st["locked"] == [1, 2, 3, 4, 5]
+    assert st["only"] == 6
 
 
 def test_shipped_config_has_no_stale_program_number():

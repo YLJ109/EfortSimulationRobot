@@ -1,0 +1,25 @@
+{
+  "name": "ceshi1",
+  "saved_at": "2026-09-29T19:23:39",
+  "speed_pct": 5,
+  "items": [
+    {
+      "point_id": 1
+    },
+    {
+      "point_id": 2
+    },
+    {
+      "op": "suck"
+    },
+    {
+      "point_id": 1
+    },
+    {
+      "point_id": 3
+    },
+    {
+      "op": "release"
+    }
+  ]
+}

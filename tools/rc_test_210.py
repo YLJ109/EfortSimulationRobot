@@ -3,7 +3,8 @@
 
 安全口径（现场既定）：
   · 控制器必须 AUTO（本脚本先断言）
-  · 只动 J6，单次 1°，慢速；J1~J5 必须被轴锁拒绝（同时验证轴锁）
+  · 只动 J6，单次 1°，慢速；**J1~J5 只在轴锁护栏开启时才做"应被拒"试探**，
+    护栏关闭（生产默认）时一律跳过，绝不主动去动 J1~J5
   · 真实下发总闸 EFORT_REAL_MOTION=1 + motion.real_write=true（后端 .env 已开）
 
 用法： python tools/rc_test_210.py            # 全流程
@@ -102,11 +103,20 @@ def main():
         if p0 and p1:
             print("   J6 位移 = %+.3f°" % (p1[5] - p0[5]))
 
-        print("\n6) 轴锁验证：尝试动 J1（必须被拒）")
-        st, m1 = call("POST", "/api/control/jog/step",
-                      {"joint": 1, "dir": 1, "amount": 1.0, "speed_dps": 5.0, "frame": "joint"},
-                      tok=tok, timeout=60)
-        show("J1 step(应拒)", st, m1, 600)
+        # ★★ 只在轴锁护栏**确实开启**时才去试 J1。护栏是给 AI 做真机验证用的
+        #    临时开关，生产默认关闭（操作员全轴可动）；锁没开时发 J1 点动
+        #    不是"验证被拒"，而是**真的把 J1 动了** —— 绝不允许。
+        _, hd = call("GET", "/api/system/health")
+        lock_on = bool(((hd or {}).get("joint_lock") or {}).get("enabled"))
+        if lock_on:
+            print("\n6) 轴锁验证（护栏已开启）：尝试动 J1，必须被拒")
+            st, m1 = call("POST", "/api/control/jog/step",
+                          {"joint": 1, "dir": 1, "amount": 1.0, "speed_dps": 5.0,
+                           "frame": "joint"},
+                          tok=tok, timeout=60)
+            show("J1 step(应拒)", st, m1, 600)
+        else:
+            print("\n6) 轴锁未开启（生产默认：操作员全轴可动）→ 跳过 J1 试探")
     else:
         print("\n5) 跳过移动测试（--no-move）")
 
