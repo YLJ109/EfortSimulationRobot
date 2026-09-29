@@ -1,9 +1,34 @@
 # -*- coding: utf-8 -*-
 """EFORT 真机诊断（只读，不下发任何指令）。"""
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
+
+
+def _RC_PW() -> str:
+    """管理员口令：优先环境变量 EFORT_ADMIN_PASSWORD，其次项目根 .env。
+
+    ★★ 绝不写死在源码里 —— 本仓库在 GitHub 上，明文口令等于公开。
+       （2026-09-29 修正：此前这些工具里硬编码了真实口令。）
+    """
+    v = os.environ.get("EFORT_ADMIN_PASSWORD", "").strip()
+    if v:
+        return v
+    try:
+        env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+        with open(env, encoding="utf-8-sig") as f:
+            for ln in f:
+                s = ln.strip()
+                if s.startswith("EFORT_ADMIN_PASSWORD="):
+                    return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    raise SystemExit("未找到管理员口令：请设环境变量 EFORT_ADMIN_PASSWORD，"
+                     "或在项目根 .env 里配置 EFORT_ADMIN_PASSWORD=...")
+
+
 
 BASE = "http://127.0.0.1:8000"
 
@@ -33,7 +58,7 @@ def call(method, path, body=None, tok=None, timeout=25):
 
 
 def main():
-    st, d = call("POST", "/api/auth/login", {"password": "admin123"})
+    st, d = call("POST", "/api/auth/login", {"password": _RC_PW()})
     print("[login] http=%s" % st)
     if st != 200:
         print("  ->", d)

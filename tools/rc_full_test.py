@@ -12,10 +12,35 @@
   · 零位移探针：目标 = 当前位姿，机器人不会动，仅用于判定 40135.Bit0 分支是否存在
 """
 import json
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
+
+
+def _RC_PW() -> str:
+    """管理员口令：优先环境变量 EFORT_ADMIN_PASSWORD，其次项目根 .env。
+
+    ★★ 绝不写死在源码里 —— 本仓库在 GitHub 上，明文口令等于公开。
+       （2026-09-29 修正：此前这些工具里硬编码了真实口令。）
+    """
+    v = os.environ.get("EFORT_ADMIN_PASSWORD", "").strip()
+    if v:
+        return v
+    try:
+        env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+        with open(env, encoding="utf-8-sig") as f:
+            for ln in f:
+                s = ln.strip()
+                if s.startswith("EFORT_ADMIN_PASSWORD="):
+                    return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    raise SystemExit("未找到管理员口令：请设环境变量 EFORT_ADMIN_PASSWORD，"
+                     "或在项目根 .env 里配置 EFORT_ADMIN_PASSWORD=...")
+
+
 
 BASE = "http://127.0.0.1:8000"
 PROG = 210
@@ -62,7 +87,7 @@ def main():
             wait_s = int(sys.argv[i + 1])
     do_move = "--no-move" not in sys.argv
 
-    _, d = call("POST", "/api/auth/login", {"password": "admin123"})
+    _, d = call("POST", "/api/auth/login", {"password": _RC_PW()})
     tok = d["token"]
 
     print("等待控制器切到 AUTO（最多 %ds，每 4s 看一次）…" % wait_s)

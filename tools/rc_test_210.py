@@ -11,10 +11,35 @@
        python tools/rc_test_210.py --no-move  # 不动机器人，只测吸气/停止吸气
 """
 import json
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
+
+
+def _RC_PW() -> str:
+    """管理员口令：优先环境变量 EFORT_ADMIN_PASSWORD，其次项目根 .env。
+
+    ★★ 绝不写死在源码里 —— 本仓库在 GitHub 上，明文口令等于公开。
+       （2026-09-29 修正：此前这些工具里硬编码了真实口令。）
+    """
+    v = os.environ.get("EFORT_ADMIN_PASSWORD", "").strip()
+    if v:
+        return v
+    try:
+        env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+        with open(env, encoding="utf-8-sig") as f:
+            for ln in f:
+                s = ln.strip()
+                if s.startswith("EFORT_ADMIN_PASSWORD="):
+                    return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    raise SystemExit("未找到管理员口令：请设环境变量 EFORT_ADMIN_PASSWORD，"
+                     "或在项目根 .env 里配置 EFORT_ADMIN_PASSWORD=...")
+
+
 
 BASE = "http://127.0.0.1:8000"
 PROG = 210
@@ -59,7 +84,7 @@ def show(tag, st, d, limit=520):
 def main():
     do_move = "--no-move" not in sys.argv
 
-    st, d = call("POST", "/api/auth/login", {"password": "admin123"})
+    st, d = call("POST", "/api/auth/login", {"password": _RC_PW()})
     if st != 200:
         print("!! 登录失败", st, d)
         return 1

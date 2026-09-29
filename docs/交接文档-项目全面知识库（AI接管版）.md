@@ -72,7 +72,7 @@ D:\EFORT_Projects\EFORT_Web_Monitoring\
 
 | 变量 | 当前值 | 说明 |
 |---|---|---|
-| `EFORT_ADMIN_PASSWORD` | `admin123` | 管理员口令（Web「请求控制」输入它） |
+| `EFORT_ADMIN_PASSWORD` | **见 `.env`**（勿写入文档/仓库） | 管理员口令（Web「请求控制」输入它）|
 | `EFORT_CONTROL_TTL` | `7200` | 控制令牌时长秒数；**代码默认 7200 = 2 小时**（现场口径，2026-09-29 用户确认）；设置页可改并自动回写本文件；**重启后端后令牌全部失效，必须重新获取**。★ 这是**启动默认值**：启动只读它，所以它写 `1800` 就会出现"设置页改成 2 小时、一重启又回到 30 分钟" |
 | `EFORT_REAL_MOTION` | `1` | ★ 真机下发总闸 1/2（2026-09-23 用户授权真机联调）。恢复安全模拟改回 0 并重启 |
 | `EFORT_SIMULATE` | （注释，默认 auto） | auto=不可达则模拟 / always / never |
@@ -147,7 +147,7 @@ Start-Process -FilePath "D:\EFORT_Projects\EFORT_Web_Monitoring\backend\.venv\Sc
 
 ## 8. 控制权限体系（全面细节）
 
-1. **登录**：`POST /api/auth/login {"password":"admin123"}` → 48 字符 token（PBKDF2-SHA256 10 万次+盐，存内存 → **后端重启即全部失效，必须重新获取**）。`GET /auth/status`、`POST /auth/logout`。
+1. **登录**：`POST /api/auth/login {"password":"<管理员口令>"}` → 48 字符 token（PBKDF2-SHA256 10 万次+盐，存内存 → **后端重启即全部失效，必须重新获取**）。`GET /auth/status`、`POST /auth/logout`。
 2. **角色**：admin（全能）/ operator（只能操控；`EFORT_OPERATOR_PASSWORD` 未配则禁用）。`require_control`(401) + `require_admin`(403)。
 3. **TTL**：默认 0=不限时；设置页「控制权限时长」可改（`POST /api/settings/control-ttl`，admin，自动回写 .env）；**不追溯**，只影响新签发令牌。
 4. **档位声明（runmode）**：模式旋钮是硬件，**Modbus 读不到** → Web 侧"声明"（`POST /api/control/run-mode`，`DELETE` 撤销）+ 控制器寄存器回读 `confirmed`。**语义已按实机反转**：`JOGGABLE = {T1:False, T2:False, AUTO:True, REMOTE:True}` —— 实测 T1/T2 下控制器忽略一切 PC 指令（写成功但不动）。声明不持久化、有 2h 有效期。
@@ -284,7 +284,7 @@ cd frontend && npm run verify
 
 ```bash
 # 登录取令牌
-curl -s --noproxy "*" -X POST http://127.0.0.1:8000/api/auth/login -H "Content-Type: application/json" -d '{"password":"admin123"}'
+curl -s --noproxy "*" -X POST http://127.0.0.1:8000/api/auth/login -H "Content-Type: application/json" -d '{"password":"<管理员口令>"}'
 # 读真机状态（公开只读）
 curl -s --noproxy "*" http://127.0.0.1:8000/api/rc-status
 curl -s --noproxy "*" http://127.0.0.1:8000/api/pose        # j1..j6 平铺
