@@ -82,13 +82,11 @@ export const useExecStore = defineStore("exec", {
     teachMode: "joint",                       // joint | cartesian
     teachQ: [0, 0, 0, 0, 0, 0],
     teachTcp: { x: 300, y: 0, z: 700 },
-    teachSpeed: 5,                        // 示教/滑块下发速度（%）：★ 默认压到最慢 5，安全
     teachBusy: false,
     teachResult: null,
     teachGhost: true,
 
     // ---- 点动 ----
-    jogSpeed: 5,                              // °/s（后端再夹到 max_speed_dps）：★ 默认最慢 5°/s，安全
     jogStepDeg: 1,
     jogBusy: false,
     jogState: null,
@@ -127,8 +125,9 @@ export const useExecStore = defineStore("exec", {
     _seqPoll: null,           // 进度轮询句柄
     vacuumBusy: false,
     vacuumErr: null,
-    // ★ 「停止吸气」在上一发还飞时被按下 → 记为待补发，收尾后立刻执行，绝不丢弃。
-    vacuumPendingRelease: false,
+    // ★ 「停止吸气」/「放气」在上一发还飞时被按下 → 记下待补发的动作，
+    //   收尾后立刻执行，绝不丢弃（"" = 无待补发）。
+    vacuumPending: "",
 
     // ---- 程序执行运行态 ----
     running: false,
@@ -439,7 +438,7 @@ export const useExecStore = defineStore("exec", {
         }
         const r = await apiControl("/control/move", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ joints: target, speed_pct: this.teachSpeed }),
+          body: JSON.stringify({ joints: target, speed_pct: this.speed }),
         });
         const d = await r.json();
         this.execState = d;
@@ -503,7 +502,8 @@ export const useExecStore = defineStore("exec", {
       try {
         const r = await apiControl("/control/jog/start", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ joint, dir, speed_dps: this.jogSpeed }),
+          // ★ 速度只认右上角全局速度（%）：不再传 °/s，避免"两个旋钮"口径不一致
+          body: JSON.stringify({ joint, dir, speed_pct: this.speed }),
         });
         if (r.status === 401 || r.status === 403) { this.needAuth(); return; }
         const d = await r.json();
@@ -523,7 +523,7 @@ export const useExecStore = defineStore("exec", {
         }
         this.holding = joint;
         this.holdingDir = dir;
-        this.logLine("info", `连续点动 J${joint} ${dir > 0 ? "正向" : "反向"} @${this.jogSpeed}°/s`);
+        this.logLine("info", `连续点动 J${joint} ${dir > 0 ? "正向" : "反向"} @${this.speed}%`);
         // 死人开关：0.4s 一次使能保持，1.5s 收不到后端自动停
         keepAliveTimer = setInterval(async () => {
           try { await apiControl("/control/jog/keepalive", { method: "POST" }); }
@@ -574,7 +574,7 @@ export const useExecStore = defineStore("exec", {
         const r = await apiControl("/control/jog/step", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ joint, dir, angle_deg: this.jogStepDeg,
-                                 speed_dps: this.jogSpeed }),
+                                 speed_pct: this.speed }),
         });
         if (r.status === 401 || r.status === 403) { this.needAuth(); return; }
         const d = await r.json();
@@ -594,7 +594,7 @@ export const useExecStore = defineStore("exec", {
           const after = Array.isArray(d.target) ? Number(d.target[jIdx]) : NaN;
           this.logLine("ok", `增量点动 J${joint} ${dir > 0 ? "+" : "−"}${this.jogStepDeg}°`
             + (Number.isFinite(after) ? ` → ${after.toFixed(1)}°` : "")
-            + `（${d.mode === "real" ? "真实" : "模拟"} @${this.jogSpeed}°/s）`);
+            + `（${d.mode === "real" ? "真实" : "模拟"} @${this.speed}%）`);
         }
         this.syncTeachFromRobot();
       } catch (e) { this.execState = { ok: false, error: e.message }; }
@@ -1122,27 +1122,30 @@ export const useExecStore = defineStore("exec", {
      *   操作员会误判 → 属安全隐患。现在只有 release 成功才回 idle。
      */
     async vacuum(action) {
-      if (action !== "suck" && action !== "release") return;
+      if (!["suck", "release", "blow", "unblow"].includes(action)) return;
       if (this.needAuth()) return;
 
-      // ★★ 安全优先：**停止吸气请求绝不丢弃** ★★
+      // ★★ 安全优先：**停止吸气 / 放气请求绝不丢弃** ★★
       //   上一发（通常是吸气）还在飞时，后端 rc_vacuum 的前置守卫会以
       //   「吸触发位仍为 1（上一发未收尾），已拒绝」回 502 ——
-      //   操作员慌乱中按"停止吸气"，看到的是"按了没反应还报错"，而阀其实还开着。
-      //   这里记下意图，等上一发收尾后立刻补发，保证"停"的语义最终一定生效。
-      if (action === "release" && this.vacuumBusy) {
-        this.vacuumPendingRelease = true;
-        this.logLine("info", "停止吸气已排队：等上一发收尾后立即执行");
+      //   操作员慌乱中按"停止吸气/放气"，看到的是"按了没反应还报错"，而阀其实还开着。
+      //   这里记下意图，等上一发收尾后立刻补发，保证"脱件"的语义最终一定生效。
+      //   四种气路动作（吸/停止吸/放/停止放）里，后三种都是"让状态往安全/脱件方向走"的，
+      //   一律排队不丢弃。
+      if (action !== "suck" && this.vacuumBusy) {
+        this.vacuumPending = action;
+        this.logLine("info", "已排队：等上一发收尾后立即执行");
         return;
       }
 
       const prev = this.vacuumState;   // 失败时回退，绝不谎报阀状态
+      const LABEL = { suck: "吸", release: "停止吸", blow: "放", unblow: "停止放" };
+      const BIT = { suck: 1, release: 2, blow: 3, unblow: 4 };
       this.vacuumBusy = true;
       this.vacuumErr = null;
       this.vacuumState = action;
-      this.logLine("info", action === "suck"
-        ? "Web 触发吸气（40135.Bit1，电平保持，需手动停止）"
-        : "Web 触发停止吸气（40135.Bit2）");
+      this.logLine("info", "Web 触发" + LABEL[action] + "（40135.Bit" + BIT[action] + "）"
+        + (action === "suck" || action === "blow" ? "，电平保持，需手动停止" : ""));
       try {
         const r = await apiControl("/control/vacuum", {
           method: "POST", headers: { "Content-Type": "application/json" },
@@ -1150,11 +1153,17 @@ export const useExecStore = defineStore("exec", {
         });
         if (r.status === 401 || r.status === 403) { this.vacuumState = prev; this.needAuth(); return; }
         if (r.ok) {
-          // ★ 保持型语义：吸 → 一直显示"吸气中"，直到停止吸气成功才回 idle
-          this.vacuumState = action === "suck" ? "suck" : "idle";
-          this.logLine("ok", action === "suck"
-            ? "吸气已开启（保持中，请按「停止吸气」关断）"
-            : "已停止吸气（真空已关断）");
+          // ★ 保持型语义：吸/放 都是"开了就一直保持"，直到对应的"停止"动作；
+          //   停止吸/停止放 → 回到 idle（两者都关掉了）。
+          if (action === "suck") this.vacuumState = "suck";
+          else if (action === "blow") this.vacuumState = "blow";
+          else this.vacuumState = "idle";
+          this.logLine("ok", {
+            suck: "吸已开启（保持中）",
+            release: "已停止吸（真空阀关断）",
+            blow: "放已开启（吹气保持中）",
+            unblow: "已停止放（吹气阀关断）",
+          }[action] || (LABEL[action] + "完成"));
         } else {
           let msg = "吸放触发失败";
           try {
@@ -1165,7 +1174,7 @@ export const useExecStore = defineStore("exec", {
           } catch (e) { msg = "HTTP " + r.status; }
           this.vacuumErr = String(msg);
           this.vacuumState = prev;
-          this.logLine("err", "吸放触发失败：" + msg);
+          this.logLine("err", LABEL[action] + "失败：" + msg);
         }
       } catch (e) {
         this.vacuumErr = e && e.message ? String(e.message) : String(e);
@@ -1173,17 +1182,22 @@ export const useExecStore = defineStore("exec", {
         this.logLine("err", "吸放触发异常：" + this.vacuumErr);
       } finally {
         this.vacuumBusy = false;
-        // ★ 收尾即补发排队中的"停止吸气"，不让它被丢掉
-        if (this.vacuumPendingRelease) {
-          this.vacuumPendingRelease = false;
-          this.vacuum("release");
+        // ★ 收尾即补发排队中的"停止吸气/放气"，不让它被丢掉
+        if (this.vacuumPending) {
+          const nx = this.vacuumPending;
+          this.vacuumPending = "";
+          this.vacuum(nx);
         }
       }
     },
     // =================================================================
     // ★ 2026-09-29 序列编辑器（「程序执行」页）
-    //   设计见 docs/方案-程序执行序列编辑器（四类操作·经210执行）.md
-    //   ★★ 只四类操作：标记点 point / 吸气 suck / 停止吸气 release / 等待 wait。
+    //   设计见 docs/方案-程序执行序列编辑器（五类操作·经210执行）.md
+    //   ★★ 六类操作：标记点 point / 吸 suck / 停止吸 release / 放 blow / 停止放 unblow / 等待 wait。
+    //      四路气路全部**电平保持**（与控制器 210 的 Bit1~Bit4 一一对应）：
+    //      只关真空阀挡不住残余负压、工件会吸住不掉 → 必须能单独"放"（吹气）；
+    //      但也不能并入"停止吸"（有些场合只需松手不想吹气）。
+    //      想"吹一下就收"：序列里排 [放, 等待 0.4s, 停止放]。
     //      后端 POST /control/seq 会硬校验，前端这里也不给别的入口。
     //   执行一律走 /control/run-file（items 模式）→ 后端逐步下发：
     //      标记点 → 写目标+触发 Bit0 → 控制器常驻 210 执行 MJOINT
@@ -1193,7 +1207,7 @@ export const useExecStore = defineStore("exec", {
 
     /** 追加一步。type 只接受四类。 */
     addSeqStep(type) {
-      const TYPES = ["point", "suck", "release", "wait"];
+      const TYPES = ["point", "suck", "release", "blow", "unblow", "wait"];
       if (!TYPES.includes(type)) return;
       if (this.seqItems.length >= 200) { this.seqErr = "步骤数已达上限 200"; return; }
       if (type === "point") {
@@ -1253,7 +1267,9 @@ export const useExecStore = defineStore("exec", {
       }
       if (it.type === "wait") return it.seconds + " 秒";
       if (it.type === "suck") return "打开真空（保持）";
-      return "关断真空";
+      if (it.type === "blow") return "开吹气（保持）";
+      if (it.type === "unblow") return "关吹气";
+      return "只关真空阀（不吹气）";
     },
 
     /** 保存成本地文件 programs/<名称>.json（保存后立刻出现在「本地程序」列表）。 */

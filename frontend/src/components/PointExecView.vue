@@ -225,11 +225,9 @@ watch(() => auth.controlActive, (v) => {
         </div>
       </template>
 
-      <div class="pf-row" style="margin-top:8px">
-        <label>速度</label>
-        <input type="range" min="1" max="100" v-model.number="exec.teachSpeed" :disabled="!readyOk" />
-        <span class="v" style="width:44px;text-align:right">{{ exec.teachSpeed }}%</span>
-      </div>
+      <p class="small muted" style="margin-top:8px">
+        速度统一由右上角「速度」控制（全项目唯一速度入口：点动 / 示教 / 执行共用同一份）。
+      </p>
 
       <div v-if="exec.teachResult" class="teach-res"
            :class="exec.teachResult.ok ? 'ok' : 'err'">
@@ -274,11 +272,6 @@ watch(() => auth.controlActive, (v) => {
       <p v-if="!readyOk" class="lock-hint">
         <Icon name="lock" :size="13" /> 需先在「真机链路」点「一键就绪」（伺服上电 + 程序运行）后才可点动。
       </p>
-      <div class="pf-row">
-        <label>角速度</label>
-        <input type="range" min="1" max="10" v-model.number="exec.jogSpeed" :disabled="!readyOk" />
-        <span class="v" style="width:45px;text-align:right">{{ exec.jogSpeed }}°/s</span>
-      </div>
       <div class="pf-row">
         <label>步长</label>
         <div class="seg mini">

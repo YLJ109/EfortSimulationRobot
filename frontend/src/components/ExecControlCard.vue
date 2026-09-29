@@ -73,26 +73,24 @@ const estopText = computed(() => {
 
     <hr class="sp-hr" />
 
-    <div class="pf-row">
-      <label>速度</label>
-      <input type="range" min="5" max="100" v-model.number="exec.speed" />
-      <span class="v" style="width:48px;text-align:right">{{ exec.speed }}%</span>
-    </div>
+    <p class="small muted">
+      速度统一由右上角「速度」控制（这里不再单设一份，避免两个口径对不上）。
+    </p>
 
     <p v-if="exec.blockReason" class="pf-err">
       <Icon name="alert" :size="13" /> {{ exec.blockReason }}
     </p>
 
-    <!-- ★ 真空吸放：写 40135.Bit1/Bit2 触发位，控制器常驻服务程序 **210** 执行，不移动机器人。
-         吸气=电平保持（不自动停，需按「停止吸气」关断）；停止吸气=立即关断（默认态）。
+    <!-- ★ 四路气路：写 40135.Bit1~Bit4 触发位，控制器常驻服务程序 **210** 执行，不移动机器人。
+         吸(Bit1)/停止吸(Bit2)/放(Bit3)/停止放(Bit4) —— 全部**电平保持**。
          ★ 状态由 store 锁存：吸气成功后持续显示"吸气中"，避免"阀开着却显示空闲"。
-         ★ 「停止吸气」**不因 vacuumBusy 被禁用** —— 它是安全动作，
-           哪怕上一发吸气请求还挂着，操作员也必须能立刻关阀。 -->
+         ★ 「停止吸气 / 放气」**不因 vacuumBusy 被禁用** —— 它们是脱件动作，
+           哪怕上一发吸气请求还挂着，操作员也必须能立刻脱件。 -->
     <hr class="sp-hr" />
     <div class="vac-title">
       <Icon name="grip" :size="13" /> 真空吸放
-      <span class="h3-sub" :class="exec.vacuumState === 'suck' ? 'on-suck' : ''">
-        {{ exec.vacuumState === 'suck' ? '吸气中（保持）' : '已关断' }}
+      <span class="h3-sub" :class="exec.vacuumState === 'suck' ? 'on-suck' : (exec.vacuumState === 'blow' ? 'on-blow' : '')">
+        {{ exec.vacuumState === 'suck' ? '吸：保持中' : (exec.vacuumState === 'blow' ? '放：吹气中' : '两路都关断') }}
       </span>
     </div>
     <div class="btns" style="margin-top:6px">
@@ -105,12 +103,22 @@ const estopText = computed(() => {
               @click="exec.vacuum('release')">
         <Icon name="upload" :size="14" /> 停止吸气
       </button>
+      <button class="vac-blow" :class="{ 'is-on': exec.vacuumState === 'blow' }"
+              :disabled="!canControl"
+              @click="exec.vacuum('blow')">
+        <Icon name="eject" :size="14" /> 放
+      </button>
+      <button class="vac-unblow" :disabled="!canControl"
+              @click="exec.vacuum('unblow')">
+        <Icon name="close" :size="14" /> 停止放
+      </button>
     </div>
     <p v-if="exec.vacuumErr" class="pf-err">
       <Icon name="alert" :size="13" /> {{ exec.vacuumErr }}
     </p>
     <p v-else class="small">
-      吸气为保持型（不会自动停止），须按「停止吸气」关断。控制器须 AUTO 且常驻程序 210 运行中。
+      四路都是**电平保持**：吸/放 开了就一直保持，要靠「停止吸 / 停止放」关。
+      工件吸住不掉时按「放」吹一下破真空。控制器须 AUTO 且常驻程序 210 运行中。
     </p>
 
     <div class="btns" style="margin-top:8px">
@@ -148,5 +156,12 @@ const estopText = computed(() => {
 .vac-suck.is-on { background: var(--c-suck, #2f9e6f); color: #fff; border-color: var(--c-suck, #2f9e6f); }
 .vac-release { color: var(--c-release, #d98a2b); border-color: var(--c-release-line, #d98a2b55); }
 .vac-release:hover:not(:disabled) { background: var(--c-release, #d98a2b); color: #fff; }
+/* 放气 = 吹气破真空（脱件）：用与"关阀"不同的色，操作员能一眼区分这两件事 */
+.vac-blow { color: var(--c-blow, #3b7dd8); border-color: var(--c-blow-line, #3b7dd855); }
+.vac-blow:hover:not(:disabled) { background: var(--c-blow, #3b7dd8); color: #fff; }
+.vac-unblow { color: var(--c-blow, #3b7dd8); border-color: var(--c-blow-line, #3b7dd855); }
+.vac-unblow:hover:not(:disabled) { background: var(--c-blow, #3b7dd8); color: #fff; }
+.vac-blow.is-on { background: var(--c-blow, #3b7dd8); color: #fff; border-color: var(--c-blow, #3b7dd8); }
 .on-suck { color: var(--c-suck, #2f9e6f); }
+.on-blow { color: var(--c-blow, #3b7dd8); }
 </style>

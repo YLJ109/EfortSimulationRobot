@@ -138,8 +138,26 @@ class JogEngine:
         return [0.0] * 6
 
     def _speed_pct(self, speed_dps: float) -> int:
+        """°/s → %（**引擎内部用**：把每拍的角速度换算成下发给 40103 的百分比）。
+
+        ★ 与 `_dps_est` 互为逆函数；因 max_speed 作为 100% 参考，两者往返是恒等的
+          （pct → 0.3×pct °/s → pct），所以"用户设的 % == 下发 40103 的 %"。
+        """
         pct = int(round(speed_dps / max(self.max_speed, 1e-6) * 100))
         return max(1, min(100, pct))
+
+    def _dps_est(self, speed_pct: int) -> float:
+        """% → 估算 °/s（**仅用于耗时估算/显示，不参与下发**）。
+
+        ★ 速度的唯一权威口径是**百分比**（与右上角全局速度一致）：
+          有效速度 = 程序内 v…perc × 40103。控制器不反馈"每秒多少度"，
+          故按 config motion.jog.max_speed_dps（默认 30 = 现场 100% 的参考角速度）
+          线性折算，纯估算。2026-09-29 起点动入参改为 speed_pct ——
+          旧实现让"角速度 5°/s"经 5/30→17% 再被 v50perc 反算成 40103=34%，
+          造成"示教器显示 34%、右上角 5%"的口径分裂。
+        """
+        pct = max(1, min(100, int(speed_pct)))
+        return max(0.1, self.max_speed * pct / 100.0)
 
     def _block_reason(self) -> str:
         """返回非空字符串表示禁止点动。"""
@@ -167,7 +185,7 @@ class JogEngine:
 
     # ---------- 增量点动 ----------
     def step(self, joint: int, direction: int, angle_deg: float,
-             speed_dps: float, frame: str = "joint",
+             speed_pct: int, frame: str = "joint",
              user_frame: Optional[str] = None, slow: bool = False) -> dict:
         """按一次走固定距离/角度，返回执行结果(含目标姿态与预计耗时)。
 
@@ -191,9 +209,12 @@ class JogEngine:
         with self._lock:
             self._frame, self._user_frame, self._slow = f, str(user_frame or ""), bool(slow)
 
+        # ★ 速度口径统一：入参是**百分比**（右上角全局速度）。引擎内部按 °/s 计算每拍位移，
+        #   故在此**单点换算一次**（_dps_est 只做参考折算，权威值仍是 %）。
+        dps = self._dps_est(speed_pct)
         if f == "joint":
-            return self._step_joint(j, d, amt, speed_dps)
-        return self._step_cartesian(f, j, d, amt, speed_dps, user_frame, slow)
+            return self._step_joint(j, d, amt, dps)
+        return self._step_cartesian(f, j, d, amt, dps, user_frame, slow)
 
     def _step_joint(self, j: int, d: int, ang: float, speed_dps: float) -> dict:
         sp = max(0.1, min(float(speed_dps), self.max_speed))
@@ -220,7 +241,8 @@ class JogEngine:
             "joint": j,
             "dir": d,
             "angle_deg": round(ang, 3),
-            "speed_dps": round(sp, 2),
+            "speed_pct": self._speed_pct(sp),   # ★ 权威口径（== 右上角速度）
+            "speed_dps_est": round(sp, 2),      # 仅估算，供参考/耗时
             "duration_ms": duration_ms,
             "target": [round(float(v), 3) for v in target],
             "limit_clamped": clamped,
@@ -285,7 +307,7 @@ class JogEngine:
         return out
 
     # ---------- 连续点动 ----------
-    def start(self, joint: int, direction: int, speed_dps: float,
+    def start(self, joint: int, direction: int, speed_pct: int,
               frame: str = "joint", user_frame: Optional[str] = None,
               slow: bool = False) -> dict:
         f, ferr = jf.norm_frame(frame)
@@ -300,7 +322,8 @@ class JogEngine:
 
         with self._lock:
             d = 1 if direction >= 0 else -1
-            sp = self.axis_speed(f, j, speed_dps, slow)
+            # ★ 同 step：入口是 %，此处单点换算成引擎内部用的 °/s
+            sp = self.axis_speed(f, j, self._dps_est(speed_pct), slow)
             switching = self._active and (self._joint != j or self._dir != d
                                           or self._frame != f
                                           or self._user_frame != str(user_frame or ""))

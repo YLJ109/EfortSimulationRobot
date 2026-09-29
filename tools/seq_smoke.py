@@ -58,22 +58,28 @@ def main():
     print("\n[1] 空态：进度 / 载入不存在的序列")
     st, r = call("GET", "/api/control/run-state", tok=tok)
     check("run-state 可读（空态无异常）", st == 200 and r.get("ok") is True, r.get("state"))
-    check("空态 state=None", r.get("state") is None)
+    # ★ 不再断言 state 必须为 None：后端**故意**保留最近一次执行的终态
+    #   （_LAST_RUN_ID），好让界面在收尾后仍能显示"完成/已停止"。
+    #   这里只要求"没有正在跑的"。
+    _s = r.get("state")
+    check("没有进行中的执行", (not r.get("active")) and (_s is None or _s.get("running") is False),
+          "active=%s running=%s" % (r.get("active"), (_s or {}).get("running")))
     st, r = call("GET", "/api/control/seq", tok=tok, query={"name": "__nope__"})
     check("载入不存在的序列 → 404", st == 404, r.get("detail"))
 
-    print("\n[2] 四类操作硬校验（后端是唯一入口）")
+    print("\n[2] 操作类型硬校验（后端是唯一入口，只允许五类）")
     bad = [
         ({"type": "loop"}, "循环"),
         ({"type": "if"}, "条件"),
         ({"type": "call"}, "子程序"),
-        ({"type": "suck", "extra": 1}, None),          # 合法
+        ({"type": "suck"}, None),                      # 合法
+        ({"type": "blow"}, None),                      # ★ 合法（放气）
     ]
     for it, label in bad:
         st, r = call("POST", "/api/control/seq",
                      {"name": "smoke-bad", "items": [it]}, tok=tok)
         if label is None:
-            check("合法步骤 suck 被接受", st == 200, r.get("detail"))
+            check("合法步骤 %s 被接受" % it.get("type"), st == 200, r.get("detail"))
         else:
             check("拒绝非四类操作「%s」" % label, st == 400, (r.get("detail") or "")[:60])
 
@@ -99,13 +105,14 @@ def main():
         {"type": "suck"},
         {"type": "wait", "seconds": 0.2},
         {"type": "release"},
+        {"type": "blow"},            # ★ 放气（破真空脱件）
     ]
     st, r = call("POST", "/api/control/seq",
                  {"name": "smoke-序列A", "items": items, "speed_pct": 5}, tok=tok)
-    check("保存四步序列", st == 200 and r.get("ok"), r.get("file"))
+    check("保存五步序列", st == 200 and r.get("ok"), r.get("file"))
     saved_file = r.get("file")
     st, r2 = call("GET", "/api/control/seq", tok=tok, query={"name": "smoke-序列A"})
-    check("载入回填", st == 200 and len(r2.get("items") or []) == 4,
+    check("载入回填", st == 200 and len(r2.get("items") or []) == 5,
           json.dumps(r2.get("items"), ensure_ascii=False)[:150])
 
     print("\n[5] 试运行（dry_run，绝不下发）解析编辑器缓冲")
@@ -116,9 +123,9 @@ def main():
           "kind=%s count=%s" % (r.get("kind"), r.get("count")))
     ops = [(s.get("index"), s.get("op") or "point", s.get("ok")) for s in (r.get("steps") or [])]
     print("      步骤解析:", ops)
-    check("四步全部解析成功", len(ops) == 4 and all(x[2] is not False for x in ops))
-    check("io 步骤被识别为 suck/wait/release",
-          [x[1] for x in ops] == ["point", "suck", "wait", "release"], ops)
+    check("五步全部解析成功", len(ops) == 5 and all(x[2] is not False for x in ops))
+    check("io 步骤被识别为 suck/wait/release/blow",
+          [x[1] for x in ops] == ["point", "suck", "wait", "release", "blow"], ops)
     check("dry_run 不下发（readonly）", r.get("readonly") is True)
 
     print("\n[6] run-file 缺目标时给 422")
@@ -130,6 +137,20 @@ def main():
     check("无执行时暂停 → 明确提示", st == 200 and r.get("ok") is False, r.get("error"))
     st, r = call("POST", "/api/control/run-resume", {}, tok=tok)
     check("无暂停时继续 → 明确提示", st == 200 and r.get("ok") is False, r.get("error"))
+
+    print("\n[7b] 吸放动作入参闸门（读 OpenAPI 校验，**零副作用**）")
+    # ★ 为什么不直接 POST：/control/vacuum 是**真写寄存器**的接口 ——
+    #   控制器在 AUTO 时 POST 一次就真的吸一次/放一次气（本脚本不该动机器）。
+    #   这里改为读 openapi.json 里 VacuumIn.action 的正则，纯校验、不出手。
+    st, spec = call("GET", "/openapi.json", tok=tok)
+    pat = (((spec.get("components") or {}).get("schemas") or {})
+           .get("VacuumIn", {}).get("properties", {}).get("action", {}).get("pattern"))
+    check("能取到 VacuumIn.action 的正则", bool(pat), pat)
+    import re as _re
+    rx = _re.compile(pat) if pat else None
+    for act in ("suck", "release", "blow"):
+        check("动作 %s 在允许集内" % act, bool(rx and rx.match(act)), pat)
+    check("未知动作 purge 不在允许集内", bool(rx and not rx.match("purge")), pat)
 
     print("\n[8] 清理冒烟文件")
     for fn in (saved_file, "smoke-bad.json"):

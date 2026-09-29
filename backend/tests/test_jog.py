@@ -79,8 +79,13 @@ def test_jog_step_moves_only_target_joint(client):
     assert d["ok"] is True
     assert d["joint"] == 2 and d["dir"] == 1
     assert d["angle_deg"] == 5.0
-    assert d["speed_dps"] == 10.0
-    assert d["duration_ms"] == 500             # 5° / 10°/s = 0.5s
+    # ★ 2026-09-29 速度口径统一：权威字段是 speed_pct（右下/右上角同一个 %）。
+    #   旧入参 speed_dps=10 只作兼容折算：10/30×100 = 33%。
+    assert d["speed_pct"] == 33
+    assert abs(d["speed_dps_est"] - 9.9) < 0.05   # 仅估算显示用
+    # duration 是按**估算 °/s** 算的：10°/s → 33% → 估回 9.9°/s → 505ms。
+    # 旧的 speed_dps 入参经 % 往返有精度损失（这也是要用 % 当唯一口径的原因之一）。
+    assert abs(d["duration_ms"] - 505) <= 5, d["duration_ms"]
     # 只有 J2 从 0 走到 +5
     assert d["target"] == [0.0, 5.0, 0.0, 0.0, 0.0, 0.0]
     assert d["limit_clamped"] is False
@@ -97,14 +102,19 @@ def test_jog_step_negative_direction(client):
 
 
 def test_jog_step_speed_clamped_to_max(client):
-    """请求 60°/s 应被夹到上限 30°/s。"""
+    """★ 速度的唯一上限是**工程边界 100%**（不再是 30°/s）。
+
+    口径变更（2026-09-29）：点动速度改为与右上角同一份**百分比**；
+    旧的 60°/s 折算成 200% → 被 clamp 到 100%（对应的估算 °/s 恰为 30）。
+    """
     h = _h(client)
     _home(client, h)
     d = client.post("/api/control/jog/step",
                     json={"joint": 1, "dir": 1, "angle_deg": 10, "speed_dps": 60},
                     headers=h).json()
     assert d["ok"] is True
-    assert d["speed_dps"] == 30.0
+    assert d["speed_pct"] == 100          # 夹到工程上限
+    assert abs(d["speed_dps_est"] - 30.0) < 0.05
 
 
 def test_jog_step_limit_clamp(client):
@@ -212,3 +222,139 @@ def test_estop_stops_running_jog(client):
     st = client.get("/api/control/jog", headers=h).json()
     assert st["active"] is False
     assert st["reason"] == "estop"
+
+
+# =====================================================================
+# ★★ 2026-09-29 速度口径统一（现场报"点动速度突然飘升到 34%"）
+# =====================================================================
+def test_jog_speed_pct_is_authoritative_and_passthrough(client):
+    """★★ 点动速度唯一口径 = **百分比**，且必须原样直通（不回绕、不翻倍）★★
+
+    现场事故：点动页曾有独立"角速度 5°/s"旋钮 → 5/30×100 = 17% →
+    再被 v50perc 反算成 40103 = 34% ⇒ **示教器显示 34%、右上角 5%**，
+    操作员看到"速度突然飘升到 34%"。现在前端只传 speed_pct，后端直通。
+    """
+    h = _h(client)
+    _home(client, h)
+    d = client.post("/api/control/jog/step",
+                    json={"joint": 6, "dir": 1, "angle_deg": 1, "speed_pct": 17},
+                    headers=h).json()
+    assert d["ok"] is True, d
+    assert d["speed_pct"] == 17, "权威口径必须原样返回，不得折算：%s" % d
+    # 估算 °/s 仅用于显示/耗时：100% 参考 30°/s × 17% ≈ 5.1
+    assert abs(d["speed_dps_est"] - 5.1) < 0.05, d
+
+
+def test_jog_speed_pct_boundaries(client):
+    """工程边界 [5,100]：入参越界由 Pydantic 拦（5 与 100 必须放行）。"""
+    h = _h(client)
+    _home(client, h)
+    for pct in (5, 100):
+        d = client.post("/api/control/jog/step",
+                        json={"joint": 6, "dir": 1, "angle_deg": 1, "speed_pct": pct},
+                        headers=h).json()
+        assert d["ok"] is True and d["speed_pct"] == pct, d
+    for bad in (0, 4, 101):
+        r = client.post("/api/control/jog/step",
+                        json={"joint": 6, "dir": 1, "angle_deg": 1, "speed_pct": bad},
+                        headers=h)
+        assert r.status_code == 422, "speed_pct=%s 应被拒：%s" % (bad, r.text)
+
+
+def test_speed_vperc_matches_program():
+    """★★ 速度显示一致性的前提：常驻程序用 `v100perc`，config 必须同步为 100 ★★
+
+    vperc≠100 时上位机要把 40103 写成本身的倍数（设 17% → 写 34%），
+    示教器显示与右上角就对不上 —— 这正是现场"速度飘升到 34%"的根因。
+    本用例把"config 与控制器程序里的速度常量必须一致且为 100"钉死。
+    """
+    import os
+    import yaml as _yaml
+    from app.core.config import project_root
+
+    with open(os.path.join(project_root(), "config", "robot.yaml"), "r",
+              encoding="utf-8") as f:
+        cfg = _yaml.safe_load(f)
+    vperc = (cfg.get("motion") or {}).get("jog", {}).get("service_program_vperc")
+    assert float(vperc) == 100.0, (
+        "service_program_vperc 必须是 100（程序内 v100perc）——"
+        "否则 40103 会被反算成倍数，示教器显示与右上角不一致。实测=%r" % vperc)
+
+    # 控制器程序源码里也必须写 v100perc（两者不一致会差一倍）
+    pgm = os.path.join(project_root(), "programs", "210_service_merged.pgm")
+    with open(pgm, "r", encoding="utf-8") as f:
+        src = f.read()
+    # ★ 只认 MJOINT(...) 实际传进去的速度常量（注释里可以提到别的名字）
+    import re as _re
+    m = _re.search(r"MJOINT\(.*?\)\s*,\s*(\w+perc)", src, _re.S)
+    assert m, "没在 210 程序里找到 MJOINT 的速度常量"
+    assert m.group(1) == "v100perc", (
+        "MJOINT 的速度常量必须是 v100perc（实测 %s）—— 与 config 不一致会差一倍" % m.group(1))
+
+
+# =====================================================================
+# ★★ 2026-09-29 速度口径统一（现场报"点动速度突然飘升到 34%"）
+# =====================================================================
+def test_jog_speed_pct_is_authoritative_and_passthrough(client):
+    """★★ 点动速度唯一口径 = **百分比**，且必须原样直通（不回绕、不翻倍）★★
+
+    现场事故：点动页曾有独立"角速度 5°/s"旋钮 → 5/30×100 = 17% →
+    再被 v50perc 反算成 40103 = 34% ⇒ **示教器显示 34%、右上角 5%**，
+    操作员看到"速度突然飘升到 34%"。现在前端只传 speed_pct，后端直通。
+    """
+    h = _h(client)
+    _home(client, h)
+    d = client.post("/api/control/jog/step",
+                    json={"joint": 6, "dir": 1, "angle_deg": 1, "speed_pct": 17},
+                    headers=h).json()
+    assert d["ok"] is True, d
+    assert d["speed_pct"] == 17, "权威口径必须原样返回，不得折算：%s" % d
+    # 估算 °/s 仅用于显示/耗时：100% 参考 30°/s × 17% ≈ 5.1
+    assert abs(d["speed_dps_est"] - 5.1) < 0.05, d
+
+
+def test_jog_speed_pct_boundaries(client):
+    """工程边界 [5,100]：入参越界由 Pydantic 拦（5 与 100 必须放行）。"""
+    h = _h(client)
+    _home(client, h)
+    for pct in (5, 100):
+        d = client.post("/api/control/jog/step",
+                        json={"joint": 6, "dir": 1, "angle_deg": 1, "speed_pct": pct},
+                        headers=h).json()
+        assert d["ok"] is True and d["speed_pct"] == pct, d
+    for bad in (0, 4, 101):
+        r = client.post("/api/control/jog/step",
+                        json={"joint": 6, "dir": 1, "angle_deg": 1, "speed_pct": bad},
+                        headers=h)
+        assert r.status_code == 422, "speed_pct=%s 应被拒：%s" % (bad, r.text)
+
+
+def test_speed_vperc_matches_program():
+    """★★ 速度显示一致性的前提：常驻程序用 `v100perc`，config 必须同步为 100 ★★
+
+    vperc≠100 时上位机要把 40103 写成本身的倍数（设 17% → 写 34%），
+    示教器显示与右上角就对不上 —— 这正是现场"速度飘升到 34%"的根因。
+    本用例把"config 与控制器程序里的速度常量必须一致且为 100"钉死。
+    """
+    import os
+    import yaml as _yaml
+    from app.core.config import project_root
+
+    with open(os.path.join(project_root(), "config", "robot.yaml"), "r",
+              encoding="utf-8") as f:
+        cfg = _yaml.safe_load(f)
+    vperc = (cfg.get("motion") or {}).get("jog", {}).get("service_program_vperc")
+    assert float(vperc) == 100.0, (
+        "service_program_vperc 必须是 100（程序内 v100perc）——"
+        "否则 40103 会被反算成倍数，示教器显示与右上角不一致。实测=%r" % vperc)
+
+    # 控制器程序源码里也必须写 v100perc（两者不一致会差一倍）
+    pgm = os.path.join(project_root(), "programs", "210_service_merged.pgm")
+    with open(pgm, "r", encoding="utf-8") as f:
+        src = f.read()
+    # ★ 只认 MJOINT(...) 实际传进去的速度常量（注释里可以提到别的名字）
+    import re as _re
+    m = _re.search(r"MJOINT\(.*?\)\s*,\s*(\w+perc)", src, _re.S)
+    assert m, "没在 210 程序里找到 MJOINT 的速度常量"
+    assert m.group(1) == "v100perc", (
+        "MJOINT 的速度常量必须是 v100perc（实测 %s）—— 与 config 不一致会差一倍" % m.group(1))

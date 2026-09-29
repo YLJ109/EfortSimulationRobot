@@ -2,7 +2,8 @@
 """序列编辑器（「程序执行」页四类操作）的回归测试。
 
 覆盖：
-  1. 后端是"只四类"的唯一入口：循环/条件/子程序/未知类型一律 400
+  1. 后端是操作类型的唯一入口（**只有五类**：标记点/吸气/停止吸气/放气/等待）：
+     循环/条件/子程序/未知类型一律 400
   2. 参数校验：空序列、标记点缺 point_id、等待时长越界
   3. 名称与路径穿越防护
   4. 保存 → 载入 回环（落盘格式与既有 _steps_from 兼容）
@@ -67,40 +68,49 @@ def _clean_runner_state():
     {"type": "loop"}, {"type": "if"}, {"type": "call"}, {"type": "goto"},
     {"type": "setvar"}, {"type": "unknown"},
 ])
-def test_seq_rejects_non_four_types(client, seq_dir, bad):
-    """★ 四种之外的操作一律拒绝 —— 这是"不要乱添加别的东西"的后端保证。"""
+def test_seq_rejects_non_allowed_types(client, seq_dir, bad):
+    """★ 五类之外的操作一律拒绝 —— 这是"不要乱添加别的东西"的后端保证。"""
     r = client.post("/api/control/seq", json={"name": "t1", "items": [bad]}, headers=_admin(client))
     assert r.status_code == 400, r.text
     assert "只允许" in r.text
 
 
-def test_seq_accepts_exactly_four(client, seq_dir):
-    """四类各一条 → 全部接受，且落盘格式与 _steps_from 兼容。"""
+def test_seq_accepts_all_five_types(client, seq_dir):
+    """五类各一条 → 全部接受，且落盘格式与 _steps_from 兼容。"""
     items = [{"type": "point", "point_id": 1}, {"type": "suck"},
-             {"type": "release"}, {"type": "wait", "seconds": 1.5}]
+             {"type": "release"}, {"type": "blow"}, {"type": "wait", "seconds": 1.5}]
     r = client.post("/api/control/seq", json={"name": "four", "items": items},
                     headers=_admin(client))
     assert r.status_code == 200, r.text
     with open(seq_dir / "four.json", "r", encoding="utf-8") as f:
         data = json.load(f)
     assert data["items"] == [
-        {"point_id": 1}, {"op": "suck"}, {"op": "release"},
+        {"point_id": 1}, {"op": "suck"}, {"op": "release"}, {"op": "blow"},
         {"op": "wait", "dwell_ms": 1500},
     ]
-    # 三条 io 步骤必须能被既有 _steps_from 解析成 suck/release/wait
+    # 四条 io 步骤必须能被既有 _steps_from 解析成 suck/release/blow/wait
     #（点位步需要数据库会话，这里单独验它的归一化字段即可）
     steps = C._steps_from(data["items"][1:], None)
-    assert [s.get("op") for s in steps] == ["suck", "release", "wait"]
-    assert [s.get("name") for s in steps] == ["吸气", "停止吸气", "等待"]
-    assert [s.get("index") for s in steps] == [1, 2, 3]
-    assert steps[2]["dwell_ms"] == 1500
+    assert [s.get("op") for s in steps] == ["suck", "release", "blow", "wait"]
+    assert [s.get("name") for s in steps] == ["吸", "停止吸", "放", "等待"]
+    assert [s.get("index") for s in steps] == [1, 2, 3, 4]
+    assert steps[3]["dwell_ms"] == 1500
     assert all(s.get("ok") is not False for s in steps), steps
     # ★ 兼容 XPL 解析器的老写法：{"op":"suck","on":false} = 停止吸气
     old = C._steps_from([{"op": "suck", "on": True}, {"op": "suck", "on": False}], None)
     assert [s.get("op") for s in old] == ["suck", "release"]
-    # ★ 未知 op 必须显式标失败（不能静默当成功）
-    unk = C._steps_from([{"op": "blow"}], None)
+    # ★ 放气（2026-09-29 新增）：显式 blow 与其别名都要归一化为 blow
+    bl = C._steps_from([{"op": "blow"}, {"op": "blowoff"}, {"op": "purge"}], None)
+    assert [s.get("op") for s in bl] == ["blow", "blow", "blow"]
+    assert bl[0]["name"] == "放" and bl[0]["ok"] is not False
+    # ★ 停止放（unblow）也要能归一化（2026-09-29 增加第四路气路）
+    ub = C._steps_from([{"op": "unblow"}, {"op": "stop_blow"}], None)
+    assert [s.get("op") for s in ub] == ["unblow", "unblow"]
+    assert ub[0]["name"] == "停止放"
+    # ★ 真正未知的 op 必须显式标失败（不能静默当成功）
+    unk = C._steps_from([{"op": "purge_xyz"}, {"op": "loop"}], None)
     assert unk[0]["ok"] is False and unk[0]["op"] == "unknown"
+    assert unk[1]["ok"] is False
 
 
 # ---------------------------------------------------------------- 2/3. 校验
@@ -191,7 +201,7 @@ def test_runfile_needs_a_target(client, seq_dir):
     assert r.status_code == 422, r.text
 
 
-def test_runfile_items_rejects_non_four(client, seq_dir):
+def test_runfile_items_rejects_unknown_op(client, seq_dir):
     r = client.post("/api/control/run-file",
                     json={"items": [{"type": "loop"}], "dry_run": True},
                     headers=_admin(client))
@@ -307,3 +317,67 @@ def test_jog_stop_not_blocked_by_run(client):
     finally:
         with C._RUN_CANCEL_LOCK:
             C._RUN_ACTIVE.pop(rid, None)
+
+
+# ---------------------------------------------------------------- 放气动作闸门
+def test_vacuum_accepts_blow_action(client):
+    """★ /control/vacuum 必须接受 suck / release / **blow**，其余入参一律 422。
+
+    坑（2026-09-29 差点漏掉）：VacuumIn.action 的正则是 `^(suck|release)$`，
+    新增的放气动作会被 Pydantic 直接 422 挡掉 —— 后端逻辑全对、前端按钮也画出来了，
+    但一按就"请求非法"。本条把这个入参闸门钉死。
+    """
+    h = _admin(client)
+    for act in ("suck", "release", "blow"):
+        r = client.post("/api/control/vacuum", json={"action": act}, headers=h)
+        assert r.status_code != 422, "%s 不该被入参拒：%s" % (act, r.text)
+        # 测试环境真实下发总闸关闭 → 403；有令牌但闸关是预期行为
+        assert r.status_code in (403, 409, 502), "%s 意外状态 %s" % (act, r.status_code)
+    r = client.post("/api/control/vacuum", json={"action": "purge"}, headers=h)
+    assert r.status_code == 422, "未知动作必须 422：%s" % r.text
+
+
+def test_vacuum_blow_maps_to_bit3(client):
+    """★ 放气必须映射到 40135.Bit3 / 完成位 40035.Bit3（不与吸气/关阀复用位）。"""
+    from app.services.modbus import VAC_BIT_SUCK, VAC_BIT_RELEASE, VAC_BIT_BLOW
+    assert (VAC_BIT_SUCK, VAC_BIT_RELEASE, VAC_BIT_BLOW) == (0x0002, 0x0004, 0x0008)
+    seen = set()
+    import inspect
+    import app.services.modbus as M
+    src = inspect.getsource(M.ModbusRobot.rc_vacuum)
+    for bit in ("0x0002", "0x0004", "0x0008"):
+        assert bit in src, "rc_vacuum 未覆盖完成位 %s" % bit
+        seen.add(bit)
+    assert "blow" in src and "suck/release/blow" in src, "rc_vacuum 未接受 blow 动作"
+
+
+# ---------------------------------------------------------------- 放气动作闸门
+def test_vacuum_accepts_blow_action(client):
+    """★ /control/vacuum 必须接受 suck / release / **blow**，其余入参一律 422。
+
+    坑（2026-09-29 差点漏掉）：VacuumIn.action 的正则是 `^(suck|release)$`，
+    新增的放气动作会被 Pydantic 直接 422 挡掉 —— 后端逻辑全对、前端按钮也画出来了，
+    但一按就"请求非法"。本条把这个入参闸门钉死。
+    """
+    h = _admin(client)
+    for act in ("suck", "release", "blow"):
+        r = client.post("/api/control/vacuum", json={"action": act}, headers=h)
+        assert r.status_code != 422, "%s 不该被入参拒：%s" % (act, r.text)
+        # 测试环境真实下发总闸关闭 → 403；有令牌但闸关是预期行为
+        assert r.status_code in (403, 409, 502), "%s 意外状态 %s" % (act, r.status_code)
+    r = client.post("/api/control/vacuum", json={"action": "purge"}, headers=h)
+    assert r.status_code == 422, "未知动作必须 422：%s" % r.text
+
+
+def test_vacuum_blow_maps_to_bit3(client):
+    """★ 放气必须映射到 40135.Bit3 / 完成位 40035.Bit3（不与吸气/关阀复用位）。"""
+    from app.services.modbus import VAC_BIT_SUCK, VAC_BIT_RELEASE, VAC_BIT_BLOW
+    assert (VAC_BIT_SUCK, VAC_BIT_RELEASE, VAC_BIT_BLOW) == (0x0002, 0x0004, 0x0008)
+    seen = set()
+    import inspect
+    import app.services.modbus as M
+    src = inspect.getsource(M.ModbusRobot.rc_vacuum)
+    for bit in ("0x0002", "0x0004", "0x0008"):
+        assert bit in src, "rc_vacuum 未覆盖完成位 %s" % bit
+        seen.add(bit)
+    assert "blow" in src and "suck/release/blow" in src, "rc_vacuum 未接受 blow 动作"

@@ -1,6 +1,6 @@
 {
   "name": "ceshi1",
-  "saved_at": "2026-09-29T19:26:58",
+  "saved_at": "2026-09-29T19:38:07",
   "speed_pct": 5,
   "items": [
     {
@@ -11,10 +11,6 @@
     },
     {
       "op": "suck"
-    },
-    {
-      "op": "wait",
-      "dwell_ms": 1000
     },
     {
       "point_id": 1

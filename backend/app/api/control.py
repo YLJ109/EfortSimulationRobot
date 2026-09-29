@@ -39,6 +39,7 @@ from app.services.kinematics import (
 from app.services.limits import in_limits as _check_in_limits
 from app.services.limits import load_limits as _load_limits
 from app.services.limits import violations as _violations_of
+from app.core.safety_const import clamp_speed
 from app.services.motion import motion, real_write_enabled
 from app.services.runmode import MODES as RUN_MODES
 from app.services.runmode import runmode
@@ -692,7 +693,7 @@ def _steps_from(items, db) -> List[dict]:
                         "speed_pct": sp, "dwell_ms": dw})
         elif it.get("op"):   # io 步骤：吸气 / 停止吸气 / 等待（可校验，无移动目标）
             # ★ 2026-09-29 序列编辑器：op 归一化为三值 suck / release / wait，
-            #   与界面上的四类操作一一对应（wait 的秒数由 dwell_ms 承载）。
+            #   与界面上的五类操作一一对应（wait 的秒数由 dwell_ms 承载）。
             #   · 显式 {"op":"suck"} / {"op":"release"}
             #   · 兼容 XPL 解析器产出的 {"op":"suck","on":false}（= 停止吸气）
             _raw = str(it.get("op") or "").strip().lower()
@@ -700,11 +701,16 @@ def _steps_from(items, db) -> List[dict]:
                 op = "suck" if it.get("on") is not False else "release"
             elif _raw in ("release", "unsuck", "stop_suck"):
                 op = "release"
+            elif _raw in ("blow", "blowoff", "purge"):
+                op = "blow"
+            elif _raw in ("unblow", "stop_blow"):
+                op = "unblow"
             elif _raw in ("wait", "dwell"):
                 op = "wait"
             else:
                 op = "unknown"
-            label = {"suck": "吸气", "release": "停止吸气", "wait": "等待"}.get(op, _raw)
+            label = {"suck": "吸", "release": "停止吸",
+                     "blow": "放", "unblow": "停止放", "wait": "等待"}.get(op, _raw)
             out.append({"index": idx, "name": it.get("name") or label,
                         "ok": op != "unknown", "op": op, "dwell_ms": dw,
                         "error": None if op != "unknown" else ("未知操作类型：%s" % _raw),
@@ -1034,9 +1040,13 @@ def api_run_cancel(body: RunCancelIn, tok: str = Depends(require_control)):
 
 # =====================================================================
 # ★ 2026-09-29 序列编辑器（「程序执行」页）——进度 / 暂停 / 继续 / 序列文件读写
-#   设计见 docs/方案-程序执行序列编辑器（四类操作·经210执行）.md
-#   ★ 只支持四类操作：标记点(point) / 吸气(suck) / 停止吸气(release) / 等待(wait)。
-#     本文件是**唯一入口**，后端在这里做"只四类"的硬校验，前端不可能绕过。
+#   设计见 docs/方案-程序执行序列编辑器（五类操作·经210执行）.md
+#   ★ 支持的操作（**只有这五类**，其余一律拒）：
+#       标记点(point) / 吸(suck) / 停止吸(release) / 放(blow) / 停止放(unblow) / 等待(wait)
+#     ★ 四路气路**全部电平保持**（与控制器 210 的 Bit1~Bit4 一一对应）。
+#       只关真空阀挡不住残余负压、工件会吸住不掉，所以要能单独"放"（吹气）；
+#       但也不能并入"停止吸"——有些场合只需松手不想吹气。
+#     本文件是**唯一入口**，后端在这里做硬校验，前端不可能绕过。
 # =====================================================================
 SEQ_NAME_RE = re.compile(r"^[\w\u4e00-\u9fa5\-. ]{1,40}$")
 SEQ_MAX_ITEMS = 200          # 单条序列最多 200 步（防止界面失控 + 文件过大）
@@ -1061,10 +1071,10 @@ def _seq_path(name: str) -> Optional[str]:
 
 
 def _norm_seq_items(items) -> List[dict]:
-    """把编辑器提交的步骤**归一化并硬校验为四类**，落盘格式与既有
+    """把编辑器提交的步骤**归一化并硬校验为这五类**，落盘格式与既有
     `_steps_from` 完全兼容（point_id / op / dwell_ms）。
 
-    非四类的任何东西都在这里被拒 —— 这是"只做四个操作"的后端保证。
+    五类之外的任何东西都在这里被拒 —— 这是"不乱加操作"的后端保证。
     """
     if not isinstance(items, list):
         raise HTTPException(400, detail="items 必须是数组")
@@ -1084,6 +1094,11 @@ def _norm_seq_items(items) -> List[dict]:
             out.append({"op": "suck"})
         elif t in ("release", "unsuck", "stop_suck"):
             out.append({"op": "release"})
+        elif t in ("blow", "blowoff", "purge"):
+            # ★ 放（开吹气阀，电平保持）：只关阀时工件会因残余负压/密封吸住不掉。
+            out.append({"op": "blow"})
+        elif t in ("unblow", "stop_blow", "blowoff_stop"):
+            out.append({"op": "unblow"})
         elif t in ("wait", "dwell"):
             try:
                 sec = float(it.get("seconds", 0))
@@ -1094,8 +1109,8 @@ def _norm_seq_items(items) -> List[dict]:
             out.append({"op": "wait", "dwell_ms": int(round(sec * 1000))})
         else:
             raise HTTPException(
-                400, detail=("第 %d 步操作类型「%s」不支持 —— 只允许 标记点/吸气/停止吸气/等待"
-                             % (i, t or "空")))
+                400, detail=("第 %d 步操作类型「%s」不支持 —— 只允许 "
+                             "标记点/吸/停止吸/放/停止放/等待" % (i, t or "空")))
     return out
 
 
@@ -1186,7 +1201,7 @@ def api_seq_load(name: str = Query(..., min_length=1, max_length=64),
 def api_seq_save(body: SeqIn, tok: str = Depends(require_control)):
     """把编辑器里的序列保存成本地文件 programs/<name>.json。
 
-    ★ 校验：名称字符集（中英文/数字/_/-/./空格）、四类操作硬校验、
+    ★ 校验：名称字符集（中英文/数字/_/-/./空格）、操作类型硬校验（六类）、
       步骤数上限、路径穿越防护、文件大小上限。
     ★ 格式与既有 `_load_disk` / `_steps_from` 兼容 → 保存后立刻出现在
       「本地程序」列表里，也能被「手动执行」按文件名跑。
@@ -1269,7 +1284,7 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
                     "candidates": _candidates(db),
                 })
         else:
-            _seq = _norm_seq_items(body.items)          # ★ 四类操作硬校验
+            _seq = _norm_seq_items(body.items)          # ★ 六类操作硬校验
             if not _seq:
                 raise HTTPException(400, detail="至少需要一个步骤")
             res = {"kind": "program", "name": disp_name, "source": "editor",
@@ -1342,7 +1357,7 @@ def api_run_file(body: RunFileIn, tok: str = Depends(require_control)):
                                     "ok": True, "op": "wait", "dwell_ms": dw,
                                     "readonly": bool(body.dry_run)})
                     continue
-                if op in ("suck", "release"):
+                if op in ("suck", "release", "blow", "unblow"):
                     if body.dry_run:
                         total_ms += 300
                         results.append({"index": st["index"], "name": st.get("name") or op,
@@ -1695,7 +1710,11 @@ class JogStepIn(BaseModel):
     #   两个字段都能传，amount 优先（新前端用 amount，旧前端继续用 angle_deg，语义不变）。
     angle_deg: float = Field(default=1.0, gt=0, le=1800)
     amount: Optional[float] = Field(default=None, gt=0, le=1800)
-    speed_dps: float = Field(default=15.0, gt=0, le=1000)   # 关节系 °/s；直角系 mm/s(或 °/s)
+    # ★ 2026-09-29 速度口径统一：**只认右上角全局速度的百分比** speed_pct。
+    #   speed_dps 保留仅为兼容旧前端/脚本（按 max_speed_dps 折算成 %），新代码别再用。
+    speed_pct: Optional[int] = Field(default=None, ge=5, le=100)
+    speed_pct: Optional[int] = Field(default=None, ge=5, le=100)
+    speed_dps: float = Field(default=15.0, gt=0, le=1000)   # 已废弃，仅兼容   # 已废弃，仅兼容
     frame: str = Field(default="joint", max_length=16)      # joint | base | tool | user
     user_frame: Optional[str] = Field(default=None, max_length=16)
     slow: bool = False                            # 慢速模式（速度 ÷slow_ratio，官方是 ÷10）
@@ -1708,6 +1727,25 @@ class JogStartIn(BaseModel):
     frame: str = Field(default="joint", max_length=16)
     user_frame: Optional[str] = Field(default=None, max_length=16)
     slow: bool = False
+
+
+def _jog_speed_pct(b) -> int:
+    """点动速度的**唯一口径 = 百分比**（与右上角全局速度一致）。
+
+    为什么要有这个函数：2026-09-29 现场报"点动速度突然飘升到 34%"——根因是
+    点动页有个独立"角速度(°/s)"旋钮，5°/s 经 5/30→17% 再被 v50perc 反算成 40103=34%，
+    于是示教器显示 34%、右上角 5%、实际又是第三个值。现在统一：入参就是右上角那个 %，
+    一路直通到 40103（配合程序内 v100perc，写多少就是多少）。
+    旧入参 speed_dps 仍接受，按 max_speed_dps 折算成 %（纯兼容，日志留痕）。
+    """
+    if getattr(b, "speed_pct", None) is not None:
+        return clamp_speed(int(b.speed_pct))
+    try:
+        ref = float(get_config().get("motion", "jog", "max_speed_dps", default=30) or 30)
+    except Exception:
+        ref = 30.0
+    old = max(0.1, float(getattr(b, "speed_dps", 15.0) or 15.0))
+    return clamp_speed(int(round(old / max(ref, 1e-6) * 100)))
 
 
 def _jog_emit(tok: str, action: str, ok: bool, text: str, detail: dict) -> None:
@@ -1753,17 +1791,20 @@ def api_jog_state():
 
 
 class VacuumIn(BaseModel):
-    action: str = Field(..., pattern="^(suck|release)$")
+    # ★ 2026-09-29：新增 blow（放气/吹气破真空）。三种动作对应常驻程序 210 的
+    #   Bit1（吸气保持）/ Bit2（只关真空阀）/ Bit3（关真空 + 吹气脉冲）。
+    action: str = Field(..., pattern="^(suck|release|blow|unblow)$")
     timeout: float = Field(default=6.0, gt=0.0, le=30.0)
 
 
 @router.post("/vacuum")
 def api_vacuum(body: VacuumIn, tok: str = Depends(require_control)):
-    """吸气/放气（不移动机器人关节）：写 40135.Bit1/Bit2 触发位 → 控制器常驻服务程序执行。
+    """吸气 / 停止吸气 / 放气（不移动机器人关节）：写 40135.Bit1/Bit2/Bit3 触发位 → 常驻服务程序执行。
 
     ★ 走与 jog 相同的真实下发双闸（real_write_enabled：EFORT_REAL_MOTION=1 + motion.real_write=true）。
       控制器须在 AUTO/远程模式且常驻服务程序在运行，否则触发位无人响应 → 502。
-      此接口只驱动电磁阀输出（吸盘/破真空），不写任何运动指令 → 不会移动机器人。
+      此接口只驱动电磁阀输出（真空阀 / 吹气阀），不写任何运动指令 → 不会移动机器人。
+      ★ 放气（blow）= 关真空 + 吹气脉冲 = **破真空脱件**：只关阀时工件会被残余负压吸住不掉。
     ★ 2026-09-29：吸放与点动**共用同一个常驻程序 200**（见 config motion.jog/vacuum.service_program）。
       吸气=电平保持（不自动停），停止吸气需显式按「停止吸气」。
     """
@@ -1815,7 +1856,7 @@ def api_jog_step(body: JogStepIn, tok: str = Depends(require_control)):
     if ferr:
         raise HTTPException(400, detail=ferr)
     amt = float(body.amount if body.amount is not None else body.angle_deg)
-    res = jog.step(body.joint, body.dir, amt, body.speed_dps,
+    res = jog.step(body.joint, body.dir, amt, _jog_speed_pct(body),
                    frame=frame, user_frame=body.user_frame, slow=body.slow)
     unit = jf.unit_of(frame, body.joint)
     name = _axis_name(frame, body.joint)
@@ -1826,7 +1867,7 @@ def api_jog_step(body: JogStepIn, tok: str = Depends(require_control)):
                if res.get("ok") else f"增量点动被拒：{res.get('error')}"),
               {"joint": body.joint, "dir": body.dir, "amount": amt, "unit": unit,
                "frame": frame, "user_frame": body.user_frame, "slow": body.slow,
-               "speed_dps": body.speed_dps, "blocked": bool(res.get("blocked")),
+               "speed_pct": _jog_speed_pct(body), "blocked": bool(res.get("blocked")),
                "limited": bool(res.get("limited")), "clamped": bool(res.get("limit_clamped"))})
     _jog_mode_note(tok, res)
     if not res.get("ok") and res.get("blocked"):
@@ -1843,16 +1884,16 @@ def api_jog_start(body: JogStartIn, tok: str = Depends(require_control)):
     if ferr:
         raise HTTPException(400, detail=ferr)
     _reject_if_run_active("连续点动")
-    res = jog.start(body.joint, body.dir, body.speed_dps,
+    res = jog.start(body.joint, body.dir, _jog_speed_pct(body),
                     frame=frame, user_frame=body.user_frame, slow=body.slow)
     unit = jf.unit_of(frame, body.joint)
     name = _axis_name(frame, body.joint)
     _jog_emit(tok, "control.jog_start", bool(res.get("ok")),
               (f"连续点动[{_frame_label(frame, body.user_frame)}] "
-               f"{name}{'+' if body.dir > 0 else '-'} 起，{body.speed_dps:g}{unit}/s"
+               f"{name}{'+' if body.dir > 0 else '-'} 起，{_jog_speed_pct(body)}%（全局速度）"
                + ("（慢速）" if body.slow else "")
                if res.get("ok") else f"连续点动被拒：{res.get('error')}"),
-              {"joint": body.joint, "dir": body.dir, "speed_dps": body.speed_dps,
+              {"joint": body.joint, "dir": body.dir, "speed_pct": _jog_speed_pct(body),
                "frame": frame, "user_frame": body.user_frame, "slow": body.slow,
                "blocked": bool(res.get("blocked"))})
     _jog_mode_note(tok, res)

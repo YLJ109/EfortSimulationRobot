@@ -100,7 +100,7 @@ async function refetchFiles() {
 // ---------- 序列编辑（只四类操作）----------
 // ★ 需求（2026-09-29）：像编辑器一样自己把顺序排好，然后执行 / 暂停 / 继续 / 停止执行，
 //   可保存成本地文件、可选择已保存文件载入并执行。**只有四类**：标记点/吸气/停止吸气/等待。
-//   方案见 docs/方案-程序执行序列编辑器（四类操作·经210执行）.md
+//   方案见 docs/方案-程序执行序列编辑器（五类操作·经210执行）.md
 //   全部执行都在后端逐步下发（经控制器常驻程序 210），前端只负责编排与进度。
 
 /** 可载入的序列文件 = programs 目录里的 .json（后端保存的序列就是这种）。 */
@@ -115,7 +115,7 @@ function onLoadSeq() {
 }
 
 const seqTypeName = (t) => ({
-  point: "标记点", suck: "吸气", release: "停止吸气", wait: "等待",
+  point: "标记点", suck: "吸", release: "停止吸", blow: "放", unblow: "停止放", wait: "等待",
 }[t] || t);
 
 /** 执行中高亮当前步（进度来自后端 run-state 轮询）。 */
@@ -263,7 +263,7 @@ watch(() => auth.controlActive, (v) => {
     <!-- ★ 序列编辑（只四类操作）：自己排序 → 执行 / 暂停 / 继续 / 停止执行 → 保存/载入 -->
     <div class="card">
       <h3><Icon name="layers" :size="15" /> 序列编辑
-        <span class="h3-sub">只四类：标记点 / 吸气 / 停止吸气 / 等待</span>
+        <span class="h3-sub">六类：标记点 / 吸 / 停止吸 / 放 / 停止放 / 等待</span>
       </h3>
 
       <div class="pf-row">
@@ -272,15 +272,22 @@ watch(() => auth.controlActive, (v) => {
                :disabled="exec.running" placeholder="例如：取件-放件" />
       </div>
 
-      <div class="btns" style="margin-top:6px">
+      <!-- ★ 六个操作按钮分两行（3 + 3），一行挤不下会换行错位 -->
+      <div class="seq-add">
         <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('point')">
           <Icon name="target" :size="13" /> 标记点
         </button>
         <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('suck')">
-          <Icon name="download" :size="13" /> 吸气
+          <Icon name="download" :size="13" /> 吸
         </button>
         <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('release')">
-          <Icon name="upload" :size="13" /> 停止吸气
+          <Icon name="upload" :size="13" /> 停止吸
+        </button>
+        <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('blow')">
+          <Icon name="eject" :size="13" /> 放
+        </button>
+        <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('unblow')">
+          <Icon name="close" :size="13" /> 停止放
         </button>
         <button :disabled="exec.seqBusy || exec.running" @click="exec.addSeqStep('wait')">
           <Icon name="clock" :size="13" /> 等待
@@ -304,7 +311,9 @@ watch(() => auth.controlActive, (v) => {
               <span class="pt-joints">秒</span>
             </template>
             <span v-else class="pt-joints">
-              {{ it.type === 'suck' ? '打开真空（保持）' : '关断真空' }}
+              {{ it.type === 'suck' ? '开真空（保持）'
+                 : it.type === 'blow' ? '开吹气（保持）'
+                 : it.type === 'unblow' ? '关吹气' : '关真空阀（不吹气）' }}
             </span>
           </div>
           <div class="pt-ops">
@@ -531,4 +540,8 @@ watch(() => auth.controlActive, (v) => {
 /* 序列编辑：等待步的秒数输入 */
 .seq-sec { width: 72px; padding: 2px 6px; border-radius: 6px;
   border: 1px solid var(--line); background: var(--panel); color: var(--txt); }
+/* ★ 六个添加按钮固定 3 列 × 2 行：一行挤不下会换行错位，看起来像少了按钮 */
+.seq-add { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px; margin-top: 8px; }
+.seq-add > button { justify-content: center; min-width: 0; white-space: nowrap; }
 </style>
